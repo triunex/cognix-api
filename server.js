@@ -38,7 +38,7 @@ app.post("/api/search", async (req, res) => {
     res.json({ answer });
 
   } catch (err) {
-    console.error("Execution error:", err);
+    console.error("Execution error:", JSON.stringify(err, null, 2));
     res.status(500).json({ error: "Failed to generate answer", details: err.message });
   }
 });
