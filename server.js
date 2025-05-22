@@ -4,11 +4,19 @@ import dotenv from "dotenv";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { SerpAPI } from "langchain/tools";
 import { initializeAgentExecutorWithOptions } from "langchain/agents";
+import cors from "cors";
 
 dotenv.config();
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: "*", // <-- ALLOW ALL ORIGINS TEMPORARILY
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
+
 app.use(express.json());
 
 const gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -26,20 +34,21 @@ app.post("/api/search", async (req, res) => {
         call: async (inputs) => {
           const result = await model.generateContent(inputs.input);
           return { content: result.response.text() };
-        }
+        },
       },
       {
         agentType: "openai-functions",
-        verbose: true
+        verbose: true,
       }
     );
 
     const answer = await executor.run(userQuery);
     res.json({ answer });
-
   } catch (err) {
     console.error("Execution error:", JSON.stringify(err, null, 2));
-    res.status(500).json({ error: "Failed to generate answer", details: err.message });
+    res
+      .status(500)
+      .json({ error: "Failed to generate answer", details: err.message });
   }
 });
 
