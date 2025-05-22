@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { SerpAPI } from "langchain/tools/serpapi";
+import { SerpAPI } from "langchain/tools";
 import { initializeAgentExecutorWithOptions } from "langchain/agents";
 
 dotenv.config();
@@ -26,24 +26,23 @@ app.post("/api/search", async (req, res) => {
         call: async (inputs) => {
           const result = await model.generateContent(inputs.input);
           return { content: result.response.text() };
-        },
+        }
       },
       {
         agentType: "openai-functions",
-        verbose: true,
+        verbose: true
       }
     );
 
     const answer = await executor.run(userQuery);
     res.json({ answer });
+
   } catch (err) {
     console.error("Execution error:", err);
-    res
-      .status(500)
-      .json({ error: "Failed to generate answer", details: err.message });
+    res.status(500).json({ error: "Failed to generate answer", details: err.message });
   }
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log("Server running...");
+  console.log("Server running on port " + (process.env.PORT || 3000));
 });
