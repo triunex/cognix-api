@@ -26,10 +26,26 @@ app.post("/api/search", async (req, res) => {
     const results = serpResponse.data.organic_results?.slice(0, 5) || [];
 
     const context = results
-      .map((r, i) => `${i + 1}. ${r.title}\n${r.snippet || ""}\n${r.link}`)
+      .map(
+        (r, i) => `${i + 1}. ${r.title}\n${r.snippet || ""}\nSource: ${r.link}`
+      )
       .join("\n\n");
 
-    const prompt = `You are a helpful assistant. Based on the following web search results, answer the user's query: "${query}"\n\n${context}`;
+    const prompt = `
+You're an intelligent assistant. Use the search results below to answer the user's question *clearly and helpfully*, even if not all results are directly relevant. 
+If needed, combine your own knowledge with the web results.
+Add a "Sources:" section at the end using the most relevant URLs from the search results.
+
+
+Question: "${query}"
+
+Search Results:
+${context}
+
+Answer in a friendly, helpful tone:
+Answer clearly, concisely, and professionally.
+Also include links to sources if possible.
+`;
 
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
@@ -47,6 +63,9 @@ app.post("/api/search", async (req, res) => {
         },
       }
     );
+
+    const sources = results.map(r => `- ${r.title}: ${r.link}`).join("\n");
+    const fullAnswer = `${geminiResponse.data.candidates[0].content.parts[0].text}\n\nSources:\n${sources}`;
 
     // 4. Respond to frontend
     res.json({
