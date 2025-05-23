@@ -48,10 +48,10 @@ app.post("/api/search", async (req, res) => {
       }
     );
 
-    const finalAnswer = geminiResponse.data.candidates[0].content.parts[0].text;
-
     // 4. Respond to frontend
-    res.json({ answer: finalAnswer });
+    res.json({
+      answer: geminiResponse.data.candidates[0].content.parts[0].text,
+    });
   } catch (err) {
     console.error("❌ Error:", err.response?.data || err.message || err);
     res.status(500).json({ error: "Failed to get answer" });
