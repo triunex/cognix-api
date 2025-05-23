@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { SerpAPI } from "langchain/tools";
+import { SerpAPI } from "langchain/tools"; // ✅ safe in 0.0.189
 import { initializeAgentExecutorWithOptions } from "langchain/agents";
 
 dotenv.config();
@@ -10,7 +10,7 @@ dotenv.config();
 const app = express();
 app.use(
   cors({
-    origin: "*", // <-- ALLOW ALL ORIGINS TEMPORARILY
+   origin: "https://cognix-1fc5a.web.app/", 
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type"],
   })
