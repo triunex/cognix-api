@@ -1,56 +1,57 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { SerpAPI } from "langchain/tools"; // ✅ safe in 0.0.189
-import { initializeAgentExecutorWithOptions } from "langchain/agents";
-
+import express from 'express';
+import cors from 'cors';
+import axios from 'axios';
+import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-app.use(
-  cors({
-   origin: "https://cognix-1fc5a.web.app", 
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
-  })
-);
-
+app.use(cors({ origin: "*", methods: ["POST", "OPTIONS"] }));
 app.use(express.json());
 
-const gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = gemini.getGenerativeModel({ model: "gemini-pro" });
-
 app.post("/api/search", async (req, res) => {
-  const userQuery = req.body.query?.trim();
-  if (!userQuery) return res.status(400).json({ error: "Missing query" });
+  const query = req.body.query;
+
+  if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
-    const searchTool = new SerpAPI(process.env.SERPAPI_API_KEY);
-    const executor = await initializeAgentExecutorWithOptions(
-      [searchTool],
+    // 1. Get Web Search Results from SerpAPI
+    const serpResponse = await axios.get("https://serpapi.com/search", {
+      params: {
+        engine: "google",
+        q: query,
+        api_key: process.env.SERPAPI_API_KEY
+      }
+    });
+
+    const organicResults = serpResponse.data.organic_results?.slice(0, 5) || [];
+
+    // 2. Build prompt for LLM
+    const context = organicResults.map((r, i) => 
+      `${i + 1}. ${r.title}\n${r.snippet}\n${r.link}`
+    ).join("\n\n");
+
+    const prompt = `Based on the following search results, answer this question: "${query}"\n\n${context}`;
+
+    // 3. Send to Gemini or GPT-4o
+    const geminiResponse = await axios.post(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" + process.env.GEMINI_API_KEY,
       {
-        call: async (inputs) => {
-          const result = await model.generateContent(inputs.input);
-          return { content: result.response.text() };
-        },
-      },
-      {
-        agentType: "openai-functions",
-        verbose: true,
+        contents: [{
+          role: "user",
+          parts: [{ text: prompt }]
+        }]
       }
     );
 
-    const answer = await executor.run(userQuery);
-    res.json({ answer });
+    const finalAnswer = geminiResponse.data.candidates[0].content.parts[0].text;
+
+    // 4. Respond to frontend
+    res.json({ answer: finalAnswer });
+
   } catch (err) {
-    console.error("Execution error:", JSON.stringify(err, null, 2));
-    res
-      .status(500)
-      .json({ error: "Failed to generate answer", details: err.message });
+    console.error("❌ Error:", err.response?.data || err.message || err);
+    res.status(500).json({ error: "Failed to get answer" });
   }
 });
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Server running on port " + (process.env.PORT || 3000));
-});
+app.listen(10000, () => console.log("Server running on port 10000"));
