@@ -33,18 +33,23 @@ app.post("/api/search", async (req, res) => {
     const prompt = `Based on the following search results, answer this question: "${query}"\n\n${context}`;
 
     // 3. Send to Gemini or GPT-4o
-    const geminiResponse = await axios.post(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" +
-        process.env.GEMINI_API_KEY,
+   // Gemini endpoint (correct one for Flash 1.5)
+const geminiResponse = await axios.post(
+  `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+  {
+    contents: [
       {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }],
-          },
-        ],
+        role: "user",
+        parts: [{ text: prompt }]
       }
-    );
+    ]
+  },
+  {
+    headers: {
+      "Content-Type": "application/json"
+    }
+  }
+);
 
     const finalAnswer = geminiResponse.data.candidates[0].content.parts[0].text;
 
