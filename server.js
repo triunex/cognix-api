@@ -1,7 +1,7 @@
-import express from 'express';
-import cors from 'cors';
-import axios from 'axios';
-import dotenv from 'dotenv';
+import express from "express";
+import cors from "cors";
+import axios from "axios";
+import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
@@ -19,27 +19,30 @@ app.post("/api/search", async (req, res) => {
       params: {
         engine: "google",
         q: query,
-        api_key: process.env.SERPAPI_API_KEY
-      }
+        api_key: process.env.SERPAPI_API_KEY,
+      },
     });
 
     const organicResults = serpResponse.data.organic_results?.slice(0, 5) || [];
 
     // 2. Build prompt for LLM
-    const context = organicResults.map((r, i) => 
-      `${i + 1}. ${r.title}\n${r.snippet}\n${r.link}`
-    ).join("\n\n");
+    const context = organicResults
+      .map((r, i) => `${i + 1}. ${r.title}\n${r.snippet}\n${r.link}`)
+      .join("\n\n");
 
     const prompt = `Based on the following search results, answer this question: "${query}"\n\n${context}`;
 
     // 3. Send to Gemini or GPT-4o
     const geminiResponse = await axios.post(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" + process.env.GEMINI_API_KEY,
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" +
+        process.env.GEMINI_API_KEY,
       {
-        contents: [{
-          role: "user",
-          parts: [{ text: prompt }]
-        }]
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: prompt }],
+          },
+        ],
       }
     );
 
@@ -47,7 +50,6 @@ app.post("/api/search", async (req, res) => {
 
     // 4. Respond to frontend
     res.json({ answer: finalAnswer });
-
   } catch (err) {
     console.error("❌ Error:", err.response?.data || err.message || err);
     res.status(500).json({ error: "Failed to get answer" });
