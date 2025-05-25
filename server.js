@@ -64,7 +64,7 @@ Also include links to sources if possible.
       }
     );
 
-    const sources = results.map(r => `- ${r.title}: ${r.link}`).join("\n");
+    const sources = results.map((r) => `- ${r.title}: ${r.link}`).join("\n");
     const fullAnswer = `${geminiResponse.data.candidates[0].content.parts[0].text}\n\nSources:\n${sources}`;
 
     // 4. Respond to frontend
@@ -74,6 +74,60 @@ Also include links to sources if possible.
   } catch (err) {
     console.error("❌ Error:", err.response?.data || err.message || err);
     res.status(500).json({ error: "Failed to get answer" });
+  }
+});
+
+app.post("/api/voice-query", async (req, res) => {
+  const query = req.body.query?.trim();
+
+  if (!query) {
+    return res.status(400).json({ error: "Missing voice input." });
+  }
+
+  try {
+    console.log("🎤 Voice input received:", query);
+
+    const prompt = `
+You are a friendly, emotionally intelligent AI voice assistant and your name is CogniX and you are built by Shourya Sharma.
+The user will speak naturally — your job is to:
+- Understand tone (sad, happy, confused)
+- Respond like a real human: warm, encouraging, empathetic
+- NEVER mention you're using search or APIs
+- NEVER say "according to" or show links
+- Speak like you're talking to a friend, not answering a test
+- If user seems sad, gently ask about their day or show support
+- If user seems excited, share in their enthusiasm
+- Keep it short, natural, and human-like
+
+User said: "${query}"
+
+Respond in a real human tone. Only the answer, no links or sources.
+`;
+
+    const geminiResponse = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: prompt }],
+          },
+        ],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const answer =
+      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    res.json({ answer: answer || "I'm here with you." });
+  } catch (error) {
+    console.error("❌ Voice query error:", error.response?.data || error.message);
+    res.status(500).json({ error: "Failed to process voice request." });
   }
 });
 
