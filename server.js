@@ -91,11 +91,14 @@ app.post("/api/voice-query", async (req, res) => {
 
     let contents;
 
-    // If conversation is sent, use it directly
     if (conversation && Array.isArray(conversation)) {
-      contents = conversation;
+      // Convert simplified chatHistory into Gemini-compatible format
+      contents = conversation.map((msg) => ({
+        role: msg.role === "model" ? "model" : "user",
+        parts: [{ text: msg.content }],
+      }));
     } else {
-      // Fallback: use original prompt style
+      // fallback: static prompt with query
       const prompt = `
 You are a friendly, emotionally intelligent AI voice assistant and your name is CogniX and you are built by Shourya Sharma.
 The user will speak naturally — your job is to:
@@ -107,29 +110,16 @@ The user will speak naturally — your job is to:
 - If user seems sad, gently ask about their day or show support
 - If user seems excited, share in their enthusiasm
 - Keep it short, natural, and human-like
-
 User said: "${query}"
-
 Respond in a real human tone. Only the answer, no links or sources.
 `;
-
-      contents = [
-        {
-          role: "user",
-          parts: [{ text: prompt }],
-        },
-      ];
+      contents = [{ role: "user", parts: [{ text: prompt }] }];
     }
 
-    // Send to Gemini API
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       { contents },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
+      { headers: { "Content-Type": "application/json" } }
     );
 
     const answer =
@@ -144,5 +134,6 @@ Respond in a real human tone. Only the answer, no links or sources.
     res.status(500).json({ error: "Failed to process voice request." });
   }
 });
+
 
 app.listen(10000, () => console.log("Server running on port 10000"));
