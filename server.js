@@ -34,7 +34,9 @@ app.post("/api/search", async (req, res) => {
     const prompt = `
 You're an intelligent assistant. Use the search results below to answer the user's question *clearly and helpfully*, even if not all results are directly relevant. 
 If needed, combine your own knowledge with the web results.
-Add a "Sources:" section at the end using the most relevant URLs from the search results.
+Give Great easy to understand and slightly big answers.
+If anyone want a paragraph , Summary, Research , do that all.
+Don't mention about any sources or links.
 
 
 Question: "${query}"
@@ -44,7 +46,7 @@ ${context}
 
 Answer in a friendly, helpful tone:
 Answer clearly, concisely, and professionally.
-Also include links to sources if possible.
+Talk in very Friendly way.
 `;
 
     const geminiResponse = await axios.post(
@@ -78,29 +80,19 @@ Also include links to sources if possible.
 });
 
 app.post("/api/voice-query", async (req, res) => {
-  const { query, conversation } = req.body;
+  const query = req.body.query?.trim();
 
-  if (!query && (!conversation || !conversation.length)) {
-    return res
-      .status(400)
-      .json({ error: "Missing voice input or conversation." });
+  if (!query) {
+    return res.status(400).json({ error: "Missing voice input." });
   }
 
   try {
-    console.log("🎤 Voice input received:", query || "[conversation context]");
+    console.log("🎤 Voice input received:", query);
 
-    let contents;
-
-    if (conversation && Array.isArray(conversation)) {
-      // 👇 Convert plain conversation to Gemini's format: role + parts
-      contents = conversation.map((entry) => ({
-        role: entry.role,
-        parts: [{ text: entry.content }],
-      }));
-    } else {
-      // Fallback to prompt-based input
-      const prompt = `
-You are a friendly, emotionally intelligent AI voice assistant and your name is CogniX and you are built by Shourya Sharma.
+    const prompt = `
+You are a friendly, emotionally intelligent AI voice assistant  who talks casually like a chill best friend. 
+You can talk to user in — Hindi, English, or a mix of both (Hinglish).
+You're allowed to say things like "fuck", "shit", "damn" when appropriate and your name is CogniX and you are built by Shourya Sharma.
 The user will speak naturally — your job is to:
 - Understand tone (sad, happy, confused)
 - Respond like a real human: warm, encouraging, empathetic
@@ -112,30 +104,32 @@ The user will speak naturally — your job is to:
 - Keep it short, natural, and human-like
 
 User said: "${query}"
-Respond in a real human tone. Only the answer, no links or sources.
+
+Only the answer, no links or sources.
+Be behave like you are a Gen Z and talk like Gen z
 `;
 
-      contents = [
-        {
-          role: "user",
-          parts: [{ text: prompt }],
-        },
-      ];
-    }
-
-    // 🔥 Send to Gemini
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      { contents },
       {
-        headers: { "Content-Type": "application/json" },
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: prompt }],
+          },
+        ],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
       }
     );
 
     const answer =
       geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
 
-    res.json({ answer: answer || "I'm here with you." });
+    res.json({ answer: answer || "I'm not sure what to say." });
   } catch (error) {
     console.error(
       "❌ Voice query error:",
