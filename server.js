@@ -78,16 +78,25 @@ Also include links to sources if possible.
 });
 
 app.post("/api/voice-query", async (req, res) => {
-  const query = req.body.query?.trim();
+  const { query, conversation } = req.body;
 
-  if (!query) {
-    return res.status(400).json({ error: "Missing voice input." });
+  if (!query && (!conversation || !conversation.length)) {
+    return res
+      .status(400)
+      .json({ error: "Missing voice input or conversation." });
   }
 
   try {
     console.log("🎤 Voice input received:", query);
 
-    const prompt = `
+    let contents;
+
+    // If conversation is sent, use it directly
+    if (conversation && Array.isArray(conversation)) {
+      contents = conversation;
+    } else {
+      // Fallback: use original prompt style
+      const prompt = `
 You are a friendly, emotionally intelligent AI voice assistant and your name is CogniX and you are built by Shourya Sharma.
 The user will speak naturally — your job is to:
 - Understand tone (sad, happy, confused)
@@ -104,16 +113,18 @@ User said: "${query}"
 Respond in a real human tone. Only the answer, no links or sources.
 `;
 
+      contents = [
+        {
+          role: "user",
+          parts: [{ text: prompt }],
+        },
+      ];
+    }
+
+    // Send to Gemini API
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }],
-          },
-        ],
-      },
+      { contents },
       {
         headers: {
           "Content-Type": "application/json",
@@ -126,7 +137,10 @@ Respond in a real human tone. Only the answer, no links or sources.
 
     res.json({ answer: answer || "I'm here with you." });
   } catch (error) {
-    console.error("❌ Voice query error:", error.response?.data || error.message);
+    console.error(
+      "❌ Voice query error:",
+      error.response?.data || error.message
+    );
     res.status(500).json({ error: "Failed to process voice request." });
   }
 });
