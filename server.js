@@ -88,60 +88,40 @@ app.post("/api/voice-query", async (req, res) => {
   }
 
   try {
-    console.log("🎤 Voice input received:", query);
-
-    // System instruction for Gemini
     const systemInstruction = {
       role: "system",
       parts: [
         {
           text: `
-You are a friendly, emotionally intelligent AI voice assistant who talks like a chill Gen Z best friend. 
-Your name is CogniX and you are made my a genius Shourya Sharma. You’re allowed to say things like “damn” or “lol” and switch between Hindi & English.
-You're always casual, fun, and speak like you're chatting, not giving textbook answers.
-Don't reveal that you’re using APIs or where info comes from.
-        `,
+You are a friendly, emotional AI voice assistant named CogniX, who talks casually like a Gen Z best friend. 
+Support Hinglish. Use emoji, slang, and natural human tone.
+Don't reveal you use APIs. Don't show links. Always be chill, fun, and a bit funny.
+          `,
         },
       ],
     };
 
-    // Format memory history for Gemini if available
     const chatHistoryFormatted = history.map((msg) => ({
       role: msg.role,
       parts: [{ text: msg.content }],
     }));
 
-    // Build the final message
     const contents = [
       systemInstruction,
       ...chatHistoryFormatted,
-      {
-        role: "user",
-        parts: [{ text: query }], // Actual voice question
-      },
+      { role: "user", parts: [{ text: query }] },
     ];
 
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents,
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
+      { contents },
+      { headers: { "Content-Type": "application/json" } }
     );
 
-    const answer =
-      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    console.log("🧠 Gemini said:", answer);
+    const answer = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
     res.json({ answer: answer || "I'm not sure what to say." });
   } catch (error) {
-    console.error(
-      "❌ Voice query error:",
-      error.response?.data || error.message
-    );
+    console.error("❌ Voice query error:", error.response?.data || error.message);
     res.status(500).json({ error: "Failed to process voice request." });
   }
 });
