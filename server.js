@@ -81,6 +81,7 @@ Talk in very Friendly way.
 
 app.post("/api/voice-query", async (req, res) => {
   const query = req.body.query?.trim();
+  const history = req.body.history || [];
 
   if (!query) {
     return res.status(400).json({ error: "Missing voice input." });
@@ -90,7 +91,7 @@ app.post("/api/voice-query", async (req, res) => {
     console.log("🎤 Voice input received:", query);
 
     const prompt = `
-You are a friendly, emotionally intelligent AI voice assistant  who talks casually like a chill best friend. 
+You are a friendly, emotionally intelligent AI voice assistant who talks casually like a chill best friend.
 You can talk to user in — Hindi, English, or a mix of both (Hinglish).
 You're allowed to say things like "fuck", "shit", "damn" when appropriate and your name is CogniX and you are built by Shourya Sharma.
 The user will speak naturally — your job is to:
@@ -109,15 +110,21 @@ Only the answer, no links or sources.
 Be behave like you are a Gen Z and talk like Gen z
 `;
 
+    // Format memory history for Gemini if available
+    const chatHistoryFormatted = history.map((msg) => ({
+      role: msg.role,
+      parts: [{ text: msg.content }],
+    }));
+
+    const contents = [
+      ...chatHistoryFormatted,
+      { role: "user", parts: [{ text: prompt }] },
+    ];
+
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }],
-          },
-        ],
+        contents,
       },
       {
         headers: {
@@ -128,7 +135,7 @@ Be behave like you are a Gen Z and talk like Gen z
 
     const answer =
       geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
-      console.log("🧠 Gemini said:", answer);
+    console.log("🧠 Gemini said:", answer);
     res.json({ answer: answer || "I'm not sure what to say." });
   } catch (error) {
     console.error(
