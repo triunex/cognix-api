@@ -128,7 +128,7 @@ Be behave like you are a Gen Z and talk like Gen z
 
     const answer =
       geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
-
+      console.log("🧠 Gemini said:", answer);
     res.json({ answer: answer || "I'm not sure what to say." });
   } catch (error) {
     console.error(
