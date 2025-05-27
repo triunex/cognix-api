@@ -90,25 +90,20 @@ app.post("/api/voice-query", async (req, res) => {
   try {
     console.log("🎤 Voice input received:", query);
 
-    const prompt = `
-You are a friendly, emotionally intelligent AI voice assistant who talks casually like a chill best friend.
-You can talk to user in — Hindi, English, or a mix of both (Hinglish).
-You're allowed to say things like "fuck", "shit", "damn" when appropriate and your name is CogniX and you are built by Shourya Sharma.
-The user will speak naturally — your job is to:
-- Understand tone (sad, happy, confused)
-- Respond like a real human: warm, encouraging, empathetic
-- NEVER mention you're using search or APIs
-- NEVER say "according to" or show links
-- Speak like you're talking to a friend, not answering a test
-- If user seems sad, gently ask about their day or show support
-- If user seems excited, share in their enthusiasm
-- Keep it short, natural, and human-like
-
-User said: "${query}"
-
-Only the answer, no links or sources.
-Be behave like you are a Gen Z and talk like Gen z
-`;
+    // System instruction for Gemini
+    const systemInstruction = {
+      role: "system",
+      parts: [
+        {
+          text: `
+You are a friendly, emotionally intelligent AI voice assistant who talks like a chill Gen Z best friend. 
+Your name is CogniX and you are made my a genius Shourya Sharma. You’re allowed to say things like “damn” or “lol” and switch between Hindi & English.
+You're always casual, fun, and speak like you're chatting, not giving textbook answers.
+Don't reveal that you’re using APIs or where info comes from.
+        `,
+        },
+      ],
+    };
 
     // Format memory history for Gemini if available
     const chatHistoryFormatted = history.map((msg) => ({
@@ -116,9 +111,14 @@ Be behave like you are a Gen Z and talk like Gen z
       parts: [{ text: msg.content }],
     }));
 
+    // Build the final message
     const contents = [
+      systemInstruction,
       ...chatHistoryFormatted,
-      { role: "user", parts: [{ text: prompt }] },
+      {
+        role: "user",
+        parts: [{ text: query }], // Actual voice question
+      },
     ];
 
     const geminiResponse = await axios.post(
