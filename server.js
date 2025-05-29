@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
+import { addToMemory, getMemory } from "@/utils/memory"; // Import memory utilities
 dotenv.config();
 
 const app = express();
@@ -90,6 +91,12 @@ app.post("/api/voice-query", async (req, res) => {
   try {
     console.log("🎤 Voice input received:", query);
 
+    // Store the user's message in memory
+    addToMemory(query);
+
+    // Retrieve memory context
+    const memoryContext = getMemory();
+
     const prompt = `
 You are a friendly, emotionally intelligent AI voice assistant who talks casually like a chill best friend.
 You can talk to user in — Hindi, English, or a mix of both (Hinglish).
@@ -103,6 +110,8 @@ The user will speak naturally — your job is to:
 - If user seems sad, gently ask about their day or show support
 - If user seems excited, share in their enthusiasm
 - Keep it short, natural, and human-like
+
+Recent Context: "${memoryContext}"
 
 User said: "${query}"
 
