@@ -146,4 +146,76 @@ Be behave like you are a Gen Z and talk like Gen z
   }
 });
 
+app.post("/api/chat", async (req, res) => {
+  const userMessage = req.body.query;
+  const history = req.body.history || [];
+
+  if (!userMessage) {
+    return res.status(400).json({ error: "Missing message." });
+  }
+
+  try {
+    // Check if message is asking for real-time info
+    const triggerRealTime = /today|now|latest|breaking|news/i.test(userMessage);
+
+    let serpContext = "";
+
+    if (triggerRealTime) {
+      const serpResponse = await axios.get("https://serpapi.com/search", {
+        params: {
+          engine: "google",
+          q: userMessage,
+          api_key: process.env.SERPAPI_API_KEY,
+        },
+      });
+
+      const results = serpResponse.data.organic_results?.slice(0, 5) || [];
+      serpContext = results
+        .map(
+          (r, i) =>
+            `${i + 1}. ${r.title}\n${r.snippet || ""}\nSource: ${r.link}`
+        )
+        .join("\n\n");
+    }
+
+    // Build AI prompt
+    const finalPrompt = triggerRealTime
+      ? `
+You are CogniX – a friendly, real-time aware assistant.
+User asked: "${userMessage}"
+
+These are the latest search results:
+${serpContext}
+
+Answer like you're smart, helpful and human. Don’t mention these are search results.
+Be conversational and up-to-date.
+`
+      : userMessage;
+
+    const formattedHistory = history.map((msg) => ({
+      role: msg.role,
+      parts: [{ text: msg.content }],
+    }));
+
+    const geminiRes = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [
+          ...formattedHistory,
+          { role: "user", parts: [{ text: finalPrompt }] },
+        ],
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+
+    const reply = geminiRes.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    res.json({ reply });
+  } catch (err) {
+    console.error("❌ Chat error:", err.response?.data || err.message);
+    res.status(500).json({ error: "Failed to respond." });
+  }
+});
+
 app.listen(10000, () => console.log("Server running on port 10000"));
