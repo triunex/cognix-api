@@ -2,9 +2,9 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
+import { addToMemory, getMemory, resetMemory } from "./utils/memory.js";
 dotenv.config();
 
-const { addToMemory, getMemory, resetMemory } = require("./utils/memory");
 
 const app = express();
 app.use(cors({ origin: "*", methods: ["POST", "OPTIONS"] }));
