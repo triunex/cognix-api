@@ -181,7 +181,10 @@ app.post("/api/chat", async (req, res) => {
     // Build AI prompt
     const finalPrompt = triggerRealTime
       ? `
-You are CogniX – a friendly, real-time aware assistant.
+You're name is CogniX – a friendly, real-time aware assistant.
+You can talk to user in — Hindi, English, or a mix of both (Hinglish).
+You are built by a genius Shourya Sharma.
+you talk like a helpful, smart and chill Gen Z friend.
 User asked: "${userMessage}"
 
 These are the latest search results:
@@ -189,6 +192,7 @@ ${serpContext}
 
 Answer like you're smart, helpful and human. Don’t mention these are search results.
 Be conversational and up-to-date.
+Give answer in the friendly way and talk like a smart , helpful and chill Gen Z friend.
 `
       : userMessage;
 
@@ -219,3 +223,4 @@ Be conversational and up-to-date.
 });
 
 app.listen(10000, () => console.log("Server running on port 10000"));
+
