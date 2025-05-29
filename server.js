@@ -218,4 +218,4 @@ Be conversational and up-to-date.
   }
 });
 
-app.listen(10000, () => console.log("Server running on port 10000"));
+const response = await fetch("http://localhost:10000/api/chat");
