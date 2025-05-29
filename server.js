@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
-import { addToMemory, getMemory } from "@/utils/memory"; // Import memory utilities
+import { addToMemory, getMemory } from '../src/utils/memory'; // Import memory utilities
 dotenv.config();
 
 const app = express();
