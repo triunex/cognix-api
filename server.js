@@ -223,5 +223,53 @@ Give answer in the friendly way and talk like a smart , helpful and chill Gen Z 
   }
 });
 
+app.post("/api/research", async (req, res) => {
+  const query = req.body.query;
+
+  if (!query) return res.status(400).json({ error: "Missing query" });
+
+  const prompt = `
+You are CogniX – an AI Researcher.
+The user wants deep research on the following topic:
+"${query}"
+
+Please write a detailed, well-structured research article including:
+- Introduction
+- Core Analysis (include relevant facts, trends, and reasoning)
+- Conclusion
+
+Keep it insightful and easy to understand.
+Do not mention you are an AI or where this info came from.
+Use a friendly but professional tone.
+Length: 500–1000 words.
+`;
+
+  try {
+    const geminiResponse = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: prompt }],
+          },
+        ],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const answer =
+      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    res.json({ result: answer });
+  } catch (error) {
+    console.error("Research API error:", error.response?.data || error.message);
+    res.status(500).json({ error: "Failed to generate research." });
+  }
+});
+
 app.listen(10000, () => console.log("Server running on port 10000"));
 
