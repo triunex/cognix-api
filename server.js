@@ -271,5 +271,41 @@ Length: 500–1000 words.
   }
 });
 
+app.post("/api/summarize", async (req, res) => {
+  const content = req.body.content;
+
+  if (!content) return res.status(400).json({ error: "Missing content." });
+
+  const prompt = `
+Summarize the following content in a clear, friendly, and helpful way. Use bullet points for key ideas and a short conclusion if needed.
+and dont use any signs like - , * , # and etc.
+
+Content:
+${content}
+`;
+
+  try {
+    const geminiResponse = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const answer =
+      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    res.json({ result: answer });
+  } catch (error) {
+    console.error("Summarizer error:", error.response?.data || error.message);
+    res.status(500).json({ error: "Summarization failed." });
+  }
+});
+
+
 app.listen(10000, () => console.log("Server running on port 10000"));
 
