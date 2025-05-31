@@ -385,4 +385,37 @@ app.get("/api/article", async (req, res) => {
   }
 });
 
+app.post("/api/summarize-article", async (req, res) => {
+  const { content } = req.body;
+  if (!content)
+    return res.status(400).json({ error: "Missing article content." });
+
+  const prompt = `
+Summarize the following article into a concise, friendly summary with clear bullet points:
+
+${content}
+`;
+
+  try {
+    const geminiRes = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const reply = geminiRes.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    res.json({ summary: reply });
+  } catch (err) {
+    console.error("Gemini summarization error:", err.message);
+    res.status(500).json({ error: "Could not summarize article." });
+  }
+});
+
+
 app.listen(10000, () => console.log("Server running on port 10000"));
