@@ -4,6 +4,8 @@ import axios from "axios";
 import dotenv from "dotenv";
 dotenv.config();
 
+const Mercury = require("@postlight/mercury-parser");
+
 const app = express();
 app.use(cors({ origin: "*", methods: ["POST", "OPTIONS"] }));
 app.use(express.json());
@@ -352,6 +354,25 @@ app.get("/api/suggest", async (req, res) => {
   } catch (err) {
     console.error("Suggest error:", err);
     res.status(500).json({ error: "Failed to fetch suggestions" });
+  }
+});
+
+app.get("/api/article", async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: "Missing article URL" });
+
+  try {
+    const result = await Mercury.parse(url);
+    res.json({
+      title: result.title,
+      content: result.content,
+      author: result.author,
+      date_published: result.date_published,
+      lead_image_url: result.lead_image_url,
+    });
+  } catch (error) {
+    console.error("Article fetch error:", error.message);
+    res.status(500).json({ error: "Failed to parse article." });
   }
 });
 
