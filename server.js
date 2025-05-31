@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
+import Mercury from "@postlight/mercury-parser";
 dotenv.config();
 
 const app = express();
@@ -354,9 +355,6 @@ app.get("/api/suggest", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch suggestions" });
   }
 });
-
-
-const Mercury = require("@postlight/mercury-parser");
 
 app.get("/api/article", async (req, res) => {
   const { url } = req.query;
