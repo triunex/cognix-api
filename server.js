@@ -314,33 +314,35 @@ ${content}
 });
 
 app.get("/api/news", async (req, res) => {
+  const category = req.query.category || "latest";
+
   try {
     const newsRes = await axios.get("https://serpapi.com/search", {
       params: {
         engine: "google",
-        q: "latest news",
+        q: `${category} news`,
         tbm: "nws",
         api_key: process.env.SERPAPI_API_KEY,
       },
     });
 
-    const results = newsRes.data.news_results?.slice(0, 10) || [];
+    const articles =
+      newsRes.data.news_results?.map((item) => ({
+        title: item.title,
+        link: item.link,
+        source: item.source,
+        date: item.date,
+        thumbnail: item.thumbnail,
+        snippet: item.snippet,
+      })) || [];
 
-    const newsList = results.map((item) => ({
-      title: item.title,
-      link: item.link,
-      source: item.source,
-      date: item.date,
-      thumbnail: item.thumbnail,
-      snippet: item.snippet,
-    }));
-
-    res.json({ articles: newsList });
+    res.json({ articles });
   } catch (err) {
-    console.error("News API error:", err);
-    res.status(500).json({ error: "Failed to fetch news." });
+    console.error("News fetch error:", err.message);
+    res.status(500).json({ error: "Could not fetch news." });
   }
 });
+
 
 app.get("/api/suggest", async (req, res) => {
   const q = req.query.q;
