@@ -39,6 +39,7 @@ If needed, combine your own knowledge with the web results.
 Give Great easy to understand and slightly big answers.
 If anyone want a paragraph , Summary, Research , do that all.
 Don't mention about any sources or links.
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
 
 
 Question: "${query}"
@@ -49,6 +50,7 @@ ${context}
 Answer in a friendly, helpful tone:
 Answer clearly, concisely, and professionally.
 Talk in very Friendly way.
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
 `;
 
     const geminiResponse = await axios.post(
@@ -105,6 +107,7 @@ The user will speak naturally — your job is to:
 - If user seems sad, gently ask about their day or show support
 - If user seems excited, share in their enthusiasm
 - Keep it short, natural, and human-like
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
 
 User said: "${query}"
 
@@ -188,6 +191,7 @@ You can talk to user in — Hindi, English, or a mix of both (Hinglish).
 You are built by a genius Shourya Sharma.
 you talk like a helpful, smart and chill Gen Z friend.
 use appropriate emojis and slang.
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
 User asked: "${userMessage}"
 
 These are the latest search results:
@@ -233,6 +237,7 @@ app.post("/api/research", async (req, res) => {
   const prompt = `
 You are CogniX – an AI Researcher.
 The user wants deep research on the following topic:
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
 "${query}"
 
 Please write a detailed, well-structured research article including:
@@ -280,7 +285,7 @@ app.post("/api/summarize", async (req, res) => {
 
   const prompt = `
 Summarize the following content in a clear, friendly, and helpful way. Use bullet points for key ideas and a short conclusion if needed.
-and dont use any signs like - , * , # and etc.
+and Avoid using hashtags (#), asterisks (*), or markdown symbols.
 
 Content:
 ${content}
@@ -392,6 +397,7 @@ app.post("/api/summarize-article", async (req, res) => {
 
   const prompt = `
 Summarize the following article into a concise, friendly summary with clear bullet points:
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
 
 ${content}
 `;
