@@ -306,6 +306,55 @@ ${content}
   }
 });
 
+app.get("/api/news", async (req, res) => {
+  try {
+    const newsRes = await axios.get("https://serpapi.com/search", {
+      params: {
+        engine: "google",
+        q: "latest news",
+        tbm: "nws",
+        api_key: process.env.SERPAPI_API_KEY,
+      },
+    });
+
+    const results = newsRes.data.news_results?.slice(0, 10) || [];
+
+    const newsList = results.map((item) => ({
+      title: item.title,
+      link: item.link,
+      source: item.source,
+      date: item.date,
+      thumbnail: item.thumbnail,
+      snippet: item.snippet,
+    }));
+
+    res.json({ articles: newsList });
+  } catch (err) {
+    console.error("News API error:", err);
+    res.status(500).json({ error: "Failed to fetch news." });
+  }
+});
+
+app.get("/api/suggest", async (req, res) => {
+  const q = req.query.q;
+
+  try {
+    const response = await axios.get("https://serpapi.com/search", {
+      params: {
+        engine: "google_autocomplete",
+        q,
+        api_key: process.env.SERPAPI_API_KEY,
+      },
+    });
+
+    const suggestions = response.data.suggestions?.map((s) => s.value) || [];
+    res.json({ suggestions });
+  } catch (err) {
+    console.error("Suggest error:", err);
+    res.status(500).json({ error: "Failed to fetch suggestions" });
+  }
+});
+
 
 app.listen(10000, () => console.log("Server running on port 10000"));
 
