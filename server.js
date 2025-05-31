@@ -2,7 +2,8 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
-import Mercury from "@postlight/mercury-parser";
+import unfluff from "unfluff";
+
 dotenv.config();
 
 const app = express();
@@ -361,20 +362,27 @@ app.get("/api/article", async (req, res) => {
   if (!url) return res.status(400).json({ error: "Missing article URL" });
 
   try {
-    const result = await Mercury.parse(url);
+    const response = await axios.get(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+      },
+      timeout: 10000, // 10 seconds timeout
+    });
+
+    const parsed = unfluff(response.data);
+
     res.json({
-      title: result.title,
-      content: result.content,
-      author: result.author,
-      date_published: result.date_published,
-      lead_image_url: result.lead_image_url,
+      title: parsed.title,
+      content: parsed.text?.replace(/\n/g, "<br />"),
+      author: parsed.author,
+      date_published: parsed.date,
+      lead_image_url: parsed.image,
     });
   } catch (error) {
-    console.error("Article fetch error:", error.message);
-    res.status(500).json({ error: "Failed to parse article." });
+    console.error("Unfluff failed:", error.message);
+    res.status(500).json({ error: "Failed to extract article." });
   }
 });
 
-
 app.listen(10000, () => console.log("Server running on port 10000"));
-
