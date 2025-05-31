@@ -4,8 +4,6 @@ import axios from "axios";
 import dotenv from "dotenv";
 dotenv.config();
 
-const Mercury = require("@postlight/mercury-parser");
-
 const app = express();
 app.use(cors({ origin: "*", methods: ["POST", "OPTIONS"] }));
 app.use(express.json());
@@ -356,6 +354,9 @@ app.get("/api/suggest", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch suggestions" });
   }
 });
+
+
+const Mercury = require("@postlight/mercury-parser");
 
 app.get("/api/article", async (req, res) => {
   const { url } = req.query;
