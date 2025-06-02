@@ -429,7 +429,6 @@ ${content}
     res.status(500).json({ error: "Could not summarize article." });
   }
 });
-
 app.post("/api/vision", async (req, res) => {
   const { image } = req.body;
 
@@ -438,12 +437,11 @@ app.post("/api/vision", async (req, res) => {
   }
 
   try {
-    const base64Image = image.split(",")[1]; // Remove "data:image/jpeg;base64,"
-    const prompt =
-      "What do you see in this image? Give a helpful and friendly response.";
+    const base64Image = image.split(",")[1]; // remove 'data:image/jpeg;base64,'
+    const prompt = "Describe what you see in this image in a helpful, friendly way.";
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/model:gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1/models/gemini-pro-vision:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [
           {
@@ -451,7 +449,7 @@ app.post("/api/vision", async (req, res) => {
             parts: [
               {
                 inlineData: {
-                  mimeType: "image/jpeg",
+                  mimeType: "image/jpeg", // or image/png if needed
                   data: base64Image,
                 },
               },
@@ -470,14 +468,12 @@ app.post("/api/vision", async (req, res) => {
     );
 
     const reply = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    res.json({ response: reply });
+    res.json({ response: reply || "I couldn’t see anything clearly." });
   } catch (error) {
     console.error("Vision API Error:", error.response?.data || error.message);
     res.status(500).json({ error: "Failed to process image." });
   }
 });
-
-
 
 
 app.listen(10000, () => console.log("Server running on port 10000"));
