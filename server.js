@@ -439,10 +439,11 @@ app.post("/api/vision", async (req, res) => {
 
   try {
     const base64Image = image.split(",")[1]; // Remove "data:image/jpeg;base64,"
-    const prompt = "What do you see in this image? Give a helpful and friendly response.";
+    const prompt =
+      "What do you see in this image? Give a helpful and friendly response.";
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-pro-vision:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1/models/model:gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [
           {
