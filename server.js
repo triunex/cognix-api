@@ -3,10 +3,15 @@ import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
+import bodyParser from "body-parser";
 
 dotenv.config();
 
+
+
 const app = express();
+app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
+
 app.use(cors({ origin: "*", methods: ["POST", "OPTIONS"] }));
 app.use(express.json());
 
@@ -424,6 +429,39 @@ ${content}
     res.status(500).json({ error: "Could not summarize article." });
   }
 });
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+app.post("/api/vision", async (req, res) => {
+  try {
+    const { image } = req.body;
+
+    if (!image || !image.startsWith("data:image")) {
+      return res.status(400).json({ error: "Invalid image format" });
+    }
+
+    const base64Data = image.split(",")[1]; // remove data:image/jpeg;base64,...
+
+    const model = genAI.getGenerativeModel({ model: "gemini-pro-vision" });
+
+    const result = await model.generateContent([
+      {
+        inlineData: {
+          mimeType: "image/jpeg",
+          data: base64Data,
+        },
+      },
+      "Describe what you see and offer helpful information like a friend would.",
+    ]);
+
+    const text = result.response.text();
+    return res.json({ response: text });
+  } catch (err) {
+    console.error("Vision API error:", err);
+    res.status(500).json({ error: "Something went wrong with Vision AI." });
+  }
+});
+
 
 
 app.listen(10000, () => console.log("Server running on port 10000"));
