@@ -432,22 +432,15 @@ ${content}
 app.post("/api/vision", async (req, res) => {
   const { image } = req.body;
 
-  if (!image) {
-    return res.status(400).json({ error: "Missing image data." });
+  if (!image || typeof image !== "string") {
+    return res.status(400).json({ error: "Missing or invalid image data." });
   }
-
-  const base64Image = image.split(",")[1]; // remove data:image/jpeg;base64,
-  console.log("Image length:", base64Image.length); // Log image size
-
-  if (base64Image.length < 1000) {
-    return res.status(400).json({ error: "Image data too short or empty." });
-  }
-
-  const prompt = "Describe what you see in this image like a friendly AI.";
 
   try {
+    const base64Image = image.replace(/^data:image\/\w+;base64,/, "");
+
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-pro-vision:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [
           {
@@ -459,20 +452,25 @@ app.post("/api/vision", async (req, res) => {
                   data: base64Image,
                 },
               },
-              { text: prompt },
+              {
+                text: "Describe what you see in this image like a friendly AI assistant.",
+              },
             ],
           },
         ],
       },
       {
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+        },
       }
     );
 
-    const reply = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    res.json({ response: reply || "Could not see clearly." });
-  } catch (err) {
-    console.error("Gemini Vision API ERROR:", err.response?.data || err.message);
+    const reply =
+      response.data.candidates?.[0]?.content?.parts?.[0]?.text || "No description available.";
+    res.json({ response: reply });
+  } catch (error) {
+    console.error("Gemini 1.5 Vision API ERROR:", error.response?.data || error.message);
     res.status(500).json({ error: "Failed to process image." });
   }
 });
