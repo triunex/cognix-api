@@ -436,10 +436,16 @@ app.post("/api/vision", async (req, res) => {
     return res.status(400).json({ error: "Missing image data." });
   }
 
-  try {
-    const base64Image = image.split(",")[1]; // remove 'data:image/jpeg;base64,'
-    const prompt = "Describe what you see in this image in a helpful, friendly way.";
+  const base64Image = image.split(",")[1]; // remove data:image/jpeg;base64,
+  console.log("Image length:", base64Image.length); // Log image size
 
+  if (base64Image.length < 1000) {
+    return res.status(400).json({ error: "Image data too short or empty." });
+  }
+
+  const prompt = "Describe what you see in this image like a friendly AI.";
+
+  try {
     const response = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-pro-vision:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
@@ -449,31 +455,26 @@ app.post("/api/vision", async (req, res) => {
             parts: [
               {
                 inlineData: {
-                  mimeType: "image/jpeg", // or image/png if needed
+                  mimeType: "image/jpeg",
                   data: base64Image,
                 },
               },
-              {
-                text: prompt,
-              },
+              { text: prompt },
             ],
           },
         ],
       },
       {
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
       }
     );
 
     const reply = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    res.json({ response: reply || "I couldn’t see anything clearly." });
-  } catch (error) {
-    console.error("Vision API Error:", error.response?.data || error.message);
+    res.json({ response: reply || "Could not see clearly." });
+  } catch (err) {
+    console.error("Gemini Vision API ERROR:", err.response?.data || err.message);
     res.status(500).json({ error: "Failed to process image." });
   }
 });
-
 
 app.listen(10000, () => console.log("Server running on port 10000"));
