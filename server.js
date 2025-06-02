@@ -430,37 +430,52 @@ ${content}
   }
 });
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
 app.post("/api/vision", async (req, res) => {
+  const { image } = req.body;
+
+  if (!image) {
+    return res.status(400).json({ error: "Missing image data." });
+  }
+
   try {
-    const { image } = req.body;
+    const base64Image = image.split(",")[1]; // Remove "data:image/jpeg;base64,"
+    const prompt = "What do you see in this image? Give a helpful and friendly response.";
 
-    if (!image || !image.startsWith("data:image")) {
-      return res.status(400).json({ error: "Invalid image format" });
-    }
-
-    const base64Data = image.split(",")[1]; // remove data:image/jpeg;base64,...
-
-    const model = genAI.getGenerativeModel({ model: "gemini-pro-vision" });
-
-    const result = await model.generateContent([
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-pro-vision:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
-        inlineData: {
-          mimeType: "image/jpeg",
-          data: base64Data,
-        },
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                inlineData: {
+                  mimeType: "image/jpeg",
+                  data: base64Image,
+                },
+              },
+              {
+                text: prompt,
+              },
+            ],
+          },
+        ],
       },
-      "Describe what you see and offer helpful information like a friend would.",
-    ]);
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
-    const text = result.response.text();
-    return res.json({ response: text });
-  } catch (err) {
-    console.error("Vision API error:", err);
-    res.status(500).json({ error: "Something went wrong with Vision AI." });
+    const reply = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    res.json({ response: reply });
+  } catch (error) {
+    console.error("Vision API Error:", error.response?.data || error.message);
+    res.status(500).json({ error: "Failed to process image." });
   }
 });
+
 
 
 
