@@ -5,7 +5,6 @@ import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
 import multer from "multer";
-const multer = multerPkg.default;
 import fs from "fs";
 import { extractPDFText, runImageCaptioningModel } from "./utils"; // Ensure these utility functions exist
 
