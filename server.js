@@ -4,19 +4,16 @@ import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
-import multer from "multer";
-import fs from "fs";
-import { extractPDFText, runImageCaptioningModel } from "./utils"; // Ensure these utility functions exist
 
 dotenv.config();
+
+
 
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 
 app.use(cors({ origin: "*", methods: ["POST", "OPTIONS"] }));
 app.use(express.json());
-
-const upload = multer({ dest: "uploads/" }); // Temporary storage for uploaded files
 
 app.post("/api/search", async (req, res) => {
   const query = req.body.query;
@@ -351,6 +348,7 @@ app.get("/api/news", async (req, res) => {
   }
 });
 
+
 app.get("/api/suggest", async (req, res) => {
   const q = req.query.q;
 
@@ -478,42 +476,6 @@ app.post("/api/vision", async (req, res) => {
       error.response?.data || error.message
     );
     res.status(500).json({ error: "Failed to process image." });
-  }
-});
-app.post("/api/message", upload.single("file"), async (req, res) => {
-  const message = req.body.message;
-  const file = req.file;
-
-  let extractedText = "";
-
-  try {
-    if (file.mimetype === "application/pdf") {
-      extractedText = await extractPDFText(file.path);
-    } else if (file.mimetype.startsWith("image/")) {
-      extractedText = await runImageCaptioningModel(file.path);
-    } else if (file.mimetype === "text/plain") {
-      extractedText = fs.readFileSync(file.path, "utf-8");
-    }
-
-    const finalPrompt = `${message}\n\nAttached Content:\n${extractedText}`;
-    const geminiResponse = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [{ role: "user", parts: [{ text: finalPrompt }] }],
-      },
-      {
-        headers: { "Content-Type": "application/json" },
-      }
-    );
-
-    const reply =
-      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    res.json({ reply });
-  } catch (error) {
-    console.error("❌ File processing error:", error.message);
-    res.status(500).json({ error: "Failed to process file." });
-  } finally {
-    if (file) fs.unlinkSync(file.path); // Clean up temporary file
   }
 });
 
