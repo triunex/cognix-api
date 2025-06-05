@@ -429,54 +429,5 @@ ${content}
     res.status(500).json({ error: "Could not summarize article." });
   }
 });
-app.post("/api/vision", async (req, res) => {
-  const { image } = req.body;
-
-  if (!image || typeof image !== "string") {
-    return res.status(400).json({ error: "Missing or invalid image data." });
-  }
-
-  try {
-    const base64Image = image.replace(/^data:image\/\w+;base64,/, "");
-
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                inlineData: {
-                  mimeType: "image/jpeg",
-                  data: base64Image,
-                },
-              },
-              {
-                text: "Describe what you see in this image like a friendly AI assistant.",
-              },
-            ],
-          },
-        ],
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    const reply =
-      response.data.candidates?.[0]?.content?.parts?.[0]?.text ||
-      "No description available.";
-    res.json({ response: reply });
-  } catch (error) {
-    console.error(
-      "Gemini 1.5 Vision API ERROR:",
-      error.response?.data || error.message
-    );
-    res.status(500).json({ error: "Failed to process image." });
-  }
-});
 
 app.listen(10000, () => console.log("Server running on port 10000"));
