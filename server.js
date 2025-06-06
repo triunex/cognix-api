@@ -4,6 +4,8 @@ import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
+import puppeteer from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
 dotenv.config();
 
@@ -426,6 +428,62 @@ ${content}
   } catch (err) {
     console.error("Gemini summarization error:", err.message);
     res.status(500).json({ error: "Could not summarize article." });
+  }
+});
+
+app.post("/api/browser-agent", async (req, res) => {
+  const { url } = req.body;
+
+  if (!url) {
+    return res.status(400).json({ error: "Missing URL." });
+  }
+
+  try {
+    const puppeteer = await import("puppeteer-extra"); // for ESM
+    const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
+      .default;
+
+    puppeteer.use(StealthPlugin()); // Use stealth plugin
+
+    const browser = await puppeteer.launch({ headless: "new" });
+    const page = await browser.newPage();
+
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
+
+    const text = await page.evaluate(() => {
+      return document.body.innerText; // Scrape the page content
+    });
+
+    await browser.close();
+
+    const prompt = `
+Summarize this webpage in a clean and helpful way. Use bullet points and avoid tech talk.
+Make it friendly, human-like, and easy to understand.
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
+
+Here's the content from the page:
+${text}
+    `;
+
+    const geminiResponse = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const answer =
+      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    res.json({ summary: answer || "Gemini couldn't summarize the page." });
+  } catch (err) {
+    console.error("Browser Agent Error:", err.message || err);
+    res.status(500).json({ error: "Failed to read page." });
   }
 });
 
