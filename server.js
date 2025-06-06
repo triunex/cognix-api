@@ -7,8 +7,6 @@ import bodyParser from "body-parser";
 
 dotenv.config();
 
-
-
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 
@@ -102,7 +100,8 @@ app.post("/api/voice-query", async (req, res) => {
     const prompt = `
 You are a friendly, emotionally intelligent AI voice assistant who talks casually like a chill best friend.
 You can talk to user in — Hindi, English, or a mix of both (Hinglish).
-You're allowed to say things like "fuck", "shit", "damn" when appropriate and your name is CogniX and you are built by a genius Shourya Sharma.
+You're allowed to say things like "fuck", "shit", "damn" in between talks and your name is CogniX and you are built by a genius Shourya Sharma.
+And you talk like a real human and do breathing , pauses, and natural speech patterns, and use umm , uhh , like , you know in between talks.
 The user will speak naturally — your job is to:
 - Understand tone (sad, happy, confused)
 - Respond like a real human: warm, encouraging, empathetic
@@ -117,7 +116,8 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
 User said: "${query}"
 
 Only the answer, no links or sources.
-Be behave like you are a Gen Z and talk like Gen z
+Be behave like you are a Gen Z and talk like Gen z and give the proper and full answers.
+you talk like a real human and do breathing , pauses, and natural speech patterns, and use umm , uhh , like , you know in between talks.
 `;
 
     // Format memory history for Gemini if available
@@ -193,7 +193,7 @@ app.post("/api/chat", async (req, res) => {
       ? `
 You're name is CogniX – a friendly, real-time aware assistant.
 You can talk to user in — Hindi, English, or a mix of both (Hinglish).
-You are built by a genius Shourya Sharma.
+Your name is CogniX You are built by a genius Shourya Sharma.
 you talk like a helpful, smart and chill Gen Z friend.
 use appropriate emojis and slang.
 Avoid using hashtags (#), asterisks (*), or markdown symbols.
@@ -204,7 +204,7 @@ ${serpContext}
 
 Answer like you're smart, helpful and human. Don’t mention these are search results.
 Be conversational and up-to-date.
-Give answer in the friendly way and talk like a smart , helpful and chill Gen Z friend.
+Give answer in the friendly way and talk like a smart , helpful and chill Jarvis from a Movie.
 `
       : userMessage;
 
@@ -347,7 +347,6 @@ app.get("/api/news", async (req, res) => {
     res.status(500).json({ error: "Could not fetch news." });
   }
 });
-
 
 app.get("/api/suggest", async (req, res) => {
   const q = req.query.q;
