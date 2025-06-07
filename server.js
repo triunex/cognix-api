@@ -1,4 +1,3 @@
-import express from "express";
 import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
@@ -439,12 +438,6 @@ app.post("/api/browser-agent", async (req, res) => {
   }
 
   try {
-    const puppeteer = await import("puppeteer-extra"); // for ESM
-    const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
-      .default;
-
-    puppeteer.use(StealthPlugin()); // Use stealth plugin
-
     const browser = await puppeteer.launch({ headless: "new" });
     const page = await browser.newPage();
 
