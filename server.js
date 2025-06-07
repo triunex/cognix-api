@@ -8,7 +8,7 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
 dotenv.config();
 
-app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
+
 
 app.use(cors({ origin: "*", methods: ["POST", "OPTIONS"] }));
 app.use(express.json());
