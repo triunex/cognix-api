@@ -1,13 +1,11 @@
-import express from "express";
 import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
+import gptChat from "./chat-gpt.js";
 
 dotenv.config();
-
-
 
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
@@ -348,7 +346,6 @@ app.get("/api/news", async (req, res) => {
   }
 });
 
-
 app.get("/api/suggest", async (req, res) => {
   const q = req.query.q;
 
@@ -479,5 +476,6 @@ app.post("/api/vision", async (req, res) => {
   }
 });
 
+app.use("/api/chat-gpt", gptChat);
 
 app.listen(10000, () => console.log("Server running on port 10000"));
