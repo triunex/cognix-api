@@ -479,38 +479,5 @@ app.post("/api/vision", async (req, res) => {
   }
 });
 
-app.post("/api/youtube-search", async (req, res) => {
-  const query = req.body.query;
-  if (!query) return res.status(400).json({ error: "Missing query" });
-
-  try {
-    const ytResponse = await axios.get(
-      "https://www.googleapis.com/youtube/v3/search",
-      {
-        params: {
-          key: process.env.YOUTUBE_API_KEY, // ✅ ADD THIS TO .env FILE
-          q: query,
-          part: "snippet",
-          type: "video",
-          maxResults: 1,
-        },
-      }
-    );
-
-    const video = ytResponse.data.items?.[0];
-    if (!video) return res.status(404).json({ error: "No video found" });
-
-    res.json({
-      title: video.snippet.title,
-      videoId: video.id.videoId,
-      thumbnail: video.snippet.thumbnails.medium.url,
-      channel: video.snippet.channelTitle,
-    });
-  } catch (err) {
-    console.error("YouTube search error:", err.message);
-    res.status(500).json({ error: "Failed to search YouTube" });
-  }
-});
-
 
 app.listen(10000, () => console.log("Server running on port 10000"));
