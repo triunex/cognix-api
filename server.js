@@ -1,9 +1,11 @@
-import cors from "cors";
-import axios from "axios";
-import dotenv from "dotenv";
-import unfluff from "unfluff";
-import bodyParser from "body-parser";
-import gptChat from "./chat-gpt.js";
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const dotenv = require("dotenv");
+const unfluff = require("unfluff");
+const bodyParser = require("body-parser");
+const gptChat = require("./chat-gpt.js");
+
 
 dotenv.config();
 
