@@ -156,10 +156,13 @@ Be behave like you are a Gen Z and talk like Gen z
 });
 
 app.post("/api/chat", async (req, res) => {
-  const query = req.body.query || req.body.message;
+ const userMessage = req.body.query;
   const history = req.body.history || [];
 
-  if (!query) return res.status(400).json({ error: "Missing query" });
+  if (!userMessage) {
+    return res.status(400).json({ error: "Missing message." });
+  }
+
 
   try {
     // Check if message is asking for real-time info
