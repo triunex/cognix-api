@@ -158,7 +158,7 @@ Be behave like you are a Gen Z and talk like Gen z
 });
 
 app.post("/api/chat", async (req, res) => {
-  const userMessage = req.body.query;
+  const query = req.body.query || req.body.message;
   const history = req.body.history || [];
 
   if (!userMessage) {
