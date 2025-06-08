@@ -6,8 +6,6 @@ import unfluff from "unfluff";
 import bodyParser from "body-parser";
 import gptChat from "./chat-gpt.js";
 
-
-
 dotenv.config();
 
 const app = express();
@@ -161,9 +159,7 @@ app.post("/api/chat", async (req, res) => {
   const query = req.body.query || req.body.message;
   const history = req.body.history || [];
 
-  if (!userMessage) {
-    return res.status(400).json({ error: "Missing message." });
-  }
+  if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
     // Check if message is asking for real-time info
