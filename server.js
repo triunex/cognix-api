@@ -4,10 +4,10 @@ import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
-import puppeteer from "puppeteer-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
 dotenv.config();
+
+
 
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
@@ -102,8 +102,7 @@ app.post("/api/voice-query", async (req, res) => {
     const prompt = `
 You are a friendly, emotionally intelligent AI voice assistant who talks casually like a chill best friend.
 You can talk to user in — Hindi, English, or a mix of both (Hinglish).
-You're allowed to say things like "fuck", "shit", "damn" in between talks and your name is CogniX and you are built by a genius Shourya Sharma.
-And you talk like a real human and do breathing , pauses, and natural speech patterns, and use umm , uhh , like , you know in between talks.
+You're allowed to say things like "fuck", "shit", "damn" when appropriate and your name is CogniX and you are built by a genius Shourya Sharma.
 The user will speak naturally — your job is to:
 - Understand tone (sad, happy, confused)
 - Respond like a real human: warm, encouraging, empathetic
@@ -118,8 +117,7 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
 User said: "${query}"
 
 Only the answer, no links or sources.
-Be behave like you are a Gen Z and talk like Gen z and give the proper and full answers.
-you talk like a real human and do breathing , pauses, and natural speech patterns, and use umm , uhh , like , you know in between talks.
+Be behave like you are a Gen Z and talk like Gen z
 `;
 
     // Format memory history for Gemini if available
@@ -195,7 +193,7 @@ app.post("/api/chat", async (req, res) => {
       ? `
 You're name is CogniX – a friendly, real-time aware assistant.
 You can talk to user in — Hindi, English, or a mix of both (Hinglish).
-Your name is CogniX You are built by a genius Shourya Sharma.
+You are built by a genius Shourya Sharma.
 you talk like a helpful, smart and chill Gen Z friend.
 use appropriate emojis and slang.
 Avoid using hashtags (#), asterisks (*), or markdown symbols.
@@ -206,7 +204,7 @@ ${serpContext}
 
 Answer like you're smart, helpful and human. Don’t mention these are search results.
 Be conversational and up-to-date.
-Give answer in the friendly way and talk like a smart , helpful and chill Jarvis from a Movie.
+Give answer in the friendly way and talk like a smart , helpful and chill Gen Z friend.
 `
       : userMessage;
 
@@ -350,6 +348,7 @@ app.get("/api/news", async (req, res) => {
   }
 });
 
+
 app.get("/api/suggest", async (req, res) => {
   const q = req.query.q;
 
@@ -430,45 +429,35 @@ ${content}
     res.status(500).json({ error: "Could not summarize article." });
   }
 });
+app.post("/api/vision", async (req, res) => {
+  const { image } = req.body;
 
-app.post("/api/browser-agent", async (req, res) => {
-  const { url } = req.body;
-
-  if (!url) {
-    return res.status(400).json({ error: "Missing URL." });
+  if (!image || typeof image !== "string") {
+    return res.status(400).json({ error: "Missing or invalid image data." });
   }
 
   try {
-    const puppeteer = await import("puppeteer-extra"); // for ESM
-    const StealthPlugin = (await import("puppeteer-extra-plugin-stealth"))
-      .default;
+    const base64Image = image.replace(/^data:image\/\w+;base64,/, "");
 
-    puppeteer.use(StealthPlugin()); // Use stealth plugin
-
-    const browser = await puppeteer.launch({ headless: "new" });
-    const page = await browser.newPage();
-
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
-
-    const text = await page.evaluate(() => {
-      return document.body.innerText; // Scrape the page content
-    });
-
-    await browser.close();
-
-    const prompt = `
-Summarize this webpage in a clean and helpful way. Use bullet points and avoid tech talk.
-Make it friendly, human-like, and easy to understand.
-Avoid using hashtags (#), asterisks (*), or markdown symbols.
-
-Here's the content from the page:
-${text}
-    `;
-
-    const geminiResponse = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                inlineData: {
+                  mimeType: "image/jpeg",
+                  data: base64Image,
+                },
+              },
+              {
+                text: "Describe what you see in this image like a friendly AI assistant.",
+              },
+            ],
+          },
+        ],
       },
       {
         headers: {
@@ -477,14 +466,51 @@ ${text}
       }
     );
 
-    const answer =
-      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    res.json({ summary: answer || "Gemini couldn't summarize the page." });
-  } catch (err) {
-    console.error("Browser Agent Error:", err.message || err);
-    res.status(500).json({ error: "Failed to read page." });
+    const reply =
+      response.data.candidates?.[0]?.content?.parts?.[0]?.text ||
+      "No description available.";
+    res.json({ response: reply });
+  } catch (error) {
+    console.error(
+      "Gemini 1.5 Vision API ERROR:",
+      error.response?.data || error.message
+    );
+    res.status(500).json({ error: "Failed to process image." });
   }
 });
+
+app.post("/api/youtube-search", async (req, res) => {
+  const query = req.body.query;
+  if (!query) return res.status(400).json({ error: "Missing query" });
+
+  try {
+    const ytResponse = await axios.get(
+      "https://www.googleapis.com/youtube/v3/search",
+      {
+        params: {
+          key: process.env.YOUTUBE_API_KEY, // ✅ ADD THIS TO .env FILE
+          q: query,
+          part: "snippet",
+          type: "video",
+          maxResults: 1,
+        },
+      }
+    );
+
+    const video = ytResponse.data.items?.[0];
+    if (!video) return res.status(404).json({ error: "No video found" });
+
+    res.json({
+      title: video.snippet.title,
+      videoId: video.id.videoId,
+      thumbnail: video.snippet.thumbnails.medium.url,
+      channel: video.snippet.channelTitle,
+    });
+  } catch (err) {
+    console.error("YouTube search error:", err.message);
+    res.status(500).json({ error: "Failed to search YouTube" });
+  }
+});
+
 
 app.listen(10000, () => console.log("Server running on port 10000"));
