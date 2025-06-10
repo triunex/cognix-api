@@ -479,35 +479,4 @@ app.post("/api/vision", async (req, res) => {
   }
 });
 
-app.post("/api/chart-explainer", async (req, res) => {
-  const { prompt } = req.body;
-
-  if (!prompt) return res.status(400).json({ error: "Missing chart prompt." });
-
-  try {
-    const geminiRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    const explanation =
-      geminiRes.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    res.json({ explanation: explanation || "No explanation available." });
-  } catch (err) {
-    console.error(
-      "❌ Chart explainer error:",
-      err.response?.data || err.message
-    );
-    res.status(500).json({ error: "Failed to generate chart explanation." });
-  }
-});
-
-
 app.listen(10000, () => console.log("Server running on port 10000"));
