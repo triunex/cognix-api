@@ -4,7 +4,6 @@ import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
-import gptChat from "./chat-gpt.js";
 
 dotenv.config();
 
@@ -156,13 +155,12 @@ Be behave like you are a Gen Z and talk like Gen z
 });
 
 app.post("/api/chat", async (req, res) => {
- const userMessage = req.body.query;
+  const userMessage = req.body.query;
   const history = req.body.history || [];
 
   if (!userMessage) {
     return res.status(400).json({ error: "Missing message." });
   }
-
 
   try {
     // Check if message is asking for real-time info
@@ -248,12 +246,15 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
 Please write a detailed, well-structured research article including:
 - Introduction
 - Core Analysis (include relevant facts, trends, and reasoning)
+- Key Findings
+- Implications and Applications
+- Bullet Points for Key Ideas
 - Conclusion
 
 Keep it insightful and easy to understand.
 Do not mention you are an AI or where this info came from.
 Use a friendly but professional tone.
-Length: 500–1000 words.
+Length: 500–1500 words.
 `;
 
   try {
@@ -478,6 +479,35 @@ app.post("/api/vision", async (req, res) => {
   }
 });
 
-app.use("/api/chat-gpt", gptChat);
+app.post("/api/chart-explainer", async (req, res) => {
+  const { prompt } = req.body;
+
+  if (!prompt) return res.status(400).json({ error: "Missing chart prompt." });
+
+  try {
+    const geminiRes = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const explanation =
+      geminiRes.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    res.json({ explanation: explanation || "No explanation available." });
+  } catch (err) {
+    console.error(
+      "❌ Chart explainer error:",
+      err.response?.data || err.message
+    );
+    res.status(500).json({ error: "Failed to generate chart explanation." });
+  }
+});
+
 
 app.listen(10000, () => console.log("Server running on port 10000"));
