@@ -555,7 +555,7 @@ export async function sendEmailWithPdf(email, buffer, filename) {
   });
 
   const mailOptions = {
-    from: "CogniX <yourcognixemail@gmail.com>",
+    from: "CogniX <triunex.shorya@gmail.com>",
     to: email,
     subject: "Your Market Research Report",
     text: "Hi! Here's your AI-generated market research report from CogniX.",
