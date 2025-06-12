@@ -479,4 +479,60 @@ app.post("/api/vision", async (req, res) => {
   }
 });
 
+app.post("/api/agent-research", async (req, res) => {
+  const { query, email } = req.body;
+
+  if (!query || !email)
+    return res.status(400).json({ error: "Missing query or email" });
+
+  try {
+    // 1. Get AI-powered structured research content
+    const geminiPrompt = `
+You are an expert business analyst. Write a professional market research report on the topic: "${query}".
+
+Your report must include the following sections:
+1. Executive Summary
+2. Market Overview
+3. Key Trends
+4. Competitive Landscape
+5. Opportunities & Challenges
+6. Regulatory Landscape (if any)
+7. Conclusion
+
+Do not include headings like "Sure!" or "Here is your report". Just start the sections clearly.
+`;
+
+    const response = await fetch("https://cognix-api.onrender.com/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: geminiPrompt }),
+    });
+
+    const data = await response.json();
+    const content = data.reply || "Sorry, couldn't generate report.";
+
+    // 2. Convert to PDF
+    const html = `
+      <div style="font-family: sans-serif; padding: 30px;">
+        <h1 style="text-align: center;">Market Research Report</h1>
+        <h3>Topic: ${query}</h3>
+        <hr />
+        <pre style="white-space: pre-wrap; font-size: 14px;">${content}</pre>
+      </div>
+    `;
+
+    const pdfBuffer = await generatePdfFromHtml(html); // helper (next step)
+
+    // 3. Email PDF to user
+    await sendEmailWithPdf(email, pdfBuffer, `${query}-report.pdf`);
+
+    // 4. Respond to frontend with status
+    res.json({ success: true, message: "Research report sent to your email." });
+  } catch (err) {
+    console.error("Agent error:", err);
+    res.status(500).json({ error: "Agent failed." });
+  }
+});
+
+
 app.listen(10000, () => console.log("Server running on port 10000"));
