@@ -15,8 +15,6 @@
     "langchain": "^0.0.189",
     "multer": "^2.0.1",
     "puppeteer": "^24.10.0",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "unfluff": "^3.2.0"
   }
 }
