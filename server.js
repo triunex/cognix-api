@@ -580,6 +580,41 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
     res.status(500).json({ error: "Agent failed." });
   }
 });
+app.post("/api/time-machine", async (req, res) => {
+  const { year, topic } = req.body;
+  if (!year || !topic) return res.status(400).json({ error: "Missing year or topic" });
+
+  try {
+    // Step 1: Fetch historical news
+    const serpQuery = `${topic} ${year} site:cnn.com OR site:bbc.com OR site:reuters.com`;
+    const serpRes = await fetch(`https://serpapi.com/search.json?q=${encodeURIComponent(serpQuery)}&api_key=${process.env.SERPAPI_KEY}`);
+    const serpData = await serpRes.json();
+    const newsSnippets = serpData.organic_results?.slice(0, 5).map((n) => `• ${n.title}: ${n.snippet}`).join("\n") || "No headlines found.";
+
+    // Step 2: Ask Gemini to generate a historical insight
+    const prompt = `
+You are a time-traveling analyst AI. Based on the topic "${topic}" in the year ${year}, summarize the major events, trends, and business outcomes.
+
+Also summarize key insights from these news headlines:\n\n${newsSnippets}
+`;
+
+    const aiRes = await fetch("https://cognix-api.onrender.com/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: prompt })
+    });
+
+    const aiData = await aiRes.json();
+    const finalInsight = aiData.reply;
+
+    // Step 3 (Optional): Later we'll add stock charting (Phase 2)
+
+    res.json({ success: true, data: finalInsight });
+  } catch (err) {
+    console.error("Time Machine error:", err);
+    res.status(500).json({ error: "Failed to simulate year." });
+  }
+});
 
 app.listen(10000, () => console.log("Server running on port 10000"));
 
