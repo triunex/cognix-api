@@ -14,11 +14,12 @@ app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 
 app.use(
   cors({
-    origin: "*",
+    origin: ["http://localhost:8080", "https://cognix-1fc5a.web.app"], // Allow specific origins
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
 app.options("*", cors()); // Allow preflight for all routes
 
 app.use(express.json());
@@ -582,14 +583,23 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
 });
 app.post("/api/time-machine", async (req, res) => {
   const { year, topic } = req.body;
-  if (!year || !topic) return res.status(400).json({ error: "Missing year or topic" });
+  if (!year || !topic)
+    return res.status(400).json({ error: "Missing year or topic" });
 
   try {
     // Step 1: Fetch historical news
     const serpQuery = `${topic} ${year} site:cnn.com OR site:bbc.com OR site:reuters.com`;
-    const serpRes = await fetch(`https://serpapi.com/search.json?q=${encodeURIComponent(serpQuery)}&api_key=${process.env.SERPAPI_KEY}`);
+    const serpRes = await fetch(
+      `https://serpapi.com/search.json?q=${encodeURIComponent(
+        serpQuery
+      )}&api_key=${process.env.SERPAPI_KEY}`
+    );
     const serpData = await serpRes.json();
-    const newsSnippets = serpData.organic_results?.slice(0, 5).map((n) => `• ${n.title}: ${n.snippet}`).join("\n") || "No headlines found.";
+    const newsSnippets =
+      serpData.organic_results
+        ?.slice(0, 5)
+        .map((n) => `• ${n.title}: ${n.snippet}`)
+        .join("\n") || "No headlines found.";
 
     // Step 2: Ask Gemini to generate a historical insight
     const prompt = `
@@ -601,7 +611,7 @@ Also summarize key insights from these news headlines:\n\n${newsSnippets}
     const aiRes = await fetch("https://cognix-api.onrender.com/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: prompt })
+      body: JSON.stringify({ query: prompt }),
     });
 
     const aiData = await aiRes.json();
