@@ -6,6 +6,7 @@ import unfluff from "unfluff";
 import bodyParser from "body-parser";
 import { generatePdf } from "html-pdf-node"; // ES Module import
 import nodemailer from "nodemailer";
+import { ChartJSNodeCanvas } from "chartjs-node-canvas";
 
 dotenv.config();
 
@@ -22,6 +23,28 @@ app.use(
 app.options("*", cors()); // Allow preflight for all routes
 
 app.use(express.json());
+
+const width = 800;
+const height = 400;
+const chartCanvas = new ChartJSNodeCanvas({ width, height });
+
+export async function generateChartImage(chartData) {
+  const config = {
+    type: chartData.chartType || "bar",
+    data: {
+      labels: chartData.labels,
+      datasets: [
+        {
+          label: "Chart Data",
+          data: chartData.values,
+          backgroundColor: ["#7e22ce", "#8b5cf6", "#0ea5e9", "#22d3ee"],
+        },
+      ],
+    },
+  };
+
+  return await chartCanvas.renderToDataURL(config);
+}
 
 app.post("/api/search", async (req, res) => {
   const query = req.body.query;
@@ -521,12 +544,28 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
     const data = await response.json();
     const content = data.reply || "Sorry, couldn't generate report.";
 
-    // 2. Convert to PDF
-    function stripMarkdown(text) {
-      return text
-        .replace(/[*_~`#>-]+/g, "") // remove markdown chars
-        .replace(/\n{2,}/g, "<br/><br/>") // keep paragraph breaks
-        .replace(/\n/g, " "); // convert other line breaks to space
+    let chartHtml = "";
+    try {
+      const chartPrompt = `Extract chart data from the following report and respond ONLY in JSON. If none, reply "{}":\n\n${content}`;
+      const chartRes = await fetch("https://cognix-api.onrender.com/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: chartPrompt }),
+      });
+      const chartReply = await chartRes.json();
+
+      const parsedChart = JSON.parse(chartReply.reply || "{}");
+      if (
+        parsedChart.chartType &&
+        parsedChart.labels &&
+        parsedChart.values &&
+        parsedChart.labels.length > 0
+      ) {
+        const chartImg = await generateChartImage(parsedChart);
+        chartHtml = `<div style="margin-top:40px;"><h3>Chart Visualization</h3><img src="${chartImg}" style="width:100%;"/></div>`;
+      }
+    } catch (err) {
+      console.error("⚠️ Chart rendering failed:", err.message);
     }
 
     const cleanedText = stripMarkdown(content);
@@ -562,7 +601,7 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
           <h1 style="text-align: center;">Market Research Report</h1>
           <h3 style="text-align: center;">Topic: ${query}</h3>
           <div class="section-content">
-            ${cleanedText}
+            <pre style="white-space: pre-wrap; font-size: 14px;">${cleanedText}</pre>${chartHtml}
           </div>
         </body>
       </html>
