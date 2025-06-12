@@ -653,3 +653,10 @@ export async function sendEmailWithPdf(email, buffer, filename) {
 
   await transporter.sendMail(mailOptions);
 }
+
+function stripMarkdown(text) {
+  return text
+    .replace(/[#*_`~\-]+/g, "")           // remove markdown chars like #, *, _, `, etc.
+    .replace(/\n{2,}/g, "<br/><br/>")     // double newlines → paragraph spacing
+    .replace(/\n/g, " ");                 // single newlines → space
+}
