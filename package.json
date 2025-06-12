@@ -3,6 +3,7 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
+    "install": "PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false npm install puppeteer",
     "start": "node server.js"
   },
   "dependencies": {
