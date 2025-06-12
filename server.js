@@ -12,7 +12,15 @@ dotenv.config();
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 
-app.use(cors({ origin: "*", methods: ["POST", "OPTIONS"] }));
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+app.options("*", cors()); // Allow preflight for all routes
+
 app.use(express.json());
 
 app.post("/api/search", async (req, res) => {
