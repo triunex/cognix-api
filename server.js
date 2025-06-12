@@ -5,7 +5,7 @@ import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
 import { generatePdf } from "html-pdf-node"; // ES Module import
-
+import nodemailer from "nodemailer";
 
 dotenv.config();
 
@@ -543,4 +543,29 @@ export async function generatePdfFromHtml(html) {
   const options = { format: "A4" };
   const pdfBuffer = await generatePdf(file, options);
   return pdfBuffer;
+}
+
+export async function sendEmailWithPdf(email, buffer, filename) {
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: "yourcognixemail@gmail.com", // use app password if 2FA enabled
+      pass: "your-app-password",
+    },
+  });
+
+  const mailOptions = {
+    from: "CogniX <yourcognixemail@gmail.com>",
+    to: email,
+    subject: "Your Market Research Report",
+    text: "Hi! Here's your AI-generated market research report from CogniX.",
+    attachments: [
+      {
+        filename,
+        content: buffer,
+      },
+    ],
+  };
+
+  await transporter.sendMail(mailOptions);
 }
