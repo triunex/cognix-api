@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
 import puppeteer from "puppeteer";
-import { generatePdfFromHtml } from "./utils/pdf.js";
+import { generatePdfFromHtml } from "./utils/pdf.ts";
 
 
 dotenv.config();
