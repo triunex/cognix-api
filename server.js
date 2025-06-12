@@ -1,9 +1,10 @@
-import express from "express";
-import cors from "cors";
 import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
+import puppeteer from "puppeteer";
+import { generatePdfFromHtml } from "./utils/pdf.js";
+
 
 dotenv.config();
 
@@ -533,6 +534,5 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
     res.status(500).json({ error: "Agent failed." });
   }
 });
-
 
 app.listen(10000, () => console.log("Server running on port 10000"));
