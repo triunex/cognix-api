@@ -4,7 +4,7 @@ import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
-import puppeteer from "puppeteer";
+import { generatePdf } from "html-pdf-node"; // ES Module import
 
 
 dotenv.config();
@@ -539,14 +539,8 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
 app.listen(10000, () => console.log("Server running on port 10000"));
 
 export async function generatePdfFromHtml(html) {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
-
-  const page = await browser.newPage();
-  await page.setContent(html, { waitUntil: "networkidle0" });
-  const pdfBuffer = await page.pdf({ format: "A4" });
-  await browser.close();
+  const file = { content: html };
+  const options = { format: "A4" };
+  const pdfBuffer = await generatePdf(file, options);
   return pdfBuffer;
 }
