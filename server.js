@@ -557,8 +557,8 @@ export async function sendEmailWithPdf(email, buffer, filename) {
   const transporter = nodemailer.createTransport({
     service: "gmail",
     auth: {
-      user: "yourcognixemail@gmail.com", // use app password if 2FA enabled
-      pass: "your-app-password",
+      user: "triunex.shorya@gmail.com", // use app password if 2FA enabled
+      pass: "gtws srtm wcka sfoe",
     },
   });
 
