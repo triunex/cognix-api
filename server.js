@@ -522,13 +522,50 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
     const content = data.reply || "Sorry, couldn't generate report.";
 
     // 2. Convert to PDF
+    function stripMarkdown(text) {
+      return text
+        .replace(/[*_~`#>-]+/g, "") // remove markdown chars
+        .replace(/\n{2,}/g, "<br/><br/>") // keep paragraph breaks
+        .replace(/\n/g, " "); // convert other line breaks to space
+    }
+
+    const cleanedText = stripMarkdown(content);
+
     const html = `
-      <div style="font-family: sans-serif; padding: 30px;">
-        <h1 style="text-align: center;">Market Research Report</h1>
-        <h3>Topic: ${query}</h3>
-        <hr />
-        <pre style="white-space: pre-wrap; font-size: 14px;">${content}</pre>
-      </div>
+      <html>
+        <head>
+          <style>
+            body {
+              font-family: 'Segoe UI', sans-serif;
+              padding: 40px;
+              color: #222;
+            }
+            h1, h2 {
+              color: #4B0082;
+            }
+            .section {
+              margin-top: 40px;
+            }
+            .section-title {
+              font-size: 20px;
+              margin-bottom: 10px;
+              border-bottom: 2px solid #4B0082;
+              padding-bottom: 4px;
+            }
+            .section-content {
+              font-size: 15px;
+              line-height: 1.6;
+            }
+          </style>
+        </head>
+        <body>
+          <h1 style="text-align: center;">Market Research Report</h1>
+          <h3 style="text-align: center;">Topic: ${query}</h3>
+          <div class="section-content">
+            ${cleanedText}
+          </div>
+        </body>
+      </html>
     `;
 
     const pdfBuffer = await generatePdfFromHtml(html); // helper (next step)
