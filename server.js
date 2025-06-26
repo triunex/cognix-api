@@ -14,7 +14,7 @@ app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 
 app.use(
   cors({
-    origin: ["http://localhost:8080", "https://cognix-1fc5a.web.app/"],
+    origin: "*", // Allow all origins temporarily
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
