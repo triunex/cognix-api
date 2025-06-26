@@ -28,6 +28,16 @@ app.post("/api/search", async (req, res) => {
 
   if (!query) return res.status(400).json({ error: "Missing query" });
 
+  // Fetch images from SerpAPI Images
+  const fetchImages = async (query) => {
+    const serpApiKey = process.env.SERP_API_KEY;
+    const res = await fetch(
+      `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&tbm=isch&api_key=${serpApiKey}`
+    );
+    const json = await res.json();
+    return json.images_results?.slice(0, 6) || [];
+  };
+
   try {
     // 1. Get Web Search Results from SerpAPI
     const serpResponse = await axios.get("https://serpapi.com/search", {
@@ -86,9 +96,13 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
     const sources = results.map((r) => `- ${r.title}: ${r.link}`).join("\n");
     const fullAnswer = `${geminiResponse.data.candidates[0].content.parts[0].text}\n\nSources:\n${sources}`;
 
+    // Fetch images for the query
+    const images = await fetchImages(query);
+
     // 4. Respond to frontend
     res.json({
       answer: geminiResponse.data.candidates[0].content.parts[0].text,
+      images, // include in API response
     });
   } catch (err) {
     console.error("❌ Error:", err.response?.data || err.message || err);
@@ -643,3 +657,4 @@ export async function sendEmailWithPdf(email, buffer, filename) {
 
   await transporter.sendMail(mailOptions);
 }
+
