@@ -196,7 +196,23 @@ app.post("/api/chat", async (req, res) => {
         .join("\n\n");
     }
 
-    // Build AI prompt
+    // Build AI prompt with structured JSON block instruction
+    const structureInstruction = `
+When replying to the user, return JSON with structured blocks like:
+
+[
+  { "type": "heading", "content": "What is Quantum Mechanics?" },
+  { "type": "paragraph", "content": "Quantum mechanics is the theory..." },
+  { "type": "heading", "content": "What is Quantum Computing?" },
+  { "type": "paragraph", "content": "Quantum computing uses..." },
+  { "type": "chart", "chartType": "line", "labels": ["2019", "2020"], "values": [10, 20] },
+  { "type": "image", "url": "https://..." },
+  { "type": "table", "headers": ["Year", "Sales"], "rows": [["2020", "200M"], ["2021", "250M"]] }
+]
+
+Return only the JSON list of blocks. No explanation or intro text outside it.
+`;
+
     const finalPrompt = triggerRealTime
       ? `
 You're name is CogniX – a friendly, real-time aware assistant.
@@ -210,11 +226,13 @@ User asked: "${userMessage}"
 These are the latest search results:
 ${serpContext}
 
+${structureInstruction}
+
 Answer like you're smart, helpful and human. Don’t mention these are search results.
 Be conversational and up-to-date.
 Give answer in the friendly way and talk like a smart , helpful and chill Gen Z friend.
 `
-      : userMessage;
+      : `${userMessage}\n\n${structureInstruction}`;
 
     const formattedHistory = history.map((msg) => ({
       role: msg.role,
@@ -234,8 +252,19 @@ Give answer in the friendly way and talk like a smart , helpful and chill Gen Z 
       }
     );
 
-    const reply = geminiRes.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    res.json({ reply });
+    // Parse Gemini output as JSON blocks
+    const response = geminiRes.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const jsonStart = response.indexOf("[");
+    const jsonEnd = response.lastIndexOf("]");
+    const jsonStr = response.substring(jsonStart, jsonEnd + 1);
+
+    let structuredBlocks;
+    try {
+      structuredBlocks = JSON.parse(jsonStr);
+    } catch (e) {
+      structuredBlocks = [{ type: "paragraph", content: response }];
+    }
+    res.json({ reply: JSON.stringify(structuredBlocks) });
   } catch (err) {
     console.error("❌ Chat error:", err.response?.data || err.message);
     res.status(500).json({ error: "Failed to respond." });
