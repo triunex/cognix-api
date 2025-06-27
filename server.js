@@ -57,14 +57,8 @@ app.post("/api/search", async (req, res) => {
       .join("\n\n");
 
     const prompt = `
-You're an intelligent assistant. Use the search results below to answer the user's question *clearly and helpfully*, even if not all results are directly relevant. 
-If needed, combine your own knowledge with the web results.
-Give Great easy to understand and slightly big answers.
-If anyone want a paragraph , Summary, Research , do that all.
-Don't mention about any sources or links.
+“You are a professional AI research assistant. Provide a detailed, insightful, and well-structured answer to the following question as if writing a professional article. Use proper formatting, facts, and reasoning. Include relevant statistics, events, and historical background if useful. Format it in multiple paragraphs with bolded section titles when appropriate. 
 Avoid using hashtags (#), asterisks (*), or markdown symbols.
-
-
 Question: "${query}"
 
 Search Results:
@@ -72,7 +66,6 @@ ${context}
 
 Answer in a friendly, helpful tone:
 Answer clearly, concisely, and professionally.
-Talk in very Friendly way.
 Avoid using hashtags (#), asterisks (*), or markdown symbols.
 `;
 
