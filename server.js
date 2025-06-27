@@ -56,17 +56,31 @@ app.post("/api/search", async (req, res) => {
       )
       .join("\n\n");
 
+    // New prompt for structured JSON blocks
     const prompt = `
-“You are a professional AI research assistant. Provide a detailed, insightful, and well-structured answer to the following question as if writing a professional article. Use proper formatting, facts, and reasoning. Include relevant statistics, events, and historical background if useful. Format it in multiple paragraphs with bolded section titles when appropriate. 
+You're an intelligent assistant. Use the search results below to answer the user's question *clearly and helpfully*, even if not all results are directly relevant. 
+If needed, combine your own knowledge with the web results.
+Give Great easy to understand and slightly big answers.
+If anyone want a paragraph , Summary, Research , do that all.
+Don't mention about any sources or links.
 Avoid using hashtags (#), asterisks (*), or markdown symbols.
-Question: "${query}"
+
+User asked: "${query}"
 
 Search Results:
 ${context}
 
-Answer in a friendly, helpful tone:
-Answer clearly, concisely, and professionally.
-Avoid using hashtags (#), asterisks (*), or markdown symbols.
+Return JSON in this format:
+[
+{ "type": "heading", "content": "..." },
+{ "type": "paragraph", "content": "..." },
+{ "type": "image", "url": "..." },
+{ "type": "chart", "chartType": "bar", "labels": [...], "values": [...] },
+{ "type": "table", "headers": [...], "rows": [[...], [...]] }
+]
+
+Only return the JSON.
+Do not add any extra explanation or markdown.
 `;
 
     const geminiResponse = await axios.post(
@@ -86,16 +100,25 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
       }
     );
 
-    const sources = results.map((r) => `- ${r.title}: ${r.link}`).join("\n");
-    const fullAnswer = `${geminiResponse.data.candidates[0].content.parts[0].text}\n\nSources:\n${sources}`;
+    // Parse Gemini output as JSON blocks
+    const raw = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    const jsonStart = raw.indexOf("[");
+    const jsonEnd = raw.lastIndexOf("]");
+    const jsonStr = raw.substring(jsonStart, jsonEnd + 1);
+
+    let structuredBlocks;
+    try {
+      structuredBlocks = JSON.parse(jsonStr);
+    } catch (e) {
+      structuredBlocks = [{ type: "paragraph", content: raw }];
+    }
 
     // Fetch images for the query
     const images = await fetchImages(query);
 
-    // 4. Respond to frontend
     res.json({
-      answer: geminiResponse.data.candidates[0].content.parts[0].text,
-      images, // include in API response
+      answer: structuredBlocks,
+      images,
     });
   } catch (err) {
     console.error("❌ Error:", err.response?.data || err.message || err);
