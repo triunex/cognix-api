@@ -658,3 +658,27 @@ export async function sendEmailWithPdf(email, buffer, filename) {
   await transporter.sendMail(mailOptions);
 }
 
+app.get("/api/ping", (req, res) => {
+  res.status(200).send("pong");
+});
+
+// Gemini warmup endpoint
+app.get("/api/warm-gemini", async (req, res) => {
+  try {
+    const dummyPrompt = [
+      { role: "user", parts: [{ text: "Just say hello, this is a warmup ping." }] },
+    ];
+
+    // Use axios to call Gemini API for warmup
+    await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      { contents: dummyPrompt },
+      { headers: { "Content-Type": "application/json" } }
+    );
+
+    return res.status(200).send("Gemini warmed");
+  } catch (err) {
+    console.error("Gemini warmup failed:", err);
+    return res.status(500).send("Error");
+  }
+});
