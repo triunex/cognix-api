@@ -13,16 +13,18 @@ import pdf from "html-pdf-node"; // add this import at the top
 dotenv.config();
 
 const app = express();
-app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 
+// ✅ Proper CORS setup
 app.use(
   cors({
-    origin: "*", // Allow all origins temporarily
+    origin: "*", // or replace "*" with your frontend URL in production
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 app.options("*", cors()); // Allow preflight for all routes
+
+app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 
 app.use(express.json());
 
@@ -787,4 +789,11 @@ app.post("/api/convert-to-pdf", async (req, res) => {
     console.error("PDF conversion error:", error);
     return res.status(500).json({ error: "Failed to convert to PDF" });
   }
+});
+
+// ✅ Fallback CORS middleware (place before app.listen)
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*"); // Replace * with specific domain in production
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+  next();
 });
