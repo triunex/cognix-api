@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
-import puppeteer from "puppeteer";
 import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
@@ -9,6 +8,7 @@ import { generatePdf } from "html-pdf-node"; // ES Module import
 import nodemailer from "nodemailer";
 import fs from "fs/promises";
 import path from "path";
+import pdf from "html-pdf-node"; // add this import at the top
 
 dotenv.config();
 
@@ -686,25 +686,19 @@ app.get("/api/warm-gemini", async (req, res) => {
   }
 });
 
+// Replace the Puppeteer-based /api/convert-to-pdf route with html-pdf-node
 app.post("/api/convert-to-pdf", async (req, res) => {
   try {
     const { content, style } = req.body;
 
     const htmlTemplate = generatePdfHtml(content, style);
-    const browser = await puppeteer.launch({
-      headless: "new",
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    const file = { content: htmlTemplate };
+
+    pdf.generatePdf(file, { format: "A4" }).then((pdfBuffer) => {
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", "attachment; filename=cognix-report.pdf");
+      return res.send(pdfBuffer);
     });
-
-    const page = await browser.newPage();
-    await page.setContent(htmlTemplate, { waitUntil: "networkidle0" });
-
-    const pdfBuffer = await page.pdf({ format: "A4", printBackground: true });
-    await browser.close();
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", "attachment; filename=cognix-report.pdf");
-    return res.send(pdfBuffer);
   } catch (error) {
     console.error("PDF conversion error:", error);
     return res.status(500).json({ error: "Failed to convert to PDF" });
