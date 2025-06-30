@@ -641,7 +641,7 @@ app.post("/api/prompt-builder", async (req, res) => {
 You are an AI prompt assistant. Suggest 3 optimized prompt variations based on the user's input.
 Input: "${userInput}"
 
-Respond in this JSON format:
+Respond ONLY in this JSON format:
 {
   "suggestions": [
     "Prompt variation 1",
@@ -651,28 +651,25 @@ Respond in this JSON format:
 }
 `;
 
-    // Using your existing Gemini setup
-    const aiResponse = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" +
-        process.env.GEMINI_API_KEY,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-        }),
-      }
-    );
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }]
+      }),
+    });
 
-    const data = await aiResponse.json();
-    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const data = await response.json();
 
-    // Try to parse JSON if response is valid
-    const parsed = JSON.parse(rawText);
-    res.json(parsed);
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const json = JSON.parse(text);
+
+    if (!json.suggestions) throw new Error("No suggestions returned.");
+
+    res.json(json);
   } catch (err) {
     console.error("Prompt Builder Error:", err.message);
-    res.status(500).json({ error: "Failed to generate suggestions." });
+    res.status(500).json({ error: "Failed to generate prompt suggestions." });
   }
 });
 
