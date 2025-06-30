@@ -1,9 +1,12 @@
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import puppeteer from "puppeteer";
+import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
-import bodyParser from "body-parser";
 import { generatePdf } from "html-pdf-node"; // ES Module import
 import nodemailer from "nodemailer";
-import puppeteer from "puppeteer";
 import fs from "fs/promises";
 import path from "path";
 
