@@ -1,3 +1,4 @@
+
 {
   "name": "cognix-api",
   "type": "module",
@@ -16,6 +17,9 @@
     "multer": "^2.0.1",
     "nodemailer": "^7.0.3",
     "puppeteer": "^24.10.0",
+    "fs": "^0.0.1-security",
+    "path": "^0.12.7",
+    "react-markdown": "^10.1.0",
     "unfluff": "^3.2.0"
   }
 }
