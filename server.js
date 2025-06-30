@@ -690,7 +690,7 @@ app.get("/api/warm-gemini", async (req, res) => {
 
 // Replace the generatePdfHtml function with the improved version
 function generatePdfHtml(content, style = "normal") {
-  const logoBase64 = "https://ibb.co/JjPzBKx9";
+  const logoBase64 = "https://drive.google.com/file/d/1N0wdvSqsuVf5V4K-6rYotj3JV96hKd3J/view?usp=drive_link";
 
   const styleCss = `
     body {
