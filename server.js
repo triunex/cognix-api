@@ -629,6 +629,54 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
   }
 });
 
+app.post("/api/prompt-builder", async (req, res) => {
+  try {
+    const userInput = req.body.input;
+
+    if (!userInput || userInput.trim().length < 3) {
+      return res.status(400).json({ error: "Prompt too short" });
+    }
+
+    const prompt = `
+You are an AI prompt assistant. Suggest 3 optimized prompt variations based on the user's input.
+Input: "${userInput}"
+
+Respond in this JSON format:
+{
+  "suggestions": [
+    "Prompt variation 1",
+    "Prompt variation 2",
+    "Prompt variation 3"
+  ]
+}
+`;
+
+    // Using your existing Gemini setup
+    const aiResponse = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" +
+        process.env.GEMINI_API_KEY,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+      }
+    );
+
+    const data = await aiResponse.json();
+    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+    // Try to parse JSON if response is valid
+    const parsed = JSON.parse(rawText);
+    res.json(parsed);
+  } catch (err) {
+    console.error("Prompt Builder Error:", err.message);
+    res.status(500).json({ error: "Failed to generate suggestions." });
+  }
+});
+
+
 app.listen(10000, () => console.log("Server running on port 10000"));
 
 export async function generatePdfFromHtml(html) {
@@ -690,7 +738,8 @@ app.get("/api/warm-gemini", async (req, res) => {
 
 // Replace the generatePdfHtml function with the improved version
 function generatePdfHtml(content, style = "normal") {
-  const logoBase64 = "https://drive.google.com/file/d/1N0wdvSqsuVf5V4K-6rYotj3JV96hKd3J/view?usp=drive_link";
+  const logoBase64 =
+    "https://drive.google.com/file/d/1N0wdvSqsuVf5V4K-6rYotj3JV96hKd3J/view?usp=drive_link";
 
   const styleCss = `
     body {
