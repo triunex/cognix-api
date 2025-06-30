@@ -1,11 +1,11 @@
-import express from "express";
-import cors from "cors";
-import axios from "axios";
 import dotenv from "dotenv";
 import unfluff from "unfluff";
 import bodyParser from "body-parser";
 import { generatePdf } from "html-pdf-node"; // ES Module import
 import nodemailer from "nodemailer";
+import puppeteer from "puppeteer";
+import fs from "fs/promises";
+import path from "path";
 
 dotenv.config();
 
@@ -682,3 +682,69 @@ app.get("/api/warm-gemini", async (req, res) => {
     return res.status(500).send("Error");
   }
 });
+
+app.post("/api/convert-to-pdf", async (req, res) => {
+  try {
+    const { content, style } = req.body;
+
+    const htmlTemplate = generatePdfHtml(content, style);
+    const browser = await puppeteer.launch({
+      headless: "new",
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+
+    const page = await browser.newPage();
+    await page.setContent(htmlTemplate, { waitUntil: "networkidle0" });
+
+    const pdfBuffer = await page.pdf({ format: "A4", printBackground: true });
+    await browser.close();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", "attachment; filename=cognix-report.pdf");
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error("PDF conversion error:", error);
+    return res.status(500).json({ error: "Failed to convert to PDF" });
+  }
+});
+
+function generatePdfHtml(content, style = "normal") {
+  let styleCss = "";
+
+  switch (style) {
+    case "mckinsey":
+      styleCss = `
+        body { font-family: 'Georgia', serif; color: #333; padding: 40px; line-height: 1.6; }
+        h1 { font-size: 26px; border-bottom: 2px solid #444; margin-bottom: 20px; }
+        p { margin-bottom: 14px; font-size: 15px; }
+      `;
+      break;
+    case "minimal":
+      styleCss = `
+        body { font-family: 'Arial', sans-serif; color: #111; padding: 30px; line-height: 1.8; }
+        h1 { font-size: 20px; font-weight: 600; margin-bottom: 15px; }
+        p { margin-bottom: 12px; font-size: 14px; }
+      `;
+      break;
+    default:
+      styleCss = `
+        body { font-family: sans-serif; padding: 30px; color: #000; }
+        h1 { font-size: 22px; font-weight: bold; margin-bottom: 15px; }
+        p { font-size: 14px; margin-bottom: 12px; }
+      `;
+  }
+
+  return `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <style>${styleCss}</style>
+        <title>Cognix Report</title>
+      </head>
+      <body>
+        <h1>Cognix AI Report</h1>
+        <div>${content.replace(/\n/g, "<br/>")}</div>
+      </body>
+    </html>
+  `;
+}
