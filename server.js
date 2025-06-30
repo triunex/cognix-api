@@ -686,6 +686,90 @@ app.get("/api/warm-gemini", async (req, res) => {
   }
 });
 
+// Replace the generatePdfHtml function with the improved version
+function generatePdfHtml(content, style = "normal") {
+  const logoBase64 = "https://ibb.co/JjPzBKx9";
+
+  const styleCss = `
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      padding: 40px;
+      line-height: 1.75;
+      color: #222;
+    }
+    .logo {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    .logo img {
+      height: 60px;
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: bold;
+      margin-bottom: 20px;
+      border-bottom: 2px solid #ccc;
+      padding-bottom: 10px;
+    }
+    h2 {
+      font-size: 22px;
+      font-weight: bold;
+      margin-top: 30px;
+    }
+    p {
+      font-size: 15px;
+      margin-bottom: 16px;
+    }
+    strong {
+      font-weight: 700;
+      color: #000;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 20px 0;
+      font-size: 14px;
+    }
+    table, th, td {
+      border: 1px solid #999;
+    }
+    th {
+      background: #f3f3f3;
+      padding: 8px;
+      font-weight: 600;
+      text-align: center;
+    }
+    td {
+      padding: 8px;
+      text-align: left;
+    }
+    tr:nth-child(even) {
+      background: #fafafa;
+    }
+  `;
+
+  const processedContent = content
+    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>") // bold
+    .replace(/\n/g, "<br/>");
+
+  return `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <style>${styleCss}</style>
+        <title>Cognix Report</title>
+      </head>
+      <body>
+        <div class="logo">
+          <img src="${logoBase64}" alt="CogniX Logo"/>
+        </div>
+        <h1>Cognix AI Research Report</h1>
+        <div>${processedContent}</div>
+      </body>
+    </html>
+  `;
+}
+
 // Replace the Puppeteer-based /api/convert-to-pdf route with html-pdf-node
 app.post("/api/convert-to-pdf", async (req, res) => {
   try {
@@ -704,44 +788,3 @@ app.post("/api/convert-to-pdf", async (req, res) => {
     return res.status(500).json({ error: "Failed to convert to PDF" });
   }
 });
-
-function generatePdfHtml(content, style = "normal") {
-  let styleCss = "";
-
-  switch (style) {
-    case "mckinsey":
-      styleCss = `
-        body { font-family: 'Georgia', serif; color: #333; padding: 40px; line-height: 1.6; }
-        h1 { font-size: 26px; border-bottom: 2px solid #444; margin-bottom: 20px; }
-        p { margin-bottom: 14px; font-size: 15px; }
-      `;
-      break;
-    case "minimal":
-      styleCss = `
-        body { font-family: 'Arial', sans-serif; color: #111; padding: 30px; line-height: 1.8; }
-        h1 { font-size: 20px; font-weight: 600; margin-bottom: 15px; }
-        p { margin-bottom: 12px; font-size: 14px; }
-      `;
-      break;
-    default:
-      styleCss = `
-        body { font-family: sans-serif; padding: 30px; color: #000; }
-        h1 { font-size: 22px; font-weight: bold; margin-bottom: 15px; }
-        p { font-size: 14px; margin-bottom: 12px; }
-      `;
-  }
-
-  return `
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <style>${styleCss}</style>
-        <title>Cognix Report</title>
-      </head>
-      <body>
-        <h1>Cognix AI Report</h1>
-        <div>${content.replace(/\n/g, "<br/>")}</div>
-      </body>
-    </html>
-  `;
-}
