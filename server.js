@@ -390,15 +390,28 @@ app.get("/api/news", async (req, res) => {
       },
     });
 
+    // Enhance thumbnail quality by attempting to fetch higher-res images
     const articles =
-      newsRes.data.news_results?.map((item) => ({
-        title: item.title,
-        link: item.link,
-        source: item.source,
-        date: item.date,
-        thumbnail: item.thumbnail,
-        snippet: item.snippet,
-      })) || [];
+      newsRes.data.news_results?.map((item) => {
+        let thumbnail = item.thumbnail;
+        // Try to get a higher-res image if possible
+        // For Google News, sometimes you can replace "w=..." or "h=..." in the URL with higher values
+        if (thumbnail && typeof thumbnail === "string") {
+          // Try to replace width/height params in the URL for higher-res
+          // e.g., ...=w72-h72... => ...=w600-h400...
+          thumbnail = thumbnail.replace(/w\d+-h\d+/g, "w800-h600");
+          // Remove any "=s..." (size) params and set a higher value
+          thumbnail = thumbnail.replace(/=s\d+/, "=s800");
+        }
+        return {
+          title: item.title,
+          link: item.link,
+          source: item.source,
+          date: item.date,
+          thumbnail,
+          snippet: item.snippet,
+        };
+      }) || [];
 
     res.json({ articles });
   } catch (err) {
@@ -629,7 +642,6 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
   }
 });
 
-
 app.listen(10000, () => console.log("Server running on port 10000"));
 
 export async function generatePdfFromHtml(html) {
@@ -798,60 +810,4 @@ app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*"); // Replace * with specific domain in production
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
   next();
-});
-
-// New compare endpoint
-app.post("/api/compare", async (req, res) => {
-  try {
-    const { prompt } = req.body;
-
-    const aiPrompt = `
-You're an AI comparison engine. Given a prompt like "${prompt}", extract the two subjects and create:
-
-1. titleA: Name of first subject  
-2. titleB: Name of second subject  
-3. pointsA and pointsB: 3–6 bullet point insights each  
-4. chart: chartType, labels, valuesA, valuesB  
-5. summary: Concise, professional comparison insight
-
-Respond with a JSON like:
-
-{
-  "titleA": "Elon Musk",
-  "titleB": "Steve Jobs",
-  "pointsA": ["Execution focused", "Bold innovator"],
-  "pointsB": ["Design focused", "Visionary leader"],
-  "chart": {
-    "chartType": "radar",
-    "labels": ["Innovation", "Leadership", "Execution"],
-    "valuesA": [95, 90, 88],
-    "valuesB": [90, 93, 80]
-  },
-  "summary": "Elon Musk is known for rapid execution..."
-}
-`;
-
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts: [{ text: aiPrompt }] }] }),
-      }
-    );
-
-    const geminiData = await geminiRes.json();
-    const raw = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-    const cleaned = raw
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
-
-const parsed = JSON.parse(cleaned);
-
-    res.json(parsed);
-  } catch (err) {
-    console.error("Compare API Error:", err.message);
-    res.status(500).json({ error: "Failed to compare subjects" });
-  }
 });
