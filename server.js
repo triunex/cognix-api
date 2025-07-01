@@ -798,3 +798,54 @@ app.use((req, res, next) => {
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
   next();
 });
+
+// New compare endpoint
+app.post("/api/compare", async (req, res) => {
+  try {
+    const { prompt } = req.body;
+
+    const aiPrompt = `
+You're an AI comparison engine. Given a prompt like "${prompt}", extract the two subjects and create:
+
+1. titleA: Name of first subject  
+2. titleB: Name of second subject  
+3. pointsA and pointsB: 3–6 bullet point insights each  
+4. chart: chartType, labels, valuesA, valuesB  
+5. summary: Concise, professional comparison insight
+
+Respond with a JSON like:
+
+{
+  "titleA": "Elon Musk",
+  "titleB": "Steve Jobs",
+  "pointsA": ["Execution focused", "Bold innovator"],
+  "pointsB": ["Design focused", "Visionary leader"],
+  "chart": {
+    "chartType": "radar",
+    "labels": ["Innovation", "Leadership", "Execution"],
+    "valuesA": [95, 90, 88],
+    "valuesB": [90, 93, 80]
+  },
+  "summary": "Elon Musk is known for rapid execution..."
+}
+`;
+
+    const geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: aiPrompt }] }] }),
+      }
+    );
+
+    const geminiData = await geminiRes.json();
+    const raw = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+    const parsed = JSON.parse(raw);
+
+    res.json(parsed);
+  } catch (err) {
+    console.error("Compare API Error:", err.message);
+    res.status(500).json({ error: "Failed to compare subjects" });
+  }
+});
