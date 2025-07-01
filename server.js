@@ -390,28 +390,15 @@ app.get("/api/news", async (req, res) => {
       },
     });
 
-    // Enhance thumbnail quality by attempting to fetch higher-res images
     const articles =
-      newsRes.data.news_results?.map((item) => {
-        let thumbnail = item.thumbnail;
-        // Try to get a higher-res image if possible
-        // For Google News, sometimes you can replace "w=..." or "h=..." in the URL with higher values
-        if (thumbnail && typeof thumbnail === "string") {
-          // Try to replace width/height params in the URL for higher-res
-          // e.g., ...=w72-h72... => ...=w600-h400...
-          thumbnail = thumbnail.replace(/w\d+-h\d+/g, "w800-h600");
-          // Remove any "=s..." (size) params and set a higher value
-          thumbnail = thumbnail.replace(/=s\d+/, "=s800");
-        }
-        return {
-          title: item.title,
-          link: item.link,
-          source: item.source,
-          date: item.date,
-          thumbnail,
-          snippet: item.snippet,
-        };
-      }) || [];
+      newsRes.data.news_results?.map((item) => ({
+        title: item.title,
+        link: item.link,
+        source: item.source,
+        date: item.date,
+        thumbnail: item.thumbnail,
+        snippet: item.snippet,
+      })) || [];
 
     res.json({ articles });
   } catch (err) {
