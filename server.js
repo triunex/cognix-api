@@ -629,6 +629,7 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
   }
 });
 
+
 app.listen(10000, () => console.log("Server running on port 10000"));
 
 export async function generatePdfFromHtml(html) {
@@ -841,7 +842,12 @@ Respond with a JSON like:
 
     const geminiData = await geminiRes.json();
     const raw = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-    const parsed = JSON.parse(raw);
+    const cleaned = raw
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+
+const parsed = JSON.parse(cleaned);
 
     res.json(parsed);
   } catch (err) {
