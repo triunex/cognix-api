@@ -10,6 +10,12 @@ import fs from "fs/promises";
 import path from "path";
 import pdf from "html-pdf-node"; // add this import at the top
 
+// --- Autopilot Recording Imports ---
+import puppeteer from "puppeteer";
+import fs from "fs";
+import { PuppeteerScreenRecorder } from "puppeteer-screen-recorder";
+// --- End Autopilot Recording Imports ---
+
 dotenv.config();
 
 const app = express();
@@ -812,36 +818,30 @@ app.use((req, res, next) => {
   next();
 });
 
-app.post("/api/gemini-intent", async (req, res) => {
+// Autopilot browser recording endpoint
+app.post("/api/autopilot-record", async (req, res) => {
+  const { query } = req.body;
+
   try {
-    const { prompt } = req.body;
+    const browser = await puppeteer.launch({ headless: true, args: ["--no-sandbox"] });
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 720 });
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-        }),
-      }
-    );
+    const recorder = new PuppeteerScreenRecorder(page);
+    await recorder.start("./recordings/session.webm");
 
-    const data = await response.json();
+    const searchQuery = encodeURIComponent(query || "iPhone 15");
+    await page.goto(`https://www.amazon.in/s?k=${searchQuery}`);
+    await page.waitForTimeout(5000); // Simulated browsing
 
-    // ✅ Properly check structure before accessing
-    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!raw) {
-      console.error("No valid Gemini response:", data);
-      return res.status(500).json({ error: "No valid response from Gemini" });
-    }
+    await recorder.stop();
+    await browser.close();
 
-    // Strip markdown code block formatting before parsing
-    const cleaned = raw.replace(/```json|```/g, "").trim();
-    const parsed = JSON.parse(cleaned);
-    res.json(parsed);
-  } catch (err) {
-    console.error("Gemini Intent Error:", err);
-    res.status(500).json({ error: "Failed to extract intent" });
+    const video = fs.readFileSync("./recordings/session.webm");
+    res.setHeader("Content-Type", "video/webm");
+    res.send(video);
+  } catch (e) {
+    console.error("Recording error:", e);
+    res.status(500).json({ error: "Failed to record browser session" });
   }
 });
