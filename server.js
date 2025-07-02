@@ -390,15 +390,28 @@ app.get("/api/news", async (req, res) => {
       },
     });
 
+    // Enhance thumbnail quality by attempting to fetch higher-res images
     const articles =
-      newsRes.data.news_results?.map((item) => ({
-        title: item.title,
-        link: item.link,
-        source: item.source,
-        date: item.date,
-        thumbnail: item.thumbnail,
-        snippet: item.snippet,
-      })) || [];
+      newsRes.data.news_results?.map((item) => {
+        let thumbnail = item.thumbnail;
+        // Try to get a higher-res image if possible
+        // For Google News, sometimes you can replace "w=..." or "h=..." in the URL with higher values
+        if (thumbnail && typeof thumbnail === "string") {
+          // Try to replace width/height params in the URL for higher-res
+          // e.g., ...=w72-h72... => ...=w600-h400...
+          thumbnail = thumbnail.replace(/w\d+-h\d+/g, "w800-h600");
+          // Remove any "=s..." (size) params and set a higher value
+          thumbnail = thumbnail.replace(/=s\d+/, "=s800");
+        }
+        return {
+          title: item.title,
+          link: item.link,
+          source: item.source,
+          date: item.date,
+          thumbnail,
+          snippet: item.snippet,
+        };
+      }) || [];
 
     res.json({ articles });
   } catch (err) {
@@ -797,4 +810,28 @@ app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*"); // Replace * with specific domain in production
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
   next();
+});
+
+app.post("/api/gemini-intent", async (req, res) => {
+  try {
+    const { prompt } = req.body;
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+      }
+    );
+
+    const data = await response.json();
+    const parsed = JSON.parse(data.candidates[0].content.parts[0].text);
+    res.json(parsed);
+  } catch (err) {
+    console.error("Gemini Intent Error:", err);
+    res.status(500).json({ error: "Failed to extract intent" });
+  }
 });
