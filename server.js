@@ -828,7 +828,15 @@ app.post("/api/gemini-intent", async (req, res) => {
     );
 
     const data = await response.json();
-    const parsed = JSON.parse(data.candidates[0].content.parts[0].text);
+
+    // ✅ Properly check structure before accessing
+    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!raw) {
+      console.error("No valid Gemini response:", data);
+      return res.status(500).json({ error: "No valid response from Gemini" });
+    }
+
+    const parsed = JSON.parse(raw);
     res.json(parsed);
   } catch (err) {
     console.error("Gemini Intent Error:", err);
