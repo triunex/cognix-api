@@ -12,7 +12,6 @@ import pdf from "html-pdf-node"; // add this import at the top
 
 // --- Autopilot Recording Imports ---
 import puppeteer from "puppeteer";
-import fs from "fs";
 import { PuppeteerScreenRecorder } from "puppeteer-screen-recorder";
 // --- End Autopilot Recording Imports ---
 
