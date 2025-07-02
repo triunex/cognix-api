@@ -836,7 +836,9 @@ app.post("/api/gemini-intent", async (req, res) => {
       return res.status(500).json({ error: "No valid response from Gemini" });
     }
 
-    const parsed = JSON.parse(raw);
+    // Strip markdown code block formatting before parsing
+    const cleaned = raw.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(cleaned);
     res.json(parsed);
   } catch (err) {
     console.error("Gemini Intent Error:", err);
