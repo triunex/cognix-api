@@ -1,19 +1,11 @@
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
-import axios from "axios";
-import dotenv from "dotenv";
-import unfluff from "unfluff";
 import { generatePdf } from "html-pdf-node"; // ES Module import
 import nodemailer from "nodemailer";
 import fs from "fs/promises";
 import path from "path";
 import pdf from "html-pdf-node"; // add this import at the top
-
-// --- Autopilot Recording Imports ---
-import puppeteer from "puppeteer";
-import { PuppeteerScreenRecorder } from "puppeteer-screen-recorder";
-// --- End Autopilot Recording Imports ---
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+puppeteer.use(StealthPlugin());
 
 dotenv.config();
 
@@ -817,30 +809,60 @@ app.use((req, res, next) => {
   next();
 });
 
-// Autopilot browser recording endpoint
-app.post("/api/autopilot-record", async (req, res) => {
-  const { query } = req.body;
-
+app.post('/api/real-browser-agent', async (req, res) => {
   try {
-    const browser = await puppeteer.launch({ headless: true, args: ["--no-sandbox"] });
+    const { prompt } = req.body;
+    const steps = await getGeminiSteps(prompt);
+
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 720 });
 
-    const recorder = new PuppeteerScreenRecorder(page);
-    await recorder.start("./recordings/session.webm");
+    const screenshots = [];
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      if (step.url) await page.goto(step.url, { waitUntil: 'domcontentloaded' });
+      if (step.click) await page.click(step.click);
+      if (step.type && step.value) await page.type(step.type, step.value);
 
-    const searchQuery = encodeURIComponent(query || "iPhone 15");
-    await page.goto(`https://www.amazon.in/s?k=${searchQuery}`);
-    await page.waitForTimeout(5000); // Simulated browsing
+      await page.waitForTimeout(1500);
+      const screenshot = await page.screenshot({ encoding: 'base64' });
+      screenshots.push({
+        caption: step.caption || `Step ${i + 1}`,
+        image: `data:image/png;base64,${screenshot}`,
+      });
+    }
 
-    await recorder.stop();
     await browser.close();
-
-    const video = fs.readFileSync("./recordings/session.webm");
-    res.setHeader("Content-Type", "video/webm");
-    res.send(video);
-  } catch (e) {
-    console.error("Recording error:", e);
-    res.status(500).json({ error: "Failed to record browser session" });
+    res.json({ success: true, steps: screenshots });
+  } catch (err) {
+    console.error('Real Browser Agent Error:', err);
+    res.status(500).json({ success: false, message: 'Agent crashed' });
   }
 });
+
+// TEMP: Gemini mock
+async function getGeminiSteps(prompt) {
+  if (prompt.toLowerCase().includes('buy iphone')) {
+    return [
+      {
+        caption: 'Searching iPhone 15 on Amazon',
+        url: 'https://www.amazon.in/s?k=iphone+15',
+      },
+      {
+        caption: 'Visiting Apple store',
+        url: 'https://www.apple.com/in/shop/buy-iphone/iphone-15',
+      },
+    ];
+  }
+
+  // Generic fallback
+  return [
+    {
+      caption: 'Searching Google for your query',
+      url: 'https://www.google.com/search?q=' + encodeURIComponent(prompt),
+    },
+  ];
+}
