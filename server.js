@@ -1,3 +1,9 @@
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import axios from "axios";
+import dotenv from "dotenv";
+import unfluff from "unfluff";
 import { generatePdf } from "html-pdf-node"; // ES Module import
 import nodemailer from "nodemailer";
 import fs from "fs/promises";
