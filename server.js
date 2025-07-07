@@ -9,8 +9,10 @@ import nodemailer from "nodemailer";
 import fs from "fs/promises";
 import path from "path";
 import pdf from "html-pdf-node"; // add this import at the top
-import puppeteer from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import puppeteer from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import { chromium } from "playwright";
+import fs from "fs";
 puppeteer.use(StealthPlugin());
 
 dotenv.config();
@@ -40,7 +42,9 @@ app.post("/api/search", async (req, res) => {
   const fetchImages = async (query) => {
     const serpApiKey = process.env.SERP_API_KEY;
     const res = await fetch(
-      `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&tbm=isch&api_key=${serpApiKey}`
+      `https://serpapi.com/search.json?q=${encodeURIComponent(
+        query
+      )}&tbm=isch&api_key=${serpApiKey}`
     );
     const json = await res.json();
     return json.images_results?.slice(0, 6) || [];
@@ -275,7 +279,8 @@ Give answer in the friendly way and talk like a smart , helpful and chill Gen Z 
     );
 
     // Parse Gemini output as JSON blocks
-    const response = geminiRes.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const response =
+      geminiRes.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
     const jsonStart = response.indexOf("[");
     const jsonEnd = response.lastIndexOf("]");
     const jsonStr = response.substring(jsonStart, jsonEnd + 1);
@@ -687,7 +692,10 @@ app.get("/api/ping", (req, res) => {
 app.get("/api/warm-gemini", async (req, res) => {
   try {
     const dummyPrompt = [
-      { role: "user", parts: [{ text: "Just say hello, this is a warmup ping." }] },
+      {
+        role: "user",
+        parts: [{ text: "Just say hello, this is a warmup ping." }],
+      },
     ];
 
     // Use axios to call Gemini API for warmup
@@ -799,7 +807,10 @@ app.post("/api/convert-to-pdf", async (req, res) => {
 
     pdf.generatePdf(file, { format: "A4" }).then((pdfBuffer) => {
       res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=cognix-report.pdf");
+      res.setHeader(
+        "Content-Disposition",
+        "attachment; filename=cognix-report.pdf"
+      );
       return res.send(pdfBuffer);
     });
   } catch (error) {
@@ -811,64 +822,82 @@ app.post("/api/convert-to-pdf", async (req, res) => {
 // ✅ Fallback CORS middleware (place before app.listen)
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*"); // Replace * with specific domain in production
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept"
+  );
   next();
 });
 
-app.post('/api/real-browser-agent', async (req, res) => {
+app.post("/api/autopilot-agent", async (req, res) => {
+  const { query } = req.body;
+
   try {
-    const { prompt } = req.body;
-    const steps = await getGeminiSteps(prompt);
+    const browser = await chromium.launch({ headless: false });
+    const context = await browser.newContext();
+    const page = await context.newPage();
 
-    const browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    });
-    const page = await browser.newPage();
+    // Step 1: Go to a search page
+    const searchURL = `https://www.google.com/search?q=${encodeURIComponent(
+      query
+    )}`;
+    await page.goto(searchURL);
+    await page.waitForTimeout(5000); // Simulate human wait
 
-    const screenshots = [];
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
-      if (step.url) await page.goto(step.url, { waitUntil: 'domcontentloaded' });
-      if (step.click) await page.click(step.click);
-      if (step.type && step.value) await page.type(step.type, step.value);
-
-      await page.waitForTimeout(1500);
-      const screenshot = await page.screenshot({ encoding: 'base64' });
-      screenshots.push({
-        caption: step.caption || `Step ${i + 1}`,
-        image: `data:image/png;base64,${screenshot}`,
-      });
-    }
+    // Step 2: Screenshot of result
+    const screenshotPath = path.resolve(
+      "recordings",
+      `agent-result-${Date.now()}.png`
+    );
+    await page.screenshot({ path: screenshotPath });
 
     await browser.close();
-    res.json({ success: true, steps: screenshots });
+
+    const imgBuffer = fs.readFileSync(screenshotPath);
+    res.setHeader("Content-Type", "image/png");
+    res.send(imgBuffer);
   } catch (err) {
-    console.error('Real Browser Agent Error:', err);
-    res.status(500).json({ success: false, message: 'Agent crashed' });
+    console.error("Autopilot Agent Error:", err);
+    res.status(500).json({ error: "Agent failed to run" });
   }
 });
 
-// TEMP: Gemini mock
-async function getGeminiSteps(prompt) {
-  if (prompt.toLowerCase().includes('buy iphone')) {
-    return [
-      {
-        caption: 'Searching iPhone 15 on Amazon',
-        url: 'https://www.amazon.in/s?k=iphone+15',
-      },
-      {
-        caption: 'Visiting Apple store',
-        url: 'https://www.apple.com/in/shop/buy-iphone/iphone-15',
-      },
-    ];
-  }
+app.post("/api/stock-analysis", async (req, res) => {
+  try {
+    const { ticker } = req.body;
 
-  // Generic fallback
-  return [
-    {
-      caption: 'Searching Google for your query',
-      url: 'https://www.google.com/search?q=' + encodeURIComponent(prompt),
-    },
-  ];
-}
+    if (!ticker) {
+      return res.status(400).json({ error: "Ticker symbol is required" });
+    }
+
+    // Construct the prompt
+    const prompt = `
+You are a professional financial analyst. Analyze the stock: ${ticker}.
+Give a summary of:
+1. Technical indicators (MACD, RSI, trends)
+2. Fundamental view (valuation, P/E, financials if possible)
+3. News sentiment (recent headlines)
+4. AI-based buy/sell recommendation with reasoning
+Be concise but insightful.
+`;
+
+    // Gemini 1.5 Flash call (using HTTP API)
+    const geminiRes = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+
+    const geminiResponse =
+      geminiRes.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+    res.json({ analysis: geminiResponse });
+  } catch (err) {
+    console.error("Stock analysis error:", err);
+    res.status(500).json({ error: "AI analysis failed" });
+  }
+});
