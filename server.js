@@ -12,7 +12,6 @@ import pdf from "html-pdf-node"; // add this import at the top
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { chromium } from "playwright";
-import fs from "fs";
 puppeteer.use(StealthPlugin());
 
 dotenv.config();
