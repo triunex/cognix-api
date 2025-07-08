@@ -12,6 +12,7 @@ import pdf from "html-pdf-node"; // add this import at the top
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { chromium } from "playwright";
+import fs from "fs";
 puppeteer.use(StealthPlugin());
 
 dotenv.config();
@@ -860,3 +861,59 @@ app.post("/api/autopilot-agent", async (req, res) => {
     res.status(500).json({ error: "Agent failed to run" });
   }
 });
+
+let spotifyAccessToken = null;
+let tokenExpiresAt = 0;
+
+// 🔐 Get Access Token
+async function fetchSpotifyAccessToken() {
+  if (Date.now() < tokenExpiresAt && spotifyAccessToken) return spotifyAccessToken;
+
+  const res = await axios.post(
+    "https://accounts.spotify.com/api/token",
+    new URLSearchParams({ grant_type: "client_credentials" }).toString(),
+    {
+      headers: {
+        "Authorization":
+          "Basic " +
+          Buffer.from(
+            `${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`
+          ).toString("base64"),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+    }
+  );
+  spotifyAccessToken = res.data.access_token;
+  tokenExpiresAt = Date.now() + res.data.expires_in * 1000;
+  return spotifyAccessToken;
+}
+
+app.get("/api/spotify-search", async (req, res) => {
+  const { query } = req.query;
+  if (!query) return res.status(400).json({ error: "Missing query" });
+
+  try {
+    const token = await fetchSpotifyAccessToken();
+
+    const searchRes = await axios.get(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track,artist,playlist&limit=5`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
+
+    const results = searchRes.data.tracks.items.map((item) => ({
+      name: item.name,
+      artist: item.artists[0].name,
+      uri: item.uri,
+      url: item.external_urls.spotify,
+      id: item.id,
+    }));
+
+    res.json({ results });
+  } catch (err) {
+    console.error("Spotify Search Error:", err);
+    res.status(500).json({ error: "Spotify search failed" });
+  }
+});
+
