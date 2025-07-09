@@ -12,6 +12,7 @@ import pdf from "html-pdf-node"; // add this import at the top
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { chromium } from "playwright";
+import fs from "fs";
 puppeteer.use(StealthPlugin());
 
 dotenv.config();
@@ -21,7 +22,7 @@ const app = express();
 // ✅ Proper CORS setup
 app.use(
   cors({
-    origin: "http://localhost:8080/", // or replace "*" with your frontend URL in production
+    origin: "*", // or replace "*" with your frontend URL in production
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
@@ -190,8 +191,8 @@ Be behave like you are a Gen Z and talk like Gen z
 });
 
 app.post("/api/chat", async (req, res) => {
-  const userMessage = req.body.query;
-  const history = req.body.history || [];
+  // Accept focusMode and focusDuration from frontend
+  const { query: userMessage, history, focusMode, focusDuration } = req.body;
 
   if (!userMessage) {
     return res.status(400).json({ error: "Missing message." });
@@ -221,6 +222,18 @@ app.post("/api/chat", async (req, res) => {
         .join("\n\n");
     }
 
+    // 1. Build Focus Mode context
+    let focusContext = "";
+    if (focusMode) {
+      focusContext = `
+You are in Focus Mode. 
+- Keep your replies short, direct, and focused.
+- Don’t add unnecessary suggestions or follow-up questions.
+- Try to complete tasks within ${focusDuration || 20} minutes.
+- Talk like a calm, focused assistant — avoid small talk.
+`;
+    }
+
     // Build AI prompt with structured JSON block instruction
     const structureInstruction = `
 When replying to the user, return JSON with structured blocks like:
@@ -238,7 +251,12 @@ When replying to the user, return JSON with structured blocks like:
 Return only the JSON list of blocks. No explanation or intro text outside it.
 `;
 
-    const finalPrompt = triggerRealTime
+    // Inject focus context if enabled
+    const finalPrompt = focusMode
+      ? `${focusContext}\n\nUser asked: "${userMessage}"`
+      : userMessage;
+
+    const promptWithStructure = triggerRealTime
       ? `
 You're name is CogniX – a friendly, real-time aware assistant.
 You can talk to user in — Hindi, English, or a mix of both (Hinglish).
@@ -257,9 +275,9 @@ Answer like you're smart, helpful and human. Don’t mention these are search re
 Be conversational and up-to-date.
 Give answer in the friendly way and talk like a smart , helpful and chill Gen Z friend.
 `
-      : `${userMessage}\n\n${structureInstruction}`;
+      : `${finalPrompt}\n\n${structureInstruction}`;
 
-    const formattedHistory = history.map((msg) => ({
+    const formattedHistory = (history || []).map((msg) => ({
       role: msg.role,
       parts: [{ text: msg.content }],
     }));
@@ -269,7 +287,7 @@ Give answer in the friendly way and talk like a smart , helpful and chill Gen Z 
       {
         contents: [
           ...formattedHistory,
-          { role: "user", parts: [{ text: finalPrompt }] },
+          { role: "user", parts: [{ text: promptWithStructure }] },
         ],
       },
       {
