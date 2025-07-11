@@ -21,7 +21,7 @@ const app = express();
 // ✅ Proper CORS setup
 app.use(
   cors({
-    origin: "http://localhost:8080/", // or replace "*" with your frontend URL in production
+    origin: "*", // or replace "*" with your frontend URL in production
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
