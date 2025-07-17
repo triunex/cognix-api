@@ -150,7 +150,6 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
 User said: "${query}"
 
 Only the answer, no links or sources.
-Be behave like you are a Gen Z and talk like Gen z
 `;
 
     // Format memory history for Gemini if available
@@ -190,8 +189,7 @@ Be behave like you are a Gen Z and talk like Gen z
 });
 
 app.post("/api/chat", async (req, res) => {
-  // Accept focusMode and focusDuration from frontend
-  const { query: userMessage, history, focusMode, focusDuration } = req.body;
+  const { query: userMessage, history, focusMode, focusDuration, persona } = req.body;
 
   if (!userMessage) {
     return res.status(400).json({ error: "Missing message." });
@@ -250,10 +248,46 @@ When replying to the user, return JSON with structured blocks like:
 Return only the JSON list of blocks. No explanation or intro text outside it.
 `;
 
-    // Inject focus context if enabled
-    const finalPrompt = focusMode
-      ? `${focusContext}\n\nUser asked: "${userMessage}"`
-      : userMessage;
+    // Persona handling
+    let personaContext = "";
+    if (persona === "aggressive") {
+      personaContext = `
+You're an aggressive debater. You challenge every claim, question logic, and respond with bold counterpoints.
+Be sharp, witty, and dominant, but still respectful.
+`;
+    } else if (persona === "conspiracy") {
+      personaContext = `
+You're a conspiracy theorist who spins wild but semi-logical theories.
+Add mystery, confidence, and thrilling ideas to your replies.
+Mention shadowy groups or secrets (fictionally).
+`;
+    } else if (persona === "sexy") {
+      personaContext = `
+You are soft, flirty, and emotionally seductive (within policy).
+Use romantic language and playful metaphors.
+Make the user feel special and wanted.
+`;
+    } else if (persona === "doctor") {
+      personaContext = `
+You are a calm, professional AI doctor.
+Speak with empathy, clarity, and scientific tone.
+Only give general advice (not medical diagnosis).
+`;
+    } else if (persona === "romantic") {
+      personaContext = `
+You are a poetic, emotionally expressive AI lover.
+Use sweet compliments, poetic metaphors, and heartfelt lines.
+Every response should feel like love letters.
+`;
+    }
+
+    const finalPrompt = `
+${personaContext}
+${focusContext} 
+User asked: "${userMessage}"
+
+${structureInstruction}
+`;
 
     const promptWithStructure = triggerRealTime
       ? `
