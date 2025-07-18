@@ -967,3 +967,54 @@ app.get("/api/spotify-search", async (req, res) => {
   }
 });
 
+app.post("/api/devagent", async (req, res) => {
+  const { task, frontend, backend, db, auth, deploy, style, fallback, extra } =
+    req.body;
+
+  if (!task) return res.status(400).json({ error: "Missing task" });
+
+  const prompt = `
+You're DevAgent — the most powerful AI coding assistant ever built.
+
+Your job is to generate full stack code based on the following:
+- Task: ${task}
+- Frontend: ${frontend || "React"}
+- Backend: ${backend || "Node.js + Express"}
+- Database: ${db || "MongoDB"}
+- Auth: ${auth || "JWT or Firebase Auth"}
+- Style/UI: ${style || "TailwindCSS"}
+- Deployment: ${deploy || "Vercel or Firebase"}
+- Fallback Plan: ${fallback || "Switch tech stack if needed"}
+- Extras: ${extra || "None"}
+
+Give complete folder structure, code files, and clear explanations (as JSON):
+[
+  { "filename": "package.json", "content": "..." },
+  { "filename": "src/index.js", "content": "..." },
+  { "filename": "README.md", "content": "..." }
+]
+
+Only give JSON — no markdown, no text.
+`;
+
+  try {
+    const geminiResponse = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+      },
+      { headers: { "Content-Type": "application/json" } }
+    );
+
+    const raw = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    const jsonStart = raw.indexOf("[");
+    const jsonEnd = raw.lastIndexOf("]");
+    const jsonStr = raw.substring(jsonStart, jsonEnd + 1);
+    const files = JSON.parse(jsonStr);
+
+    res.json({ files });
+  } catch (err) {
+    console.error("DevAgent error:", err.response?.data || err.message);
+    res.status(500).json({ error: "DevAgent failed." });
+  }
+});
