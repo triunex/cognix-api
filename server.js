@@ -68,24 +68,26 @@ app.post("/api/search", async (req, res) => {
       .join("\n\n");
 
     const prompt = `
-You're an intelligent assistant. Use the search results below to answer the user's question *clearly and helpfully*, even if not all results are directly relevant. 
-If needed, combine your own knowledge with the web results.
-Give Great easy to understand and slightly big answers.
-If anyone want a paragraph , Summary, Research , do that all.
-Don't mention about any sources or links.
-Avoid using hashtags (#), asterisks (*), or markdown symbols.
+You are Nelieo, an intelligent AI assistant created by Nelieo.AI. You have access to current, real-time information from the web.
 
+You MUST use the search results below to answer the user's question. This information is current and up-to-date.
+
+When answering:
+- Use specific details, numbers, dates, and facts from the search results
+- Synthesize information from multiple sources when relevant
+- Give comprehensive, easy to understand answers
+- If asked about "today", "latest", or current events, use the information provided
+- You DO have access to current information - use it confidently
+- Be friendly and helpful in your tone
+- Format your response clearly with proper paragraphs
+- Avoid using hashtags (#), asterisks (*), or markdown symbols
 
 Question: "${query}"
 
-Search Results:
+Current Search Results:
 ${context}
 
-Answer in a friendly, helpful tone:
-Answer clearly, concisely, and professionally.
-Talk in very Friendly way.
-Avoid using hashtags (#), asterisks (*), or markdown symbols.
-`;
+Please provide a comprehensive answer based on the current information above:`;
 
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
@@ -113,6 +115,7 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
     // 4. Respond to frontend
     res.json({
       answer: geminiResponse.data.candidates[0].content.parts[0].text,
+      results: results, // Include the search results for RAG
       images, // include in API response
     });
   } catch (err) {
@@ -189,7 +192,13 @@ Only the answer, no links or sources.
 });
 
 app.post("/api/chat", async (req, res) => {
-  const { query: userMessage, history, focusMode, focusDuration, persona } = req.body;
+  const {
+    query: userMessage,
+    history,
+    focusMode,
+    focusDuration,
+    persona,
+  } = req.body;
 
   if (!userMessage) {
     return res.status(400).json({ error: "Missing message." });
@@ -917,14 +926,15 @@ let tokenExpiresAt = 0;
 
 // 🔐 Get Access Token
 async function fetchSpotifyAccessToken() {
-  if (Date.now() < tokenExpiresAt && spotifyAccessToken) return spotifyAccessToken;
+  if (Date.now() < tokenExpiresAt && spotifyAccessToken)
+    return spotifyAccessToken;
 
   const res = await axios.post(
     "https://accounts.spotify.com/api/token",
     new URLSearchParams({ grant_type: "client_credentials" }).toString(),
     {
       headers: {
-        "Authorization":
+        Authorization:
           "Basic " +
           Buffer.from(
             `${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`
@@ -946,7 +956,9 @@ app.get("/api/spotify-search", async (req, res) => {
     const token = await fetchSpotifyAccessToken();
 
     const searchRes = await axios.get(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track,artist,playlist&limit=5`,
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(
+        query
+      )}&type=track,artist,playlist&limit=5`,
       {
         headers: { Authorization: `Bearer ${token}` },
       }
@@ -999,7 +1011,7 @@ Only give JSON — no markdown, no text.
 
   try {
     const geminiResponse = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [{ role: "user", parts: [{ text: prompt }] }],
       },
