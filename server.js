@@ -87,26 +87,23 @@ function cosineSim(a, b) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
 }
 
-async function getEmbeddingsOpenAI(texts = []) {
-  // expects OPENAI_API_KEY in env
-  const url = "https://api.openai.com/v1/embeddings";
+async function getEmbeddingsGemini(texts = []) {
+  // Uses Google Generative Language API: text-embedding-004
   try {
-    const resp = await axios.post(
-      url,
-      {
-        model: "text-embedding-3-small",
-        input: texts,
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        },
-      }
-    );
-    return resp.data.data.map((d) => d.embedding);
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key=${process.env.GEMINI_API_KEY}`;
+    const body = {
+      requests: texts.map((t) => ({
+        model: "models/text-embedding-004",
+        content: { parts: [{ text: t }] },
+        // taskType: "RETRIEVAL_DOCUMENT", // optional hint
+      })),
+    };
+    const resp = await axios.post(url, body, {
+      headers: { "Content-Type": "application/json" },
+    });
+    return (resp.data?.embeddings || []).map((e) => e.values);
   } catch (e) {
-    console.error("Embeddings error:", e.response?.data || e.message);
+    console.error("Gemini embeddings error:", e.response?.data || e.message);
     throw e;
   }
 }
@@ -1228,10 +1225,10 @@ app.post("/api/agentic-v2", async (req, res) => {
 
     // 5) Embed all chunks (OpenAI embeddings)
     const texts = chunks.map((c) => c.text.substring(0, 2000)); // limit size
-    const embeddings = await getEmbeddingsOpenAI(texts);
+    const embeddings = await getEmbeddingsGemini(texts);
 
     // 6) Embed the user query
-    const qEmb = (await getEmbeddingsOpenAI([query]))[0];
+    const qEmb = (await getEmbeddingsGemini([query]))[0];
 
     // 7) Compute similarity, pick top chunks
     const sims = embeddings.map((emb, i) => ({
