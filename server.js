@@ -1150,7 +1150,7 @@ Only give JSON — no markdown, no text.
 
 // ------------- Agentic v2 endpoint -------------
 app.post("/api/agentic-v2", async (req, res) => {
-  const { query, maxWeb = 8, topChunks = 6 } = req.body || {};
+  const { query, maxWeb = 8, topChunks = 10 } = req.body || {};
   if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
@@ -1258,20 +1258,25 @@ app.post("/api/agentic-v2", async (req, res) => {
     const context = contextParts.join("\n");
 
     const finalPrompt = `
-You are Nelieo (CogniX) — an intelligent agent that synthesizes facts from multiple web pages and social media. 
-Use ONLY the context below (do not hallucinate new facts). Produce:
-1) A concise summary answer to the user's question.
-2) A short 'Top Sources' list with each source title and URL or handle.
-3) A timestamp of 'last_fetched' in ISO format.
+You are Nelieo (CogniX) — an intelligent agent that synthesizes facts from multiple web pages and social media.
+Use ONLY the context below (do not hallucinate new facts). Produce a friendly, well-structured, and easy-to-read answer that feels premium.
 
-Respond in JSON exactly with keys: { "answer": "...", "sources": [{ "title":"", "url":"" }], "last_fetched": "..." }
+Style requirements for the answer:
+- Write clearly in simple language; prefer short sentences.
+- Be warm and helpful; avoid formal or academic tone.
+- Make it longer and richer (about 150–300 words) with 3–5 short sections.
+- Use plain text only (no markdown symbols, no #, *, or backticks).
+- Separate sections with blank lines and start each section with a short title (e.g., Overview:, Key Points:, What this means:, Caveats:, Next steps:).
+- When helpful, include 3–6 short bullet-like lines starting with a hyphen (-) for readability.
+
+Return JSON with exactly these keys: { "answer": "...", "sources": [{ "title":"", "url":"" }], "last_fetched": "..." }
 
 User question: "${query}"
 
 Context (ranked most relevant first):
 ${context}
 
-IMPORTANT: Use plain sentences (no markdown), and if the context does not fully answer, say which parts are uncertain.
+IMPORTANT: If the context does not fully answer, briefly state which parts are uncertain or require verification.
 `;
 
     // 9) Call Gemini for synthesis
@@ -1279,6 +1284,11 @@ IMPORTANT: Use plain sentences (no markdown), and if the context does not fully 
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [{ role: "user", parts: [{ text: finalPrompt }] }],
+        generationConfig: {
+          temperature: 0.85,
+          topP: 0.9,
+          maxOutputTokens: 1024,
+        },
       },
       { headers: { "Content-Type": "application/json" } }
     );
