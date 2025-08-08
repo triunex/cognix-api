@@ -1257,7 +1257,7 @@ app.post("/api/agentic-v2", async (req, res) => {
     });
     const context = contextParts.join("\n");
 
-   const finalPrompt = `
+    const finalPrompt = `
 You are Nelieo — a world-class multi-source AI answer engine.
 
 You have context from web pages, news, and social media.
@@ -1313,35 +1313,32 @@ ${context}
     const rawText =
       geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-    // try parse JSON out of response
-    let parsed = null;
+    // Parse JSON output from Gemini
+    let parsed = {};
     try {
-      const s = rawText.slice(rawText.indexOf("{"));
-      parsed = JSON.parse(s);
+      const jsonStart = rawText.indexOf("{");
+      parsed = JSON.parse(rawText.slice(jsonStart));
     } catch (e) {
-      // fallback - return the raw text if parse failed
+      // Fallback: wrap raw response
       parsed = {
-        answer: rawText,
+        raw_answer: rawText,
+        formatted_answer: rawText,
         sources: top.map((t) => ({
           title: t.chunk.source.title || t.chunk.source.type,
           url: t.chunk.source.url || t.chunk.source.id || t.chunk.source,
         })),
+        images: [],
         last_fetched: new Date().toISOString(),
       };
     }
 
-    // 10) return structured response
+    // Return only the requested JSON structure
     res.json({
-      answer: parsed.answer || parsed.text || parsed,
-      sources:
-        parsed.sources ||
-        top.map((t) => ({
-          title: t.chunk.source.title || t.chunk.source.type,
-          url: t.chunk.source.url || t.chunk.source.id,
-        })),
+      raw_answer: parsed.raw_answer || "",
+      formatted_answer: parsed.formatted_answer || parsed.raw_answer || "",
+      sources: parsed.sources || [],
+      images: parsed.images || [],
       last_fetched: parsed.last_fetched || new Date().toISOString(),
-      top_chunks: top,
-      raw_gemini: rawText,
     });
   } catch (err) {
     console.error(
@@ -1351,4 +1348,3 @@ ${context}
     res.status(500).json({ error: "Agentic pipeline failed." });
   }
 });
-
