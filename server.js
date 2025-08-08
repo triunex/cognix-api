@@ -7,11 +7,13 @@ import unfluff from "unfluff";
 import { generatePdf } from "html-pdf-node"; // ES Module import
 import nodemailer from "nodemailer";
 import fs from "fs/promises";
+import { readFileSync } from "fs";
 import path from "path";
 import pdf from "html-pdf-node"; // add this import at the top
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { chromium } from "playwright";
+import crypto from "crypto";
 puppeteer.use(StealthPlugin());
 
 dotenv.config();
@@ -31,6 +33,127 @@ app.options("*", cors()); // Allow preflight for all routes
 app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 
 app.use(express.json());
+
+// ------------- Agentic v2 helpers -------------
+async function fetchPageText(url) {
+  try {
+    const resp = await axios.get(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+      },
+      timeout: 12000,
+    });
+    const parsed = unfluff(resp.data || "");
+    const text = (parsed.text || "").trim();
+    return {
+      url,
+      title: parsed.title || "",
+      text,
+      author: parsed.author || "",
+    };
+  } catch (e) {
+    console.warn("fetchPageText failed for", url, e.message || e);
+    return { url, title: "", text: "", author: "" };
+  }
+}
+
+function chunkText(text, maxLen = 1500) {
+  if (!text) return [];
+  const paragraphs = text.split(/\n{1,}/).filter(Boolean);
+  const chunks = [];
+  let cur = "";
+  for (const p of paragraphs) {
+    if ((cur + "\n\n" + p).length > maxLen) {
+      if (cur.trim()) chunks.push(cur.trim());
+      cur = p;
+    } else {
+      cur = cur ? cur + "\n\n" + p : p;
+    }
+  }
+  if (cur.trim()) chunks.push(cur.trim());
+  return chunks.map((c) => ({ id: crypto.randomUUID(), text: c }));
+}
+
+function cosineSim(a, b) {
+  let dot = 0,
+    na = 0,
+    nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
+}
+
+async function getEmbeddingsOpenAI(texts = []) {
+  // expects OPENAI_API_KEY in env
+  const url = "https://api.openai.com/v1/embeddings";
+  try {
+    const resp = await axios.post(
+      url,
+      {
+        model: "text-embedding-3-small",
+        input: texts,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+      }
+    );
+    return resp.data.data.map((d) => d.embedding);
+  } catch (e) {
+    console.error("Embeddings error:", e.response?.data || e.message);
+    throw e;
+  }
+}
+
+async function searchTwitterRecent(query, maxResults = 5) {
+  // requires TWITTER_BEARER in env
+  if (!process.env.TWITTER_BEARER) return [];
+  try {
+    const resp = await axios.get(
+      `https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(
+        query
+      )}&tweet.fields=created_at,author_id,text&expansions=author_id&max_results=${maxResults}`,
+      { headers: { Authorization: `Bearer ${process.env.TWITTER_BEARER}` } }
+    );
+    const tweets = (resp.data?.data || []).map((t) => ({
+      id: t.id,
+      text: t.text,
+      created_at: t.created_at,
+    }));
+    return tweets;
+  } catch (e) {
+    console.warn("Twitter search failed:", e.message || e);
+    return [];
+  }
+}
+
+async function searchReddit(query, maxResults = 6) {
+  try {
+    const resp = await axios.get(
+      `https://www.reddit.com/search.json?q=${encodeURIComponent(
+        query
+      )}&limit=${maxResults}&sort=relevance`
+    );
+    const posts =
+      (resp.data?.data?.children || []).map((c) => ({
+        id: c.data.id,
+        title: c.data.title,
+        text: c.data.selftext || "",
+        url: `https://reddit.com${c.data.permalink}`,
+        subreddit: c.data.subreddit,
+      })) || [];
+    return posts;
+  } catch (e) {
+    console.warn("Reddit search failed:", e.message || e);
+    return [];
+  }
+}
 
 app.post("/api/search", async (req, res) => {
   const query = req.body.query;
@@ -68,26 +191,24 @@ app.post("/api/search", async (req, res) => {
       .join("\n\n");
 
     const prompt = `
-You are Nelieo, an intelligent AI assistant created by Nelieo.AI. You have access to current, real-time information from the web.
+You're an intelligent assistant. Use the search results below to answer the user's question *clearly and helpfully*, even if not all results are directly relevant. 
+If needed, combine your own knowledge with the web results.
+Give Great easy to understand and slightly big answers.
+If anyone want a paragraph , Summary, Research , do that all.
+Don't mention about any sources or links.
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
 
-You MUST use the search results below to answer the user's question. This information is current and up-to-date.
-
-When answering:
-- Use specific details, numbers, dates, and facts from the search results
-- Synthesize information from multiple sources when relevant
-- Give comprehensive, easy to understand answers
-- If asked about "today", "latest", or current events, use the information provided
-- You DO have access to current information - use it confidently
-- Be friendly and helpful in your tone
-- Format your response clearly with proper paragraphs
-- Avoid using hashtags (#), asterisks (*), or markdown symbols
 
 Question: "${query}"
 
-Current Search Results:
+Search Results:
 ${context}
 
-Please provide a comprehensive answer based on the current information above:`;
+Answer in a friendly, helpful tone:
+Answer clearly, concisely, and professionally.
+Talk in very Friendly way.
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
+`;
 
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
@@ -115,7 +236,6 @@ Please provide a comprehensive answer based on the current information above:`;
     // 4. Respond to frontend
     res.json({
       answer: geminiResponse.data.candidates[0].content.parts[0].text,
-      results: results, // Include the search results for RAG
       images, // include in API response
     });
   } catch (err) {
@@ -912,7 +1032,7 @@ app.post("/api/autopilot-agent", async (req, res) => {
 
     await browser.close();
 
-    const imgBuffer = fs.readFileSync(screenshotPath);
+    const imgBuffer = readFileSync(screenshotPath);
     res.setHeader("Content-Type", "image/png");
     res.send(imgBuffer);
   } catch (err) {
@@ -1028,5 +1148,182 @@ Only give JSON — no markdown, no text.
   } catch (err) {
     console.error("DevAgent error:", err.response?.data || err.message);
     res.status(500).json({ error: "DevAgent failed." });
+  }
+});
+
+// ------------- Agentic v2 endpoint -------------
+app.post("/api/agentic-v2", async (req, res) => {
+  const { query, maxWeb = 8, topChunks = 6 } = req.body || {};
+  if (!query) return res.status(400).json({ error: "Missing query" });
+
+  try {
+    // 1) SERPAPI search -> top links
+    const serpRes = await axios.get("https://serpapi.com/search", {
+      params: {
+        engine: "google",
+        q: query,
+        api_key: process.env.SERPAPI_API_KEY,
+      },
+    });
+    const organic = serpRes.data.organic_results || [];
+    const topLinks = organic.slice(0, maxWeb).map((r) => ({
+      title: r.title,
+      link: r.link,
+      snippet: r.snippet,
+    }));
+
+    // 2) Fetch & parse pages in parallel (unfluff)
+    const pagePromises = topLinks.map((l) => fetchPageText(l.link));
+    const pages = await Promise.all(pagePromises);
+
+    // 3) Social signals (Twitter / Reddit)
+    const [tweets, reddit] = await Promise.all([
+      searchTwitterRecent(query, 6),
+      searchReddit(query, 6),
+    ]);
+
+    // 4) Build chunks from pages + social posts
+    let chunks = [];
+    for (const p of pages) {
+      if (p.text && p.text.length > 200) {
+        const cs = chunkText(p.text, 1200).map((c) => ({
+          ...c,
+          source: { type: "web", url: p.url, title: p.title },
+        }));
+        chunks = chunks.concat(cs);
+      } else if (p.title) {
+        chunks.push({
+          id: crypto.randomUUID(),
+          text: `${p.title}\n\n${p.text || ""}`.slice(0, 1200),
+          source: { type: "web", url: p.url, title: p.title },
+        });
+      }
+    }
+
+    // include tweets as short chunks
+    for (const t of tweets) {
+      chunks.push({
+        id: crypto.randomUUID(),
+        text: t.text,
+        source: { type: "twitter", id: t.id, created_at: t.created_at },
+      });
+    }
+    // include reddit posts
+    for (const r of reddit) {
+      chunks.push({
+        id: crypto.randomUUID(),
+        text: `${r.title}\n\n${r.text}`,
+        source: { type: "reddit", url: r.url, subreddit: r.subreddit },
+      });
+    }
+
+    if (chunks.length === 0) {
+      return res.json({
+        answer:
+          "I couldn't fetch enough content for this query. Try broader terms or check your SERPAPI/Twitter credentials.",
+        sources: [],
+        raw: [],
+      });
+    }
+
+    // 5) Embed all chunks (OpenAI embeddings)
+    const texts = chunks.map((c) => c.text.substring(0, 2000)); // limit size
+    const embeddings = await getEmbeddingsOpenAI(texts);
+
+    // 6) Embed the user query
+    const qEmb = (await getEmbeddingsOpenAI([query]))[0];
+
+    // 7) Compute similarity, pick top chunks
+    const sims = embeddings.map((emb, i) => ({
+      i,
+      score: cosineSim(emb, qEmb),
+    }));
+    sims.sort((a, b) => b.score - a.score);
+    const top = sims.slice(0, Math.min(topChunks, sims.length)).map((s) => ({
+      chunk: chunks[s.i],
+      score: s.score,
+    }));
+
+    // 8) Build context string for Gemini (include small excerpt + source metadata)
+    const contextParts = top.map((t, idx) => {
+      const s = t.chunk.source;
+      const sourceLabel =
+        s?.type === "web"
+          ? `${s.title} — ${s.url}`
+          : s?.type === "twitter"
+          ? `Twitter (${s.id})`
+          : `Reddit (${s.subreddit || s.url})`;
+      return `Source ${idx + 1}: ${sourceLabel}\nExcerpt:\n${t.chunk.text.slice(
+        0,
+        1200
+      )}\n---\n`;
+    });
+    const context = contextParts.join("\n");
+
+    const finalPrompt = `
+You are Nelieo (CogniX) — an intelligent agent that synthesizes facts from multiple web pages and social media. 
+Use ONLY the context below (do not hallucinate new facts). Produce:
+1) A concise summary answer to the user's question.
+2) A short 'Top Sources' list with each source title and URL or handle.
+3) A timestamp of 'last_fetched' in ISO format.
+
+Respond in JSON exactly with keys: { "answer": "...", "sources": [{ "title":"", "url":"" }], "last_fetched": "..." }
+
+User question: "${query}"
+
+Context (ranked most relevant first):
+${context}
+
+IMPORTANT: Use plain sentences (no markdown), and if the context does not fully answer, say which parts are uncertain.
+`;
+
+    // 9) Call Gemini for synthesis
+    const geminiResp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ role: "user", parts: [{ text: finalPrompt }] }],
+      },
+      { headers: { "Content-Type": "application/json" } }
+    );
+
+    const rawText =
+      geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+    // try parse JSON out of response
+    let parsed = null;
+    try {
+      const s = rawText.slice(rawText.indexOf("{"));
+      parsed = JSON.parse(s);
+    } catch (e) {
+      // fallback - return the raw text if parse failed
+      parsed = {
+        answer: rawText,
+        sources: top.map((t) => ({
+          title: t.chunk.source.title || t.chunk.source.type,
+          url: t.chunk.source.url || t.chunk.source.id || t.chunk.source,
+        })),
+        last_fetched: new Date().toISOString(),
+      };
+    }
+
+    // 10) return structured response
+    res.json({
+      answer: parsed.answer || parsed.text || parsed,
+      sources:
+        parsed.sources ||
+        top.map((t) => ({
+          title: t.chunk.source.title || t.chunk.source.type,
+          url: t.chunk.source.url || t.chunk.source.id,
+        })),
+      last_fetched: parsed.last_fetched || new Date().toISOString(),
+      top_chunks: top,
+      raw_gemini: rawText,
+    });
+  } catch (err) {
+    console.error(
+      "agentic-v2 error:",
+      err.response?.data || err.message || err
+    );
+    res.status(500).json({ error: "Agentic pipeline failed." });
   }
 });
