@@ -1260,7 +1260,7 @@ app.post("/api/agentic-v2", async (req, res) => {
     const finalPrompt = `
 You are Nelieo AI. Respond in well-formatted Markdown for humans — with a big H1 title for the topic, a short overview paragraph, clear H2/H3 sections, bullet points/numbered lists, and generous white space between sections. If relevant, include images using Markdown syntax: ![Alt text](image_url).
 
-Do NOT return JSON unless the user explicitly asks for a chart or a table; otherwise always return human-friendly Markdown. At the end, add a "References" section listing sources as Title — URL, one per line. Use ONLY the provided context for factual details.
+Do NOT return JSON unless the user explicitly asks for a chart or a table; otherwise always return human-friendly Markdown. At the end, add a section titled "Sources" listing each source as: Title — URL, one per line. Use ONLY the provided context for factual details.
 
 USER QUESTION:
 "${query}"
