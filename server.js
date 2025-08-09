@@ -1258,23 +1258,9 @@ app.post("/api/agentic-v2", async (req, res) => {
     const context = contextParts.join("\n");
 
     const finalPrompt = `
-You are Nelieo — a world-class multi-source AI answer engine.
+You are Nelieo AI. Respond in well-formatted Markdown for humans — with a big H1 title for the topic, a short overview paragraph, clear H2/H3 sections, bullet points/numbered lists, and generous white space between sections. If relevant, include images using Markdown syntax: ![Alt text](image_url).
 
-You have context from web pages, news, and social media.
-
-TASK:
-1) Analyze the provided context and answer the user's question in a premium, human-friendly way.
-2) Return ONLY with these fields:
-{
-  "formatted_answer": "...", // Rich Markdown or HTML. Include a big title, overview, sections with headings, lists, and spacing. Images allowed with Markdown syntax.
-  "sources": [ { "title": "string", "url": "string" } ], // optional
-  "images": [ "https://..." ], // optional
-  "charts": [ { "chartType": "bar|line|pie|...", "labels": [..], "values": [..] } ] // optional
-}
-
-Important:
-- Keep to the provided context. Be factual and clear.
-- If you cannot include any optional fields, omit them instead of returning empty lists.
+Do NOT return JSON unless the user explicitly asks for a chart or a table; otherwise always return human-friendly Markdown. At the end, add a "References" section listing sources as Title — URL, one per line. Use ONLY the provided context for factual details.
 
 USER QUESTION:
 "${query}"
@@ -1300,31 +1286,80 @@ ${context}
     const rawText =
       geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-    // Parse JSON output from Gemini
-    let result = {};
-    try {
-      const jsonStart = rawText.indexOf("{");
-      result = JSON.parse(rawText.slice(jsonStart));
-    } catch (e) {
-      // Fallback: use raw text as formatted answer and derive sources from top chunks
-      result = {
-        formatted_answer: rawText,
-        sources: top.map((t) => ({
-          title: t.chunk.source.title || t.chunk.source.type,
-          url: t.chunk.source.url || t.chunk.source.id || t.chunk.source,
-        })),
-        images: [],
-      };
+    // Helper: extract sources from Markdown (References or inline links)
+    function extractSourcesFromMarkdown(md, fallbackTop) {
+      const sources = [];
+      const seen = new Set();
+      const lines = (md || "").split(/\r?\n/);
+
+      // 1) Markdown links [Title](URL)
+      const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+      let m;
+      while ((m = linkRe.exec(md))) {
+        const title = m[1].trim();
+        const url = m[2].trim();
+        if (!seen.has(url)) {
+          sources.push({ title, url });
+          seen.add(url);
+        }
+      }
+
+      // 2) Lines like "- Title — URL" or "Title: URL"
+      const lineUrlRe =
+        /^(?:[-*]|\d+\.)?\s*([^:—\-]+?)\s*(?:[:—\-])\s*(https?:\/\/\S+)/i;
+      for (const line of lines) {
+        const match = line.match(lineUrlRe);
+        if (match) {
+          const title = match[1].trim();
+          const url = match[2].trim().replace(/[).,;]+$/, "");
+          if (title && url && !seen.has(url)) {
+            sources.push({ title, url });
+            seen.add(url);
+          }
+        }
+      }
+
+      // 3) Fallback to top chunk web sources
+      if (sources.length === 0 && Array.isArray(fallbackTop)) {
+        for (const t of fallbackTop) {
+          const src = t.chunk.source;
+          if (src && src.url && !seen.has(src.url)) {
+            sources.push({
+              title: src.title || src.type || src.url,
+              url: src.url,
+            });
+            seen.add(src.url);
+          }
+        }
+      }
+      return sources.slice(0, 10);
     }
 
-    const formatted_answer = result.formatted_answer || result.answer || "";
+    // Helper: extract image URLs from Markdown ![alt](url)
+    function extractImages(md) {
+      const out = [];
+      const seen = new Set();
+      const imgRe = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g;
+      let m;
+      while ((m = imgRe.exec(md))) {
+        const url = m[1].trim();
+        if (!seen.has(url)) {
+          out.push(url);
+          seen.add(url);
+        }
+      }
+      return out.slice(0, 6);
+    }
 
-    // Return normalized structure
+    const formatted_answer = rawText.trim();
+    const sourcesArr = extractSourcesFromMarkdown(formatted_answer, top);
+    const imagesArr = extractImages(formatted_answer);
+
     res.json({
       formatted_answer,
-      sources: result.sources || [],
-      images: result.images || [],
-      ...(result.charts ? { charts: result.charts } : {}),
+      sources: sourcesArr,
+      images: imagesArr,
+      last_fetched: new Date().toISOString(),
     });
   } catch (err) {
     console.error(
@@ -1334,4 +1369,3 @@ ${context}
     res.status(500).json({ error: "Agentic pipeline failed." });
   }
 });
-
