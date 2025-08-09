@@ -1264,7 +1264,7 @@ You have context from web pages, news, and social media.
 
 TASK:
 1) Analyze the provided context and answer the user's question in a premium, human-friendly way.
-2) Return ONLY JSON with these fields:
+2) Return ONLY with these fields:
 {
   "formatted_answer": "...", // Rich Markdown or HTML. Include a big title, overview, sections with headings, lists, and spacing. Images allowed with Markdown syntax.
   "sources": [ { "title": "string", "url": "string" } ], // optional
@@ -1275,7 +1275,6 @@ TASK:
 Important:
 - Keep to the provided context. Be factual and clear.
 - If you cannot include any optional fields, omit them instead of returning empty lists.
-- Do not include any text outside of the JSON.
 
 USER QUESTION:
 "${query}"
@@ -1335,3 +1334,4 @@ ${context}
     res.status(500).json({ error: "Agentic pipeline failed." });
   }
 });
+
