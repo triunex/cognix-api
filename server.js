@@ -1262,32 +1262,20 @@ You are Nelieo — a world-class multi-source AI answer engine.
 
 You have context from web pages, news, and social media.
 
-**TASK:**
-1. Analyze the provided context and answer the user query.
-2. Produce TWO outputs:
-   - "raw_answer": A concise factual answer.
-   - "formatted_answer": A BEAUTIFULLY formatted answer in **Markdown** with:
-       - A large title (h1) for the topic.
-       - Overview paragraph.
-       - Proper sections with headings (##).
-       - Bullet points and numbered lists when appropriate.
-       - White line spacing between sections for readability.
-       - If possible, relevant images using Markdown image syntax: ![Alt text](image_url)
-       - A "References" section at the end with numbered clickable links to sources.
-3. Maintain factual accuracy — use ONLY the provided context.
-4. Include \`sources\` as an array with title and URL.
-5. Include \`last_fetched\` timestamp in ISO format.
-
-Respond ONLY in the following JSON structure:
-
+TASK:
+1) Analyze the provided context and answer the user's question in a premium, human-friendly way.
+2) Return ONLY JSON with these fields:
 {
-  "raw_answer": "...",
-  "formatted_answer": "...", // Markdown format
-  "sources": [
-    { "title": "string", "url": "string" }
-  ],
-  "last_fetched": "YYYY-MM-DDTHH:mm:ss.sssZ"
+  "formatted_answer": "...", // Rich Markdown or HTML. Include a big title, overview, sections with headings, lists, and spacing. Images allowed with Markdown syntax.
+  "sources": [ { "title": "string", "url": "string" } ], // optional
+  "images": [ "https://..." ], // optional
+  "charts": [ { "chartType": "bar|line|pie|...", "labels": [..], "values": [..] } ] // optional
 }
+
+Important:
+- Keep to the provided context. Be factual and clear.
+- If you cannot include any optional fields, omit them instead of returning empty lists.
+- Do not include any text outside of the JSON.
 
 USER QUESTION:
 "${query}"
@@ -1314,31 +1302,30 @@ ${context}
       geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
     // Parse JSON output from Gemini
-    let parsed = {};
+    let result = {};
     try {
       const jsonStart = rawText.indexOf("{");
-      parsed = JSON.parse(rawText.slice(jsonStart));
+      result = JSON.parse(rawText.slice(jsonStart));
     } catch (e) {
-      // Fallback: wrap raw response
-      parsed = {
-        raw_answer: rawText,
+      // Fallback: use raw text as formatted answer and derive sources from top chunks
+      result = {
         formatted_answer: rawText,
         sources: top.map((t) => ({
           title: t.chunk.source.title || t.chunk.source.type,
           url: t.chunk.source.url || t.chunk.source.id || t.chunk.source,
         })),
         images: [],
-        last_fetched: new Date().toISOString(),
       };
     }
 
-    // Return only the requested JSON structure
+    const formatted_answer = result.formatted_answer || result.answer || "";
+
+    // Return normalized structure
     res.json({
-      raw_answer: parsed.raw_answer || "",
-      formatted_answer: parsed.formatted_answer || parsed.raw_answer || "",
-      sources: parsed.sources || [],
-      images: parsed.images || [],
-      last_fetched: parsed.last_fetched || new Date().toISOString(),
+      formatted_answer,
+      sources: result.sources || [],
+      images: result.images || [],
+      ...(result.charts ? { charts: result.charts } : {}),
     });
   } catch (err) {
     console.error(
