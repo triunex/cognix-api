@@ -1370,3 +1370,178 @@ ${context}
   }
 });
 
+// -------------------------
+// Autonomous Chart Pipeline
+// -------------------------
+
+/**
+ * POST /api/parse-chart-intent
+ * Body: { query: "<user text>" }
+ * Response: { chart_type, topic, prefer_3d, prefer_motion }
+ */
+app.post("/api/parse-chart-intent", async (req, res) => {
+  try {
+    const q = (req.body.query || "").trim();
+    if (!q) return res.status(400).json({ error: "Missing query" });
+
+    const prompt = `
+You are a tiny intent parser. The user asks for a chart. Extract the user's requested chart type and the exact topic to search for.
+Return JSON ONLY with fields:
+{
+  "chart_type": "<one of: bar, line, pie, scatter, bubble, gauge, bar3d, line3d, scatter3d, surface3d, globeFlights, globeAirlines, barRace, lineRace>",
+  "topic": "<short search-friendly topic string>",
+  "prefer_3d": true|false,
+  "prefer_motion": true|false
+}
+
+Rules:
+- Choose chart_type that best matches the user's words. If user says "3D" or "globe" or "on a globe" pick a 3D type.
+- If user asks "race", "animate", "over time", "leaderboard", prefer motion charts (barRace/lineRace).
+- topic should be concise and good to use as a web search query (example: "AI market size 2012 to 2025 global").
+- Do not include other text. Respond only with JSON.
+User query: """${q}"""
+    `.trim();
+
+    const resp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+      },
+      { headers: { "Content-Type": "application/json" } }
+    );
+
+    const raw = resp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    // try safe JSON parse - model sometimes adds text
+    const jsStart = raw.indexOf("{");
+    const jsEnd = raw.lastIndexOf("}");
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw.slice(jsStart, jsEnd + 1));
+    } catch (e) {
+      // Fallback naive heuristics
+      const low = q.toLowerCase();
+      let chart_type = "bar";
+      if (/\b(line|trend|growth)\b/.test(low)) chart_type = "line";
+      if (/\b(pie|distribution)\b/.test(low)) chart_type = "pie";
+      if (/\b(scatter|correlation)\b/.test(low)) chart_type = "scatter";
+      if (/\b(3d|3-D|on a globe|globe)\b/.test(low)) chart_type = "bar3d";
+      if (/\b(race|animate|animated|leaderboard|over time)\b/.test(low)) chart_type = "barRace";
+      parsed = {
+        chart_type,
+        topic: q,
+        prefer_3d: /\b(3d|globe|3-D)\b/i.test(q),
+        prefer_motion: /\b(race|animate|animated|leaderboard|over time)\b/i.test(q),
+      };
+    }
+
+    return res.json(parsed);
+  } catch (err) {
+    console.error("parse-chart-intent error:", err.response?.data || err.message);
+    res.status(500).json({ error: "Intent parsing failed." });
+  }
+});
+
+/**
+ * POST /api/extract-chart-data
+ * Body: { topic: "<search topic>", chart_type?: "<>" , rangeHints?: { start:2012, end:2025 } }
+ *
+ * This calls your existing agentic pipeline to fetch context, and then asks the model to extract a clean numeric series.
+ * Response: { labels: [], values: [], series?: [], data?: [] , sourceHints: [{title,url}] }
+ */
+app.post("/api/extract-chart-data", async (req, res) => {
+  try {
+    const { topic, chart_type } = req.body || {};
+    if (!topic) return res.status(400).json({ error: "Missing topic" });
+
+    // 1) Use existing agentic-v2 to fetch multi-source context
+    // call local agentic endpoint
+    const agenticResp = await axios.post(
+      `${process.env.SELF_BASE_URL || "http://localhost:10000"}/api/agentic-v2`,
+      { query: topic, maxWeb: 8, topChunks: 10 },
+      { headers: { "Content-Type": "application/json" } }
+    ).catch(e => {
+      console.warn("agentic-v2 internal call failed:", e.message || e);
+      return null;
+    });
+
+    const agenticData = agenticResp?.data || {};
+
+    // 2) Build extraction prompt with context
+    const contextSummary = (agenticData.top_chunks || [])
+      .slice(0, 6)
+      .map((t, i) => `Source ${i+1}: ${t.chunk?.source?.title || t.chunk?.source?.type}\nExcerpt: ${t.chunk?.text?.slice(0,400)}`)
+      .join("\n\n");
+
+    const prompt = `
+You are a data extractor. Using the provided context (web search excerpts and social posts), extract numeric time-series or category-series data that best answers the topic: "${topic}".
+Return JSON ONLY with this schema (choose the appropriate fields):
+
+{
+  "labels": ["label1","label2",...],    // x-axis labels (years, months, categories)
+  "values": [num1, num2, ...],          // numeric values aligned to labels
+  // optional fields:
+  "series": [ { "name":"Series A", "labels": [...], "values":[...] } ],
+  "data": [ [x,y,z], ... ]              // for scatter3d or globe coordinates (lng,lat,value)
+  "source_hints": [ { "title":"", "url":"" }, ... ]
+}
+
+Rules:
+- Use only numeric facts that are supported by the provided context. If context contains ranges/estimates, provide the best single numeric estimate and add additional source_hints.
+- If multiple conflicting numbers exist, aggregate by choosing the most recent authoritative source and mention it in source_hints.
+- If you cannot find numeric data, attempt to infer approximate values and mark them as estimated by adding " (est)" in the labels (but still return numbers).
+- Keep labels and values same length.
+- Return JSON only (no extra text).
+
+Context:
+${contextSummary}
+
+Now extract the dataset.
+    `.trim();
+
+    // call Gemini to extract structured data
+    const extractorResp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      { contents: [{ role: "user", parts: [{ text: prompt }] }] },
+      { headers: { "Content-Type": "application/json" } }
+    );
+
+    const raw = extractorResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    // parse out JSON block
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw.slice(start, end+1));
+    } catch (e) {
+      // fallback: try to extract simple "year: value" lines
+      const lines = raw.split("\n").map(l => l.trim()).filter(Boolean);
+      const labels = [], values = [];
+      for (const ln of lines) {
+        const m = ln.match(/(\b20\d{2}\b|\b19\d{2}\b|\b\d{4}\b)[^\d\-]*([0-9\.,]+)/);
+        if (m) {
+          labels.push(m[1]);
+          values.push(Number(m[2].replace(/[,]/g,"")));
+        }
+      }
+      if (labels.length && values.length) parsed = { labels, values, source_hints: agenticData.sources || [] };
+      else parsed = { labels: [], values: [], source_hints: agenticData.sources || [] };
+    }
+
+    // sanitize results
+    parsed.labels = parsed.labels || [];
+    parsed.values = parsed.values || [];
+    parsed.source_hints = parsed.source_hints || agenticData.sources || [];
+
+    // if series provided, prefer series[0]
+    if ((!parsed.labels.length || !parsed.values.length) && Array.isArray(parsed.series) && parsed.series[0]) {
+      parsed.labels = parsed.series[0].labels || parsed.labels;
+      parsed.values = parsed.series[0].values || parsed.values;
+    }
+
+    return res.json({ ...parsed, raw_agentic: agenticData });
+  } catch (err) {
+    console.error("extract-chart-data error:", err.response?.data || err.message);
+    res.status(500).json({ error: "Data extraction failed." });
+  }
+});
+
