@@ -1097,33 +1097,96 @@ app.get("/api/spotify-search", async (req, res) => {
 });
 
 app.post("/api/devagent", async (req, res) => {
-  const { task, frontend, backend, db, auth, deploy, style, fallback, extra } =
-    req.body;
+  const {
+    task,
+    mode, // "web" | "mobile" | "ai"
+    frontend,
+    backend,
+    db,
+    auth,
+    deploy,
+    style,
+    fallback,
+    extra,
+  } = req.body || {};
 
   if (!task) return res.status(400).json({ error: "Missing task" });
 
+  // Mode-aware defaults
+  const defaultsByMode = {
+    web: {
+      frontend: frontend || "React + Vite + TypeScript",
+      backend: backend || "Node.js + Express",
+      db: db || "MongoDB",
+      auth: auth || "Firebase Auth",
+      deploy: deploy || "Vercel or Netlify",
+      style: style || "TailwindCSS",
+      platform: "web",
+    },
+    mobile: {
+      frontend: frontend || "React Native + Expo",
+      backend: backend || "Node.js + Express or Firebase Functions",
+      db: db || "Firebase Firestore",
+      auth: auth || "Firebase Auth",
+      deploy: deploy || "Expo EAS",
+      style: style || "NativeWind",
+      platform: "mobile",
+    },
+    ai: {
+      frontend: frontend || "React + Vite",
+      backend:
+        backend || "Node.js (Express) or Python (FastAPI) for AI endpoints",
+      db: db || "PostgreSQL or MongoDB",
+      auth: auth || "JWT or Clerk",
+      deploy: deploy || "Render/Fly.io (API) + Vercel (FE)",
+      style: style || "TailwindCSS",
+      platform: "ai",
+    },
+  };
+
+  const d = defaultsByMode[mode] || defaultsByMode.web;
+
   const prompt = `
-You're DevAgent — the most powerful AI coding assistant ever built.
+You are DevAgent — an elite AI software architect and code generator.
 
-Your job is to generate full stack code based on the following:
-- Task: ${task}
-- Frontend: ${frontend || "React"}
-- Backend: ${backend || "Node.js + Express"}
-- Database: ${db || "MongoDB"}
-- Auth: ${auth || "JWT or Firebase Auth"}
-- Style/UI: ${style || "TailwindCSS"}
-- Deployment: ${deploy || "Vercel or Firebase"}
-- Fallback Plan: ${fallback || "Switch tech stack if needed"}
-- Extras: ${extra || "None"}
+Goal: Generate a minimal but working project that satisfies the user's task.
+Return JSON ONLY with this exact top-level structure:
+{
+  "plan": {
+    "understanding": "one or two sentences about the task",
+    "steps": ["short step 1", "short step 2", "..."],
+    "clarifications": ["question 1", "question 2"],
+    "stack": {
+      "platform": "${d.platform}",
+      "frontend": "${d.frontend}",
+      "backend": "${d.backend}",
+      "db": "${d.db}",
+      "auth": "${d.auth}",
+      "deploy": "${d.deploy}",
+      "ui": "${d.style}"
+    }
+  },
+  "files": [
+    { "filename": "<path/filename>", "content": "<file content>" }
+  ]
+}
 
-Give complete folder structure, code files, and clear explanations (as JSON):
-[
-  { "filename": "package.json", "content": "..." },
-  { "filename": "src/index.js", "content": "..." },
-  { "filename": "README.md", "content": "..." }
-]
+Constraints:
+- Output MUST be valid JSON, no markdown, no comments.
+- Keep the code concise but runnable.
+- Include package.json and a minimal README.md.
+- Use ${d.style} for styling when applicable.
 
-Only give JSON — no markdown, no text.
+Task: ${task}
+Mode: ${mode || "web"}
+Extras: ${extra || fallback || "None"}
+
+Mode-specific requirements:
+- For web: Use Vite + React + TypeScript. Include an App shell and one example component.
+- For mobile: Use Expo (React Native). Provide App.js/tsx and necessary config to run with Expo CLI.
+- For ai: Provide one simple AI endpoint (e.g., POST /api/generate) stub using ${
+    d.backend.includes("FastAPI") ? "FastAPI (Python)" : "Express (Node.js)"
+  } and a small frontend form that calls it. Do NOT include secrets; read keys from env.
 `;
 
   try {
@@ -1131,20 +1194,130 @@ Only give JSON — no markdown, no text.
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.7,
+          topP: 0.9,
+          maxOutputTokens: 2048,
+        },
       },
       { headers: { "Content-Type": "application/json" } }
     );
 
-    const raw = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    const jsonStart = raw.indexOf("[");
-    const jsonEnd = raw.lastIndexOf("]");
-    const jsonStr = raw.substring(jsonStart, jsonEnd + 1);
-    const files = JSON.parse(jsonStr);
+    const raw =
+      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    let plan = null;
+    let files = null;
 
-    res.json({ files });
+    try {
+      // Try parsing as an object with plan + files
+      const objStart = raw.indexOf("{");
+      const objEnd = raw.lastIndexOf("}");
+      if (objStart >= 0 && objEnd > objStart) {
+        const jsonStr = raw.slice(objStart, objEnd + 1);
+        const parsed = JSON.parse(jsonStr);
+        plan = parsed.plan || null;
+        files = parsed.files || null;
+      }
+    } catch (e) {
+      // Fallback: some models return array of files only
+      try {
+        const arrStart = raw.indexOf("[");
+        const arrEnd = raw.lastIndexOf("]");
+        if (arrStart >= 0 && arrEnd > arrStart) {
+          files = JSON.parse(raw.slice(arrStart, arrEnd + 1));
+        }
+      } catch {}
+    }
+
+    // If still missing, build minimal fallbacks
+    if (!plan) {
+      plan = {
+        understanding: task,
+        steps: [
+          "Analyze requirements",
+          "Scaffold project",
+          "Generate main UI",
+          "Wire API and data",
+          "Prepare deployment",
+        ],
+        clarifications: [
+          "Branding or color palette?",
+          "Auth provider preference?",
+        ],
+        stack: {
+          platform: d.platform,
+          frontend: d.frontend,
+          backend: d.backend,
+          db: d.db,
+          auth: d.auth,
+          deploy: d.deploy,
+          ui: d.style,
+        },
+      };
+    }
+
+    if (!files) {
+      files = [
+        {
+          filename: "README.md",
+          content: `# DevAgent Project\n\nTask: ${task}\n\nRun the app following standard ${d.platform} instructions.`,
+        },
+        {
+          filename: "package.json",
+          content: JSON.stringify(
+            {
+              name: "devagent-generated",
+              version: "0.1.0",
+              private: true,
+              scripts: { start: "echo 'Add start script' && exit 0" },
+            },
+            null,
+            2
+          ),
+        },
+      ];
+    }
+
+    res.json({ plan, files });
   } catch (err) {
     console.error("DevAgent error:", err.response?.data || err.message);
-    res.status(500).json({ error: "DevAgent failed." });
+    // graceful fallback
+    const fallbackPlan = {
+      understanding: task,
+      steps: [
+        "Analyze requirements",
+        "Scaffold project",
+        "Generate UI",
+        mode === "ai" ? "Implement AI endpoint" : "Wire basic features",
+        "Prepare deployment",
+      ],
+      clarifications: ["Brand colors?", "Auth provider?"],
+      stack: {
+        platform: defaultsByMode[mode]?.platform || "web",
+        frontend: defaultsByMode[mode]?.frontend || defaultsByMode.web.frontend,
+        backend: defaultsByMode[mode]?.backend || defaultsByMode.web.backend,
+        db: defaultsByMode[mode]?.db || defaultsByMode.web.db,
+        auth: defaultsByMode[mode]?.auth || defaultsByMode.web.auth,
+        deploy: defaultsByMode[mode]?.deploy || defaultsByMode.web.deploy,
+        ui: defaultsByMode[mode]?.style || defaultsByMode.web.style,
+      },
+    };
+    return res.json({
+      plan: fallbackPlan,
+      files: [
+        {
+          filename: "src/App.tsx",
+          content: `import React from 'react';
+export default function App(){
+  return (
+    <main style={{height:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'#0b1220',color:'#e2e8f0'}}>
+      <h1>DevAgent fallback shell</h1>
+    </main>
+  );
+}`,
+        },
+      ],
+    });
   }
 });
 
@@ -1425,18 +1598,23 @@ User query: """${q}"""
       if (/\b(pie|distribution)\b/.test(low)) chart_type = "pie";
       if (/\b(scatter|correlation)\b/.test(low)) chart_type = "scatter";
       if (/\b(3d|3-D|on a globe|globe)\b/.test(low)) chart_type = "bar3d";
-      if (/\b(race|animate|animated|leaderboard|over time)\b/.test(low)) chart_type = "barRace";
+      if (/\b(race|animate|animated|leaderboard|over time)\b/.test(low))
+        chart_type = "barRace";
       parsed = {
         chart_type,
         topic: q,
         prefer_3d: /\b(3d|globe|3-D)\b/i.test(q),
-        prefer_motion: /\b(race|animate|animated|leaderboard|over time)\b/i.test(q),
+        prefer_motion:
+          /\b(race|animate|animated|leaderboard|over time)\b/i.test(q),
       };
     }
 
     return res.json(parsed);
   } catch (err) {
-    console.error("parse-chart-intent error:", err.response?.data || err.message);
+    console.error(
+      "parse-chart-intent error:",
+      err.response?.data || err.message
+    );
     res.status(500).json({ error: "Intent parsing failed." });
   }
 });
@@ -1455,21 +1633,30 @@ app.post("/api/extract-chart-data", async (req, res) => {
 
     // 1) Use existing agentic-v2 to fetch multi-source context
     // call local agentic endpoint
-    const agenticResp = await axios.post(
-      `${process.env.SELF_BASE_URL || "http://localhost:10000"}/api/agentic-v2`,
-      { query: topic, maxWeb: 8, topChunks: 10 },
-      { headers: { "Content-Type": "application/json" } }
-    ).catch(e => {
-      console.warn("agentic-v2 internal call failed:", e.message || e);
-      return null;
-    });
+    const agenticResp = await axios
+      .post(
+        `${
+          process.env.SELF_BASE_URL || "http://localhost:10000"
+        }/api/agentic-v2`,
+        { query: topic, maxWeb: 8, topChunks: 10 },
+        { headers: { "Content-Type": "application/json" } }
+      )
+      .catch((e) => {
+        console.warn("agentic-v2 internal call failed:", e.message || e);
+        return null;
+      });
 
     const agenticData = agenticResp?.data || {};
 
     // 2) Build extraction prompt with context
     const contextSummary = (agenticData.top_chunks || [])
       .slice(0, 6)
-      .map((t, i) => `Source ${i+1}: ${t.chunk?.source?.title || t.chunk?.source?.type}\nExcerpt: ${t.chunk?.text?.slice(0,400)}`)
+      .map(
+        (t, i) =>
+          `Source ${i + 1}: ${
+            t.chunk?.source?.title || t.chunk?.source?.type
+          }\nExcerpt: ${t.chunk?.text?.slice(0, 400)}`
+      )
       .join("\n\n");
 
     const prompt = `
@@ -1505,26 +1692,39 @@ Now extract the dataset.
       { headers: { "Content-Type": "application/json" } }
     );
 
-    const raw = extractorResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const raw =
+      extractorResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
     // parse out JSON block
     const start = raw.indexOf("{");
     const end = raw.lastIndexOf("}");
     let parsed = null;
     try {
-      parsed = JSON.parse(raw.slice(start, end+1));
+      parsed = JSON.parse(raw.slice(start, end + 1));
     } catch (e) {
       // fallback: try to extract simple "year: value" lines
-      const lines = raw.split("\n").map(l => l.trim()).filter(Boolean);
-      const labels = [], values = [];
+      const lines = raw
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+      const labels = [],
+        values = [];
       for (const ln of lines) {
-        const m = ln.match(/(\b20\d{2}\b|\b19\d{2}\b|\b\d{4}\b)[^\d\-]*([0-9\.,]+)/);
+        const m = ln.match(
+          /(\b20\d{2}\b|\b19\d{2}\b|\b\d{4}\b)[^\d\-]*([0-9\.,]+)/
+        );
         if (m) {
           labels.push(m[1]);
-          values.push(Number(m[2].replace(/[,]/g,"")));
+          values.push(Number(m[2].replace(/[,]/g, "")));
         }
       }
-      if (labels.length && values.length) parsed = { labels, values, source_hints: agenticData.sources || [] };
-      else parsed = { labels: [], values: [], source_hints: agenticData.sources || [] };
+      if (labels.length && values.length)
+        parsed = { labels, values, source_hints: agenticData.sources || [] };
+      else
+        parsed = {
+          labels: [],
+          values: [],
+          source_hints: agenticData.sources || [],
+        };
     }
 
     // sanitize results
@@ -1533,15 +1733,21 @@ Now extract the dataset.
     parsed.source_hints = parsed.source_hints || agenticData.sources || [];
 
     // if series provided, prefer series[0]
-    if ((!parsed.labels.length || !parsed.values.length) && Array.isArray(parsed.series) && parsed.series[0]) {
+    if (
+      (!parsed.labels.length || !parsed.values.length) &&
+      Array.isArray(parsed.series) &&
+      parsed.series[0]
+    ) {
       parsed.labels = parsed.series[0].labels || parsed.labels;
       parsed.values = parsed.series[0].values || parsed.values;
     }
 
     return res.json({ ...parsed, raw_agentic: agenticData });
   } catch (err) {
-    console.error("extract-chart-data error:", err.response?.data || err.message);
+    console.error(
+      "extract-chart-data error:",
+      err.response?.data || err.message
+    );
     res.status(500).json({ error: "Data extraction failed." });
   }
 });
-
