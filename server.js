@@ -20,7 +20,7 @@ dotenv.config();
 
 const app = express();
 // Register DevAgent planner/runner routes
-import registerAgentRoutes from "./src/agentController.js";
+import registerAgentRoutes from "cognix-api/src/agentController.js";
 registerAgentRoutes(app);
 
 // ✅ Proper CORS setup
@@ -1754,4 +1754,5 @@ Now extract the dataset.
     res.status(500).json({ error: "Data extraction failed." });
   }
 });
+
 
