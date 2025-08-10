@@ -33,10 +33,6 @@ app.options("*", cors()); // Allow preflight for all routes
 app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 app.use(express.json());
 
-// Register DevAgent planner/runner routes AFTER body parsers are set
-import registerAgentRoutes from "./src/agentController.js";
-registerAgentRoutes(app);
-
 // ------------- Agentic v2 helpers -------------
 async function fetchPageText(url) {
   try {
@@ -1754,3 +1750,4 @@ Now extract the dataset.
     res.status(500).json({ error: "Data extraction failed." });
   }
 });
+
