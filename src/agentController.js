@@ -293,11 +293,22 @@ Return a single JSON array of objects like:
           // stream file creation + incremental updates
           for (const f of files) {
             await sendEvent(runId, "file_created", { filename: f.filename });
-            // break file into 100-char increments (simulate typing)
-            for (let i = 1; i <= f.content.length; i += 120) {
+            // break file into increments (simulate typing)
+            const len = f.content.length;
+            let lastLen = 0;
+            for (let i = 1; i <= len; i += 120) {
+              const upto = Math.min(i, len);
+              lastLen = upto;
               await sendEvent(runId, "file_update", {
                 filename: f.filename,
-                content: f.content.slice(0, i),
+                content: f.content.slice(0, upto),
+              });
+            }
+            // ensure final full content is sent
+            if (lastLen < len) {
+              await sendEvent(runId, "file_update", {
+                filename: f.filename,
+                content: f.content,
               });
             }
             await sendEvent(runId, "file_saved", { filename: f.filename });
