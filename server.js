@@ -1751,4 +1751,20 @@ Now extract the dataset.
   }
 });
 
+app.post("/agent-command", async (req, res) => {
+  try {
+    const response = await fetch("http://localhost:5050/agent-command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_prompt: req.body.user_prompt }),
+    });
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Agent request failed" });
+  }
+});
+
+
 
