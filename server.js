@@ -622,7 +622,6 @@ app.get("/api/suggest", async (req, res) => {
   }
 });
 
-/
 app.get("/api/article", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "Missing article URL" });
