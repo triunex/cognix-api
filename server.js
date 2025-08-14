@@ -32,7 +32,6 @@ app.options("*", cors()); // Allow preflight for all routes
 
 app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 app.use(express.json());
-
 // ------------- Agentic v2 helpers -------------
 async function fetchPageText(url) {
   try {
@@ -620,6 +619,91 @@ app.get("/api/suggest", async (req, res) => {
   } catch (err) {
     console.error("Suggest error:", err);
     res.status(500).json({ error: "Failed to fetch suggestions" });
+  }
+});
+
+// Yahoo Finance candles proxy
+app.get("/api/market/candles", async (req, res) => {
+  try {
+    const YMAP = {
+      "NSE:NIFTY": "^NSEI",
+      "NSE:BANKNIFTY": "^NSEBANK",
+    };
+    const tfMap = {
+      "1m": { interval: "1m", range: "1d" },
+      "5m": { interval: "5m", range: "5d" },
+      "15m": { interval: "15m", range: "1mo" },
+      "1h": { interval: "60m", range: "1mo" },
+      "1d": { interval: "1d", range: "1y" },
+    };
+
+    const symbol = (req.query.symbol || "^NSEI").toString();
+    const interval = (req.query.interval || "15m").toString();
+    const map = tfMap[interval] || tfMap["15m"];
+    const ySymbol = YMAP[symbol] || symbol;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
+      ySymbol
+    )}?interval=${map.interval}&range=${map.range}`;
+
+    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const j = await r.json();
+    const result = j?.chart?.result?.[0];
+    if (!result) return res.status(400).json({ error: "No data" });
+    const ts = result.timestamp || [];
+    const q = result.indicators?.quote?.[0] || {};
+    const o = q.open || [];
+    const h = q.high || [];
+    const l = q.low || [];
+    const c = q.close || [];
+    const v = q.volume || [];
+    const candles = ts
+      .map((t, i) => ({
+        t: t * 1000,
+        o: o[i],
+        h: h[i],
+        l: l[i],
+        c: c[i],
+        v: v[i],
+      }))
+      .filter((k) => [k.o, k.h, k.l, k.c].every(Number.isFinite));
+
+    res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=300");
+    return res.status(200).json({ candles });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Server error" });
+  }
+});
+
+// NSE option chain proxy
+app.get("/api/nse/option-chain", async (req, res) => {
+  try {
+    const BASES = {
+      index: "https://www.nseindia.com/api/option-chain-indices?symbol=",
+      equity: "https://www.nseindia.com/api/option-chain-equities?symbol=",
+    };
+    const symbol = (req.query.symbol || "NIFTY").toString();
+    const seg = (req.query.segment || "index").toString();
+    const url =
+      (seg === "equity" ? BASES.equity : BASES.index) +
+      encodeURIComponent(symbol.toUpperCase());
+    const r = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Referer: "https://www.nseindia.com/option-chain",
+        Accept: "application/json, text/plain, */*",
+      },
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      return res
+        .status(r.status)
+        .json({ error: "NSE fetch failed", details: text.slice(0, 400) });
+    }
+    const data = await r.json();
+    res.setHeader("Cache-Control", "s-maxage=20, stale-while-revalidate=60");
+    return res.status(200).json(data);
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Server error" });
   }
 });
 
@@ -1765,6 +1849,3 @@ app.post("/agent-command", async (req, res) => {
     res.status(500).json({ error: "Agent request failed" });
   }
 });
-
-
-
