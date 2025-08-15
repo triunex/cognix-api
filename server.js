@@ -694,8 +694,10 @@ Give answer in the friendly way and talk like a smart , helpful and chill Gen Z 
 `
       : `${finalPrompt}\n\n${structureInstruction}`;
 
-    const formattedHistory = (history || []).map((msg) => ({
-      role: msg.role,
+    // Cap history to last 20 messages to help stay within token limits
+    const safeHistory = Array.isArray(history) ? history.slice(-20) : [];
+    const formattedHistory = safeHistory.map((msg) => ({
+      role: msg.role === "ai" ? "assistant" : msg.role || "user",
       parts: [{ text: msg.content }],
     }));
 
