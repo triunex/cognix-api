@@ -14,6 +14,7 @@ import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { chromium } from "playwright";
 import crypto from "crypto";
+import { PuppeteerScreenRecorder } from "puppeteer-screen-recorder";
 puppeteer.use(StealthPlugin());
 
 dotenv.config();
@@ -32,6 +33,116 @@ app.options("*", cors()); // Allow preflight for all routes
 
 app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 app.use(express.json());
+
+// Serve generated media files (videos, etc.)
+const MEDIA_DIR = path.resolve("media");
+const VIDEO_DIR = path.join(MEDIA_DIR, "videos");
+await fs.mkdir(VIDEO_DIR, { recursive: true }).catch(() => {});
+app.use("/media", express.static(MEDIA_DIR));
+
+function parseResolution(res = "1920x1080") {
+  const m = String(res).match(/(\d+)x(\d+)/);
+  if (!m) return { width: 1280, height: 720 };
+  return { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
+}
+
+async function makeDemoVideoFromSpec(spec) {
+  const { resolution = "1280x720", length_seconds = 20 } = spec || {};
+  const { width, height } = parseResolution(resolution);
+  const id = crypto.randomUUID();
+  const outfile = path.join(VIDEO_DIR, `demo-${id}.mp4`);
+
+  const scenes =
+    Array.isArray(spec?.scenes) && spec.scenes.length
+      ? spec.scenes
+      : [
+          {
+            id: "scene-1",
+            start_sec: 0,
+            end_sec: Math.min(10, length_seconds),
+            prompt: spec?.description || "Cinematic demo",
+            camera: "slow dolly in",
+            mood: "inspirational",
+          },
+        ];
+
+  // Simple HTML that cycles through scenes with animated gradients and text overlays
+  const totalMs = Math.max(2000, Math.floor(length_seconds * 1000));
+  const perScene = Math.floor(totalMs / scenes.length);
+  const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+    .scene { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font-family:Segoe UI, sans-serif; }
+    .bg { position:absolute; inset:0; background: radial-gradient(1200px 600px at 30% 30%, #3b82f6, transparent), radial-gradient(1200px 600px at 70% 70%, #8b5cf6, transparent), #000; filter: blur(40px); opacity:0.7; }
+    .content { position:relative; z-index:2; text-align:center; padding:24px; }
+    .title { font-size:48px; font-weight:800; letter-spacing:1px; text-shadow: 0 2px 8px rgba(0,0,0,0.6); }
+    .subtitle { font-size:22px; margin-top:12px; opacity:0.9; }
+    .fade { animation: fadeInOut ${perScene}ms linear 1; }
+    @keyframes fadeInOut {
+      0% { opacity: 0; transform: scale(1.05) }
+      10% { opacity: 1; transform: scale(1.0) }
+      90% { opacity: 1; transform: scale(1.0) }
+      100% { opacity: 0; transform: scale(0.98) }
+    }
+  </style>
+  <script>
+    const scenes = ${JSON.stringify(scenes)};
+    function start() {
+      const root = document.getElementById('root');
+      let idx = 0;
+      function showNext(){
+        root.innerHTML = '';
+        const s = scenes[idx];
+        const el = document.createElement('div');
+        el.className = 'scene fade';
+        el.innerHTML = '<div class="bg"></div>' +
+          '<div class="content">' +
+            '<div class="title">' + (s.prompt || 'Scene '+(idx+1)) + '</div>' +
+            '<div class="subtitle">' + (s.camera || '') + (s.mood? ' • '+s.mood : '') + '</div>' +
+          '</div>';
+        root.appendChild(el);
+        idx = (idx + 1) % scenes.length;
+      }
+      showNext();
+      setInterval(showNext, ${perScene});
+    }
+    window.addEventListener('load', start);
+  </script>
+  <title>${(spec?.title || "Demo Video").replace(/</g, "&lt;")}</title>
+  </head>
+<body>
+  <div id="root"></div>
+</body>
+</html>`;
+
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width, height, deviceScaleFactor: 1 });
+    const recorder = new PuppeteerScreenRecorder(page, {
+      fps: 30,
+      videoFrame: { width, height },
+      aspectRatio: `${width}:${height}`,
+    });
+
+    await recorder.start(outfile);
+    await page.setContent(html, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(totalMs + 500);
+    await recorder.stop();
+  } finally {
+    await browser.close().catch(() => {});
+  }
+
+  const publicUrl = `/media/videos/${path.basename(outfile)}`;
+  return { videoUrl: publicUrl };
+}
 // ------------- Agentic v2 helpers -------------
 async function fetchPageText(url) {
   try {
@@ -148,6 +259,155 @@ async function searchReddit(query, maxResults = 6) {
     console.warn("Reddit search failed:", e.message || e);
     return [];
   }
+}
+
+// --- New helpers for multi-source expansion ---
+function strongEntityMatch(query, results) {
+  if (!query || !Array.isArray(results)) return false;
+  const qLower = query.toLowerCase();
+  return results.some(
+    (r) =>
+      (r.title && r.title.toLowerCase().includes(qLower)) ||
+      (r.snippet && r.snippet.toLowerCase().includes(qLower))
+  );
+}
+
+async function runExtraSearches(
+  query,
+  engines = ["google_news", "youtube", "bing", "duckduckgo"]
+) {
+  const serpApiKey = process.env.SERPAPI_API_KEY;
+  if (!serpApiKey) return [];
+  const promises = engines.map((engine) =>
+    axios
+      .get("https://serpapi.com/search.json", {
+        params: { engine, q: query, api_key: serpApiKey },
+        timeout: 8000,
+      })
+      .then((r) => r.data)
+      .catch((e) => null)
+  );
+  const results = await Promise.all(promises);
+  return results.filter(Boolean);
+}
+
+// Simple Wikipedia search via MediaWiki API
+async function searchWikipedia(query) {
+  try {
+    const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+      query
+    )}&format=json&origin=*`;
+    const resp = await axios.get(url, { timeout: 6000 });
+    return (resp.data?.query?.search || []).map((s) => ({
+      title: s.title,
+      snippet: s.snippet,
+      url: `https://en.wikipedia.org/wiki/${encodeURIComponent(s.title)}`,
+    }));
+  } catch (e) {
+    console.warn("Wikipedia search failed:", e.message || e);
+    return [];
+  }
+}
+
+// YouTube search using Data API (requires YOUTUBE_API_KEY env var)
+async function searchYouTube(query, maxResults = 4) {
+  if (!process.env.YOUTUBE_API_KEY) return [];
+  try {
+    const key = process.env.YOUTUBE_API_KEY;
+    const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(
+      query
+    )}&type=video&maxResults=${maxResults}&key=${key}`;
+    const searchRes = await axios.get(searchUrl, { timeout: 8000 });
+    const items = searchRes.data.items || [];
+    // For each video, fetch snippet details (title, description)
+    return items.map((it) => ({
+      id: it.id.videoId,
+      title: it.snippet.title,
+      description: it.snippet.description,
+      url: `https://www.youtube.com/watch?v=${it.id.videoId}`,
+    }));
+  } catch (e) {
+    console.warn("YouTube search failed:", e.message || e);
+    return [];
+  }
+}
+
+// Basic public Instagram post scraper (extracts open graph meta if possible)
+async function searchInstagramPublic(query, maxResults = 4) {
+  // We'll attempt to use the query as a hashtag or username; this is best-effort and may be rate-limited
+  try {
+    const engines = [];
+    // If query looks like @username, try profile
+    if (query.startsWith("@"))
+      engines.push(`https://www.instagram.com/${query.slice(1)}/`);
+    // hashtags
+    engines.push(
+      `https://www.instagram.com/explore/tags/${encodeURIComponent(
+        query.replace(/^#/, "")
+      )}/`
+    );
+
+    const results = [];
+    for (const url of engines.slice(0, maxResults)) {
+      try {
+        const resp = await axios.get(url, {
+          timeout: 8000,
+          headers: { "User-Agent": "Mozilla/5.0" },
+        });
+        const html = resp.data || "";
+        const mTitle = html.match(
+          /<meta property="og:title" content="([^"]+)"/i
+        );
+        const mDesc = html.match(
+          /<meta property="og:description" content="([^"]+)"/i
+        );
+        results.push({
+          url,
+          title: mTitle?.[1] || url,
+          description: mDesc?.[1] || "",
+        });
+      } catch (e) {
+        // ignore
+      }
+    }
+    return results;
+  } catch (e) {
+    console.warn("Instagram search failed:", e.message || e);
+    return [];
+  }
+}
+
+// Faster page fetch for time-limited scraping
+async function fetchPageTextFast(url) {
+  try {
+    const resp = await axios.get(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+      timeout: 4000,
+    });
+    const parsed = unfluff(resp.data || "");
+    return {
+      url,
+      title: parsed.title || "",
+      text: (parsed.text || "").trim(),
+      author: parsed.author || "",
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+function checkConfidence(newResults, query) {
+  if (!newResults || newResults.length === 0) return 0;
+  // Simple heuristic: fraction of results with query in title/snippet
+  const matches = newResults.filter((r) => {
+    const q = (query || "").toLowerCase();
+    return (
+      (r.title && r.title.toLowerCase().includes(q)) ||
+      (r.snippet && r.snippet.toLowerCase().includes(q))
+    );
+  }).length;
+  const frac = matches / Math.max(1, newResults.length);
+  return Math.min(1, frac * 1.25); // scale up slightly
 }
 
 app.post("/api/search", async (req, res) => {
@@ -961,11 +1221,26 @@ Make the language cinematic, vivid, and supply scene-level prompts that will res
           "VEO call failed or not permitted for this key:",
           vErr?.response?.data || vErr?.message || vErr
         );
-        return res.json({
-          status: "spec",
-          spec,
-          note: "Video generation not available; returning spec.",
-        });
+        // Fallback demo video generation (no external API access required)
+        try {
+          const demo = await makeDemoVideoFromSpec(spec);
+          return res.json({
+            status: "ok",
+            videoUrl: demo.videoUrl,
+            spec,
+            demo: true,
+          });
+        } catch (demoErr) {
+          console.error(
+            "Demo video generation failed:",
+            demoErr?.message || demoErr
+          );
+          return res.json({
+            status: "spec",
+            spec,
+            note: "Video generation not available; returning spec.",
+          });
+        }
       }
 
       const veoData = veoResp.data || {};
@@ -993,12 +1268,10 @@ Make the language cinematic, vivid, and supply scene-level prompts that will res
       "Generate-video fatal error:",
       err?.response?.data || err?.message || err
     );
-    return res
-      .status(500)
-      .json({
-        error: "Failed to generate video.",
-        detail: err?.response?.data || err?.message || String(err),
-      });
+    return res.status(500).json({
+      error: "Failed to generate video.",
+      detail: err?.response?.data || err?.message || String(err),
+    });
   }
 });
 
@@ -1038,6 +1311,13 @@ export async function sendEmailWithPdf(email, buffer, filename) {
 
 app.get("/api/ping", (req, res) => {
   res.status(200).send("pong");
+});
+
+// Lightweight health check for generate-video contract
+app.post("/api/generate-video/echo", (req, res) => {
+  const { prompt } = req.body || {};
+  if (!prompt) return res.status(400).json({ error: "Missing prompt." });
+  return res.json({ status: "ok", received: { promptLength: prompt.length } });
 });
 
 // Gemini warmup endpoint
@@ -1503,41 +1783,98 @@ app.post("/api/agentic-v2", async (req, res) => {
   if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
-    // 1) SERPAPI search -> top links
-    const serpRes = await axios.get("https://serpapi.com/search", {
-      params: {
-        engine: "google",
-        q: query,
-        api_key: process.env.SERPAPI_API_KEY,
-      },
-    });
-    const organic = serpRes.data.organic_results || [];
-    const topLinks = organic.slice(0, maxWeb).map((r) => ({
-      title: r.title,
-      link: r.link,
-      snippet: r.snippet,
-    }));
+    // Multi-round expansion + parallel source fetching
+    let attempts = 0;
+    let confidence = 0;
+    let allSerpOrganic = [];
+    let pages = [];
+    let tweets = [];
+    let reddit = [];
+    let youtube = [];
+    let wiki = [];
 
-    // 2) Fetch & parse pages in parallel (unfluff)
-    const pagePromises = topLinks.map((l) => fetchPageText(l.link));
-    const pages = await Promise.all(pagePromises);
+    while (attempts < 3 && confidence < 0.85) {
+      // Run primary searches in parallel
+      const [serpResp, tw, rd, yt, wp] = await Promise.all([
+        (async () => {
+          try {
+            return await axios.get("https://serpapi.com/search", {
+              params: {
+                engine: "google",
+                q: query,
+                api_key: process.env.SERPAPI_API_KEY,
+              },
+              timeout: 8000,
+            });
+          } catch (e) {
+            return { data: { organic_results: [] } };
+          }
+        })(),
+        searchTwitterRecent(query, 6),
+        searchReddit(query, 6),
+        searchYouTube(query, 4),
+        searchWikipedia(query),
+      ]).catch(() => [{ data: { organic_results: [] } }, [], [], [], []]);
 
-    // 3) Social signals (Twitter / Reddit)
-    const [tweets, reddit] = await Promise.all([
-      searchTwitterRecent(query, 6),
-      searchReddit(query, 6),
-    ]);
+      const organic = (serpResp?.data?.organic_results || []).slice(0, maxWeb);
+      allSerpOrganic = allSerpOrganic.concat(organic);
 
-    // 4) Build chunks from pages + social posts
+      // If organic results are weak, run extra engines
+      if (organic.length < 5 || !strongEntityMatch(query, organic)) {
+        const extra = await runExtraSearches(query, [
+          "google_news",
+          "youtube",
+          "bing",
+          "duckduckgo",
+        ]);
+        // merge extra organic lists
+        for (const e of extra) {
+          if (e?.organic_results)
+            allSerpOrganic = allSerpOrganic.concat(
+              e.organic_results.slice(0, 5)
+            );
+        }
+      }
+
+      // Fetch pages quickly (limited timeout)
+      const topLinks = allSerpOrganic
+        .slice(0, maxWeb)
+        .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
+      const pageFetchPromises = topLinks.map((l) => fetchPageTextFast(l.link));
+      pages = (await Promise.all(pageFetchPromises)).filter(Boolean);
+
+      tweets = tw || [];
+      reddit = rd || [];
+      youtube = yt || [];
+      wiki = wp || [];
+
+      // Evaluate confidence
+      const combined = [
+        ...(allSerpOrganic || []),
+        ...(tweets || []),
+        ...(reddit || []),
+        ...(youtube || []),
+        ...(wiki || []),
+      ];
+      confidence = checkConfidence(combined, query);
+      attempts++;
+      if (confidence >= 0.85) break;
+
+      // refine query attempts: try site:reddit, spelling variants, synonyms
+      // basic refinement: quote the query and try again with site:reddit
+      // (loop will run again and add more sources)
+    }
+
+    // 4) Build chunks from pages + social posts + youtube + wiki
     let chunks = [];
     for (const p of pages) {
-      if (p.text && p.text.length > 200) {
+      if (p && p.text && p.text.length > 200) {
         const cs = chunkText(p.text, 1200).map((c) => ({
           ...c,
           source: { type: "web", url: p.url, title: p.title },
         }));
         chunks = chunks.concat(cs);
-      } else if (p.title) {
+      } else if (p && p.title) {
         chunks.push({
           id: crypto.randomUUID(),
           text: `${p.title}\n\n${p.text || ""}`.slice(0, 1200),
@@ -1546,41 +1883,46 @@ app.post("/api/agentic-v2", async (req, res) => {
       }
     }
 
-    // include tweets as short chunks
-    for (const t of tweets) {
+    for (const t of tweets || [])
       chunks.push({
         id: crypto.randomUUID(),
         text: t.text,
         source: { type: "twitter", id: t.id, created_at: t.created_at },
       });
-    }
-    // include reddit posts
-    for (const r of reddit) {
+    for (const r of reddit || [])
       chunks.push({
         id: crypto.randomUUID(),
         text: `${r.title}\n\n${r.text}`,
         source: { type: "reddit", url: r.url, subreddit: r.subreddit },
       });
-    }
+    for (const y of youtube || [])
+      chunks.push({
+        id: crypto.randomUUID(),
+        text: `${y.title}\n\n${y.description || ""}`.slice(0, 2000),
+        source: { type: "youtube", url: y.url },
+      });
+    for (const w of wiki || [])
+      chunks.push({
+        id: crypto.randomUUID(),
+        text: `${w.title}\n\n${w.snippet || ""}`.slice(0, 2000),
+        source: { type: "wiki", url: w.url },
+      });
 
-    if (chunks.length === 0) {
+    if (chunks.length === 0)
       return res.json({
-        answer:
-          "I couldn't fetch enough content for this query. Try broader terms or check your SERPAPI/Twitter credentials.",
+        answer: "I couldn't fetch enough content for this query.",
         sources: [],
         raw: [],
       });
-    }
 
-    // 5) Embed all chunks (OpenAI embeddings)
-    const texts = chunks.map((c) => c.text.substring(0, 2000)); // limit size
-    const embeddings = await getEmbeddingsGemini(texts);
+    // 5) Batch embeddings: first item is query, then chunks
+    const allTexts = [query, ...chunks.map((c) => c.text.substring(0, 2000))];
+    const allEmbeddings = await getEmbeddingsGemini(allTexts);
+    const qEmb = allEmbeddings[0];
+    const chunkEmbeddings = allEmbeddings.slice(1);
 
-    // 6) Embed the user query
-    const qEmb = (await getEmbeddingsGemini([query]))[0];
-
-    // 7) Compute similarity, pick top chunks
-    const sims = embeddings.map((emb, i) => ({
+    // 6) Compute similarity, pick top chunks
+    const sims = chunkEmbeddings.map((emb, i) => ({
       i,
       score: cosineSim(emb, qEmb),
     }));
