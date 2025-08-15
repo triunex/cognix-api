@@ -847,8 +847,13 @@ app.post("/api/generate-video", async (req, res) => {
       .json({ error: "Server misconfigured: missing GEMINI_API_KEY." });
   }
 
+  console.log(
+    "/api/generate-video called; prompt length:",
+    (prompt || "").length
+  );
+
   try {
-    // 1) Ask Gemini (text) to produce a robust, production-ready VEO scene spec
+    // 1) Ask Gemini for a spec, but don't let failures abort the whole response
     const instruct = `You are an expert cinematic director and video producer. Given the user's brief below, produce a high-quality, production-ready JSON spec that a VEO-style generative video model can consume.
 
 Output a JSON object ONLY (no extra text) with these keys:
@@ -868,37 +873,43 @@ ${prompt}
 Make the language cinematic, vivid, and supply scene-level prompts that will result in world-class, emotionally engaging footage. Keep total length around ${lengthSeconds} seconds. Use "${style}" style and suggest camera directions and music mood. Do not include any commentary or explanation — respond with pure JSON only.
 `;
 
-    const geminiResp = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: instruct }],
-          },
-        ],
-      },
-      { headers: { "Content-Type": "application/json" } }
-    );
+    let textOut = "";
+    try {
+      const geminiResp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        { contents: [{ role: "user", parts: [{ text: instruct }] }] },
+        { headers: { "Content-Type": "application/json" }, timeout: 30000 }
+      );
+      textOut =
+        geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    } catch (gErr) {
+      console.warn(
+        "Gemini request failed — will use fallback spec",
+        gErr?.response?.data || gErr?.message || gErr
+      );
+      textOut = "";
+    }
 
-    const textOut =
-      geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-    // Try to extract JSON object from the model output
-    let jsonStart = textOut.indexOf("{");
-    let jsonEnd = textOut.lastIndexOf("}");
+    // Try to parse a JSON spec from the model response
     let spec = null;
-    if (jsonStart !== -1 && jsonEnd !== -1) {
-      const jsonStr = textOut.substring(jsonStart, jsonEnd + 1);
-      try {
-        spec = JSON.parse(jsonStr);
-      } catch (e) {
-        // parsing failed; fall back to returning raw text as 'specText'
-        spec = null;
+    if (textOut) {
+      const start = textOut.indexOf("{");
+      const end = textOut.lastIndexOf("}");
+      if (start !== -1 && end !== -1) {
+        const candidate = textOut.substring(start, end + 1);
+        try {
+          spec = JSON.parse(candidate);
+        } catch (pErr) {
+          console.warn(
+            "Failed to parse JSON from Gemini text; using fallback spec",
+            pErr.message || pErr
+          );
+          spec = null;
+        }
       }
     }
 
-    // Build a minimal spec if parsing failed
+    // Build fallback spec if parsing failed
     if (!spec) {
       spec = {
         title:
@@ -912,52 +923,53 @@ Make the language cinematic, vivid, and supply scene-level prompts that will res
             id: "scene-1",
             start_sec: 0,
             end_sec: Math.min(12, lengthSeconds),
-            prompt: prompt,
-            camera: "slow dolly in, cinematic framing",
+            prompt,
+            camera: "slow dolly in",
             mood: "inspirational",
           },
         ],
         music: {
           track_style: "emotional cinematic score",
           tempo: "moderate",
-          volume: 0.75,
+          volume: 0.8,
         },
         voice: {
           language: "en-US",
-          tts_instructions: voice || "warm, confident male/female",
+          tts_instructions: voice || "warm, confident",
         },
         deliverables: ["mp4"],
-        // attach raw model text so frontend can show it if needed
         _modelText: textOut,
       };
     }
 
-    // 2) Attempt to call Google's VEO-3 video generation endpoint
-    // NOTE: Not all projects have video generation enabled. We attempt the call and gracefully fallback to returning the spec.
+    // 2) Try VEO generation; if unavailable, return the spec (safe fallback)
     try {
       const veoUrl = `https://generativelanguage.googleapis.com/v1beta/models/veo-3:generateVideo?key=${process.env.GEMINI_API_KEY}`;
-
-      // Hypothetical request body for video generation. Many deployments return an operation or a direct URL.
       const veoBody = {
-        // We include the spec as `video_spec` for the service to interpret
         video_spec: spec,
-        // optional metadata
-        metadata: {
-          source: "CogniX",
-          request_by: "chat",
-        },
+        metadata: { source: "CogniX", request_by: "chat" },
       };
 
-      const veoResp = await axios.post(veoUrl, veoBody, {
-        headers: { "Content-Type": "application/json" },
-        timeout: 120000, // allow up to 2 minutes for the generation request to be accepted
-      });
+      let veoResp;
+      try {
+        veoResp = await axios.post(veoUrl, veoBody, {
+          headers: { "Content-Type": "application/json" },
+          timeout: 120000,
+        });
+      } catch (vErr) {
+        console.warn(
+          "VEO call failed or not permitted for this key:",
+          vErr?.response?.data || vErr?.message || vErr
+        );
+        return res.json({
+          status: "spec",
+          spec,
+          note: "Video generation not available; returning spec.",
+        });
+      }
 
-      // Try common response shapes
       const veoData = veoResp.data || {};
-      // If the API returned an operation id or a videoUrl, forward it
       if (veoData.videoUrl || veoData.output?.[0]?.uri || veoData.operation) {
-        // Prefer a direct URL when available
         const videoUrl = veoData.videoUrl || veoData.output?.[0]?.uri || null;
         return res.json({
           status: "ok",
@@ -967,26 +979,26 @@ Make the language cinematic, vivid, and supply scene-level prompts that will res
         });
       }
 
-      // If the response doesn't contain a ready URL, return the raw response and spec
       return res.json({ status: "accepted", detail: veoData, spec });
-    } catch (videoErr) {
-      console.warn(
-        "Video generation call failed or not available:",
-        videoErr?.response?.data || videoErr.message
-      );
-      // Fall back: return the spec plus model text so the frontend can either show it or send to another service
+    } catch (outerVideoErr) {
+      console.error("Unexpected VEO outer error:", outerVideoErr);
       return res.json({
         status: "spec",
         spec,
-        note: "Video generation not available; returning spec.",
+        note: "Video generation error; returning spec.",
       });
     }
   } catch (err) {
     console.error(
-      "Generate-video error:",
-      err.response?.data || err.message || err
+      "Generate-video fatal error:",
+      err?.response?.data || err?.message || err
     );
-    res.status(500).json({ error: "Failed to generate video." });
+    return res
+      .status(500)
+      .json({
+        error: "Failed to generate video.",
+        detail: err?.response?.data || err?.message || String(err),
+      });
   }
 });
 
