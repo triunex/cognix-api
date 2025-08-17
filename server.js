@@ -1279,6 +1279,43 @@ Make the language cinematic, vivid, and supply scene-level prompts that will res
 
 app.listen(10000, () => console.log("Server running on port 10000"));
 
+// --- Agent execution endpoint: forwards prompt to Agent container ---
+app.post("/agent/v1/execute", async (req, res) => {
+  const { prompt, meta } = req.body || {};
+
+  if (!prompt || typeof prompt !== "string") {
+    return res
+      .status(400)
+      .json({ error: "Missing or invalid 'prompt' in body." });
+  }
+
+  try {
+    const agentBase = process.env.AGENT_URL || "http://localhost:7001"; // agent container base URL
+    const url = `${agentBase.replace(/\/$/, "")}/agent/run`;
+
+    // Forward the prompt and any metadata to the agent service.
+    const resp = await axios.post(
+      url,
+      { prompt, meta },
+      { headers: { "Content-Type": "application/json" }, timeout: 45000 }
+    );
+
+    // Return agent response to caller
+    return res.json({ success: true, agent: resp.data });
+  } catch (err) {
+    console.error(
+      "Agent execute error:",
+      err.response?.data || err.message || err
+    );
+    return res
+      .status(500)
+      .json({
+        error: "Agent execution failed.",
+        detail: err.response?.data || err.message,
+      });
+  }
+});
+
 export async function generatePdfFromHtml(html) {
   const file = { content: html };
   const options = { format: "A4" };
