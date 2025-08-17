@@ -21,17 +21,30 @@ dotenv.config();
 
 const app = express();
 
-// ✅ Core middlewares FIRST (so req.body is available to all routes)
-// Allow only the frontend origin for browser requests
-app.use(
-  cors({
-    origin: "http://localhost:8080",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
-app.options("*", cors()); // Allow preflight for all routes
+// More explicit CORS handling to resolve preflight issues
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin === "http://localhost:8080") {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, OPTIONS, PUT, PATCH, DELETE"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "X-Requested-With,content-type,Authorization"
+  );
+  res.setHeader("Access-Control-Allow-Credentials", true);
 
+  // Intercept OPTIONS method for preflight
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+// ✅ Core middlewares FIRST (so req.body is available to all routes)
 app.use(bodyParser.json({ limit: "10mb" })); // handle base64 images
 app.use(express.json());
 
@@ -1281,18 +1294,6 @@ Make the language cinematic, vivid, and supply scene-level prompts that will res
 app.listen(10000, () => console.log("Server running on port 10000"));
 
 // --- Agent execution endpoint: forwards prompt to Agent container ---
-// Ensure preflight is handled for the agent endpoint (explicit headers)
-app.options("/agent/v1/execute", (req, res) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
-  );
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.header("Access-Control-Max-Age", "86400");
-  return res.sendStatus(204);
-});
-
 app.post("/agent/v1/execute", async (req, res) => {
   const { prompt, meta } = req.body || {};
 
@@ -1303,12 +1304,6 @@ app.post("/agent/v1/execute", async (req, res) => {
   }
 
   try {
-    // Be explicit about CORS headers for this route (helps some browser setups)
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, X-Requested-With"
-    );
     const agentBase = process.env.AGENT_URL || "http://localhost:7001"; // agent container base URL
     const url = `${agentBase.replace(/\/$/, "")}/agent/run`;
 
@@ -1325,11 +1320,6 @@ app.post("/agent/v1/execute", async (req, res) => {
     console.error(
       "Agent execute error:",
       err.response?.data || err.message || err
-    );
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, X-Requested-With"
     );
     return res.status(500).json({
       error: "Agent execution failed.",
@@ -1510,16 +1500,6 @@ app.post("/api/convert-to-pdf", async (req, res) => {
     console.error("PDF conversion error:", error);
     return res.status(500).json({ error: "Failed to convert to PDF" });
   }
-});
-
-// ✅ Fallback CORS middleware (place before app.listen)
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*"); // Replace * with specific domain in production
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept"
-  );
-  next();
 });
 
 app.post("/api/autopilot-agent", async (req, res) => {
