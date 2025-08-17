@@ -2272,17 +2272,22 @@ Now extract the dataset.
   }
 });
 
-app.post("/agent-command", async (req, res) => {
+// Inside server.js
+app.post("/agent/v1/execute", async (req, res) => {
   try {
-    const response = await fetch("http://localhost:5050/agent-command", {
+    const { prompt, config } = req.body;
+
+    // Call our first agent container (via Docker or local process)
+    const agentResponse = await fetch("http://localhost:7001/agent/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_prompt: req.body.user_prompt }),
+      body: JSON.stringify({ prompt, config }),
     });
-    const data = await response.json();
+
+    const data = await agentResponse.json();
     res.json(data);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Agent request failed" });
+    console.error("Agent execution error:", err);
+    res.status(500).json({ error: "Agent execution failed" });
   }
 });
