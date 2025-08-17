@@ -1280,6 +1280,9 @@ Make the language cinematic, vivid, and supply scene-level prompts that will res
 app.listen(10000, () => console.log("Server running on port 10000"));
 
 // --- Agent execution endpoint: forwards prompt to Agent container ---
+// Ensure preflight is handled for the agent endpoint
+app.options("/agent/v1/execute", cors());
+
 app.post("/agent/v1/execute", async (req, res) => {
   const { prompt, meta } = req.body || {};
 
@@ -1290,6 +1293,12 @@ app.post("/agent/v1/execute", async (req, res) => {
   }
 
   try {
+    // Be explicit about CORS headers for this route (helps some browser setups)
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Requested-With"
+    );
     const agentBase = process.env.AGENT_URL || "http://localhost:7001"; // agent container base URL
     const url = `${agentBase.replace(/\/$/, "")}/agent/run`;
 
@@ -1307,12 +1316,10 @@ app.post("/agent/v1/execute", async (req, res) => {
       "Agent execute error:",
       err.response?.data || err.message || err
     );
-    return res
-      .status(500)
-      .json({
-        error: "Agent execution failed.",
-        detail: err.response?.data || err.message,
-      });
+    return res.status(500).json({
+      error: "Agent execution failed.",
+      detail: err.response?.data || err.message,
+    });
   }
 });
 
@@ -2306,25 +2313,5 @@ Now extract the dataset.
       err.response?.data || err.message
     );
     res.status(500).json({ error: "Data extraction failed." });
-  }
-});
-
-// Inside server.js
-app.post("/agent/v1/execute", async (req, res) => {
-  try {
-    const { prompt, config } = req.body;
-
-    // Call our first agent container (via Docker or local process)
-    const agentResponse = await fetch("http://localhost:7001/agent/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, config }),
-    });
-
-    const data = await agentResponse.json();
-    res.json(data);
-  } catch (err) {
-    console.error("Agent execution error:", err);
-    res.status(500).json({ error: "Agent execution failed" });
   }
 });
