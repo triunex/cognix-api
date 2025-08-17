@@ -1280,8 +1280,17 @@ Make the language cinematic, vivid, and supply scene-level prompts that will res
 app.listen(10000, () => console.log("Server running on port 10000"));
 
 // --- Agent execution endpoint: forwards prompt to Agent container ---
-// Ensure preflight is handled for the agent endpoint
-app.options("/agent/v1/execute", cors());
+// Ensure preflight is handled for the agent endpoint (explicit headers)
+app.options("/agent/v1/execute", (req, res) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+  );
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Max-Age", "86400");
+  return res.sendStatus(204);
+});
 
 app.post("/agent/v1/execute", async (req, res) => {
   const { prompt, meta } = req.body || {};
@@ -1315,6 +1324,11 @@ app.post("/agent/v1/execute", async (req, res) => {
     console.error(
       "Agent execute error:",
       err.response?.data || err.message || err
+    );
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Requested-With"
     );
     return res.status(500).json({
       error: "Agent execution failed.",
