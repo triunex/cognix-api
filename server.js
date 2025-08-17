@@ -22,9 +22,10 @@ dotenv.config();
 const app = express();
 
 // ✅ Core middlewares FIRST (so req.body is available to all routes)
+// Allow only the frontend origin for browser requests
 app.use(
   cors({
-    origin: "*", // or replace "*" with your frontend URL in production
+    origin: "http://localhost:8080",
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
