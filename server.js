@@ -1295,36 +1295,27 @@ app.listen(10000, () => console.log("Server running on port 10000"));
 
 // --- Agent execution endpoint: forwards prompt to Agent container ---
 app.post("/agent/v1/execute", async (req, res) => {
-  const { prompt, meta } = req.body || {};
-
-  if (!prompt || typeof prompt !== "string") {
-    return res
-      .status(400)
-      .json({ error: "Missing or invalid 'prompt' in body." });
-  }
-
   try {
-    const agentBase = process.env.AGENT_URL || "http://localhost:7001"; // agent container base URL
-    const url = `${agentBase.replace(/\/$/, "")}/agent/run`;
+    const { prompt, config } = req.body || {};
 
-    // Forward the prompt and any metadata to the agent service.
-    const resp = await axios.post(
-      url,
-      { prompt, meta },
-      { headers: { "Content-Type": "application/json" }, timeout: 45000 }
-    );
-
-    // Return agent response to caller
-    return res.json({ success: true, agent: resp.data });
-  } catch (err) {
-    console.error(
-      "Agent execute error:",
-      err.response?.data || err.message || err
-    );
-    return res.status(500).json({
-      error: "Agent execution failed.",
-      detail: err.response?.data || err.message,
+    // Forward request to agent container
+    const agentResponse = await fetch("http://localhost:7001/agent/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, config }),
     });
+
+    if (!agentResponse.ok) {
+      throw new Error(`Agent returned ${agentResponse.status}`);
+    }
+
+    const data = await agentResponse.json();
+    return res.json(data);
+  } catch (err) {
+    console.error("Agent execution error:", err);
+    return res
+      .status(500)
+      .json({ error: "Agent execution failed", details: err.message });
   }
 });
 
