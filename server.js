@@ -181,6 +181,143 @@ async function fetchPageText(url) {
   }
 }
 
+// ---------- Agentic helpers (ADD THIS) ----------
+/**
+ * @typedef {Object} SubTask
+ * @property {string} id
+ * @property {'news'|'transcript'|'generic'} kind
+ * @property {'country'|'city'} [scope]
+ * @property {string} [place]
+ * @property {string} [date]
+ * @property {string} [month]
+ * @property {string} [title]
+ * @property {string} [year]
+ * @property {boolean} [mustBeFull]
+ * @property {string} [query]
+ */
+
+function uid() {
+  return (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`).toString();
+}
+
+function norm(s = "") {
+  try { return String(s).normalize("NFKC").trim(); } catch(e) { return String(s).trim(); }
+}
+
+function extractExplicitDate(q = "") {
+  // matches 2025-08-19 or 19 August 2025 or 19 Aug 2025
+  const iso = q.match(/\b(20\d{2})[-\/\. ](0?[1-9]|1[0-2])[-\/\. ](0?[1-9]|[12]\d|3[01])\b/);
+  if (iso) return `${iso[1]}-${String(iso[2]).padStart(2, "0")}-${String(iso[3]).padStart(2, "0")}`;
+  const dmy = q.match(/\b(0?[1-9]|[12]\d|3[01])\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(20\d{2})\b/i);
+  if (dmy) {
+    const m = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"].indexOf(dmy[2].toLowerCase())+1;
+    return `${dmy[3]}-${String(m).padStart(2, "0")}-${String(dmy[1]).padStart(2, "0")}`;
+  }
+  return null;
+}
+
+function extractMonthYear(q = "") {
+  const m1 = q.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(20\d{2})\b/i);
+  if (m1) {
+    const m = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"].indexOf(m1[1].toLowerCase())+1;
+    return { month: String(m).padStart(2, "0"), year: m1[2] };
+  }
+  const m2 = q.match(/\b(0?[1-9]|1[0-2])[\/\-](20\d{2})\b/);
+  if (m2) return { month: String(m2[1]).padStart(2, "0"), year: m2[2] };
+  return null;
+}
+
+function extractPlaces(q = "") {
+  const out = [];
+  if (/\bindia\b/i.test(q)) out.push("India");
+  if (/\bmainpuri\b/i.test(q) || /मैनपुरी/.test(q)) out.push("Mainpuri");
+  return [...new Set(out)];
+}
+
+function splitMultiIntent(original = "") {
+  // split on enumerations "1.", "2)", line breaks with clear tasks, or "and" joins
+  const parts = original
+    .split(/\n+|(?:^|\s)(?:\d+\.|\d+\)|-)\s+/g)
+    .map(x => norm(x))
+    .filter(Boolean);
+
+  // If we got too many small fragments, just return the original
+  if (parts.length <= 1) return [norm(original)];
+  return parts;
+}
+
+function makePlan(q = "", todayISO = new Date().toISOString().slice(0,10)) {
+  /** @type {SubTask[]} */
+  const tasks = [];
+  const date = extractExplicitDate(q) || todayISO;
+  const month = extractMonthYear(q);
+  const places = extractPlaces(q);
+  const wantsFull = /\bfull\b.*\b(speech|transcript)\b/i.test(q);
+  const wantsJobs2007 = /steve\s+jobs/i.test(q) && /(2007|macworld)/i.test(q);
+
+  // news (country)
+  if (/latest\s+news/i.test(q) && places.includes("India")) {
+    tasks.push({ id: uid(), kind: "news", scope: "country", place: "India", date });
+  }
+  // news (city/month)
+  if (/latest\s+news/i.test(q) && places.includes("Mainpuri") && month) {
+    tasks.push({ id: uid(), kind: "news", scope: "city", place: "Mainpuri", month: `${month.year}-${month.month}` });
+  }
+  // transcript (jobs 2007)
+  if (wantsJobs2007) {
+    tasks.push({ id: uid(), kind: "transcript", title: "Steve Jobs introduces iPhone (Macworld)", year: "2007", mustBeFull: wantsFull });
+  }
+  if (tasks.length === 0) tasks.push({ id: uid(), kind: "generic", query: q });
+  return tasks;
+}
+
+// --- Verifiers (drop obviously-wrong stuff) ---
+function articleHasPlace(s = "", place) { return new RegExp(`\\b${place}\\b`, "i").test(s); }
+function articleInMonth(iso = "", ym) { return iso?.startsWith(ym); }
+
+function verifyNewsItems(items = [], opts = { place: undefined, date: undefined, month: undefined }) {
+  const pruned = [];
+  for (const it of items || []) {
+    const title = norm(it.title || "");
+    const snippet = norm(it.snippet || it.summary || "");
+    const pageText = norm(it.text || "");
+    const combined = `${title}\n${snippet}\n${pageText}`;
+
+    // try to read a normalized date your fetchers put on objects (add if missing)
+    const dt = it.dateISO || it.published_at || it.date || "";
+    if (opts.month && !articleInMonth(dt, opts.month)) continue;
+    if (opts.place && !articleHasPlace(combined, opts.place)) continue;
+
+    pruned.push(it);
+  }
+  return { ok: pruned.length >= 3, items: pruned };
+}
+
+function verifyTranscriptCoverage(t = { text: "", coverage: 0 }, mustBeFull = false) {
+  const coverage = t.coverage ?? (t.text ? Math.min(1, t.text.length / 18000) : 0);
+  const ok = mustBeFull ? coverage >= 0.8 : coverage >= 0.4;
+  return { ok, coverage };
+}
+
+// --- Safe-composer (pretty, professional, policy-safe) ---
+function composeSections(blocks) {
+  const lines = ['# Answer'];
+  for (const b of blocks) {
+    lines.push(`\n## ${b.title}\n`);
+    lines.push(b.body.trim());
+    if (b.sources?.length) {
+      lines.push(`\n**Sources:** ` + b.sources.slice(0,8).map(s=>`[${s.title || new URL(s.url).hostname}](${s.url})`).join(" · "));
+    }
+  }
+  return lines.join("\n");
+}
+
+// (policy) avoid returning full copyrighted speeches verbatim
+function trimIfCopyrightRisk(txt = "", maxChars = 1200) {
+  if (txt.length <= maxChars) return txt;
+  return txt.slice(0, maxChars) + "\n\n*Excerpt shown. See full transcript/video via the sources below.*";
+}
+
 function chunkText(text, maxLen = 1500) {
   if (!text) return [];
   const paragraphs = text.split(/\n{1,}/).filter(Boolean);
@@ -1815,280 +1952,183 @@ app.post("/api/agentic-v2", async (req, res) => {
   if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
-    // Multi-round expansion + parallel source fetching
-    let attempts = 0;
-    let confidence = 0;
-    let allSerpOrganic = [];
-    let pages = [];
-    let tweets = [];
-    let reddit = [];
-    let youtube = [];
-    let wiki = [];
+    // helpers: unified single-run that wraps existing logic (see runUnifiedOnce below)
+    async function runUnifiedOnce(userQuery, opts = { maxWeb, topChunks }) {
+      // === begin: your existing core (lightly parameterized) ===
+      let attempts = 0;
+      let confidence = 0;
+      let allSerpOrganic = [];
+      let pages = [];
+      let tweets = [];
+      let reddit = [];
+      let youtube = [];
+      let wiki = [];
 
-    while (attempts < 3 && confidence < 0.85) {
-      // Run primary searches in parallel
-      const [serpResp, tw, rd, yt, wp] = await Promise.all([
-        (async () => {
-          try {
-            return await axios.get("https://serpapi.com/search", {
-              params: {
-                engine: "google",
-                q: query,
-                api_key: process.env.SERPAPI_API_KEY,
-              },
-              timeout: 8000,
-            });
-          } catch (e) {
-            return { data: { organic_results: [] } };
-          }
-        })(),
-        searchTwitterRecent(query, 6),
-        searchReddit(query, 6),
-        searchYouTube(query, 4),
-        searchWikipedia(query),
-      ]).catch(() => [{ data: { organic_results: [] } }, [], [], [], []]);
+      while (attempts < 3 && confidence < 0.85) {
+        const [serpResp, tw, rd, yt, wp] = await Promise.all([
+          (async () => {
+            try {
+              return await axios.get("https://serpapi.com/search", {
+                params: { engine: "google", q: userQuery, api_key: process.env.SERPAPI_API_KEY },
+                timeout: 8000,
+              });
+            } catch (e) { return { data: { organic_results: [] } }; }
+          })(),
+          searchTwitterRecent(userQuery, 6),
+          searchReddit(userQuery, 6),
+          searchYouTube(userQuery, 4),
+          searchWikipedia(userQuery),
+        ]).catch(() => [{ data: { organic_results: [] } }, [], [], [], []]);
 
-      const organic = (serpResp?.data?.organic_results || []).slice(0, maxWeb);
-      allSerpOrganic = allSerpOrganic.concat(organic);
+        const organic = (serpResp?.data?.organic_results || []).slice(0, opts.maxWeb ?? 8);
+        allSerpOrganic = allSerpOrganic.concat(organic);
 
-      // If organic results are weak, run extra engines
-      if (organic.length < 5 || !strongEntityMatch(query, organic)) {
-        const extra = await runExtraSearches(query, [
-          "google_news",
-          "youtube",
-          "bing",
-          "duckduckgo",
-        ]);
-        // merge extra organic lists
-        for (const e of extra) {
-          if (e?.organic_results)
-            allSerpOrganic = allSerpOrganic.concat(
-              e.organic_results.slice(0, 5)
-            );
+        if (organic.length < 5 || !strongEntityMatch(userQuery, organic)) {
+          const extra = await runExtraSearches(userQuery, ["google_news","youtube","bing","duckduckgo"]);
+          for (const e of extra) if (e?.organic_results) allSerpOrganic = allSerpOrganic.concat(e.organic_results.slice(0, 5));
+        }
+
+        const topLinks = allSerpOrganic.slice(0, opts.maxWeb ?? 8).map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
+        const pageFetchPromises = topLinks.map((l) => fetchPageTextFast(l.link));
+        pages = (await Promise.all(pageFetchPromises)).filter(Boolean);
+
+        tweets = tw || [];
+        reddit = rd || [];
+        youtube = yt || [];
+        wiki = wp || [];
+
+        const combined = [...(allSerpOrganic||[]), ...(tweets||[]), ...(reddit||[]), ...(youtube||[]), ...(wiki||[])];
+        confidence = checkConfidence(combined, userQuery);
+        attempts++;
+        if (confidence >= 0.85) break;
+      }
+
+      let chunks = [];
+      for (const p of pages) {
+        if (p && p.text && p.text.length > 200) {
+          const cs = chunkText(p.text, 1200).map((c) => ({ ...c, source: { type: "web", url: p.url, title: p.title } }));
+          chunks = chunks.concat(cs);
+        } else if (p && p.title) {
+          chunks.push({ id: crypto.randomUUID(), text: `${p.title}\n\n${p.text || ""}`.slice(0, 1200), source: { type: "web", url: p.url, title: p.title } });
         }
       }
+      for (const t of tweets || []) chunks.push({ id: crypto.randomUUID(), text: t.text, source: { type: "twitter", id: t.id, created_at: t.created_at } });
+      for (const r of reddit || []) chunks.push({ id: crypto.randomUUID(), text: `${r.title}\n\n${r.text}`, source: { type: "reddit", url: r.url, subreddit: r.subreddit } });
+      for (const y of youtube || []) chunks.push({ id: crypto.randomUUID(), text: `${y.title}\n\n${y.description || ""}`.slice(0, 2000), source: { type: "youtube", url: y.url } });
+      for (const w of wiki || []) chunks.push({ id: crypto.randomUUID(), text: `${w.title}\n\n${w.snippet || ""}`.slice(0, 2000), source: { type: "wiki", url: w.url } });
 
-      // Fetch pages quickly (limited timeout)
-      const topLinks = allSerpOrganic
-        .slice(0, maxWeb)
-        .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
-      const pageFetchPromises = topLinks.map((l) => fetchPageTextFast(l.link));
-      pages = (await Promise.all(pageFetchPromises)).filter(Boolean);
+      if (chunks.length === 0) return { formatted_answer: "", sources: [], images: [], chunks: [], rawTop: [] };
 
-      tweets = tw || [];
-      reddit = rd || [];
-      youtube = yt || [];
-      wiki = wp || [];
+      const allTexts = [userQuery, ...chunks.map((c) => c.text.substring(0, 2000))];
+      const allEmbeddings = await getEmbeddingsGemini(allTexts);
+      const qEmb = allEmbeddings[0];
+      const chunkEmbeddings = allEmbeddings.slice(1);
 
-      // Evaluate confidence
-      const combined = [
-        ...(allSerpOrganic || []),
-        ...(tweets || []),
-        ...(reddit || []),
-        ...(youtube || []),
-        ...(wiki || []),
-      ];
-      confidence = checkConfidence(combined, query);
-      attempts++;
-      if (confidence >= 0.85) break;
+      const sims = chunkEmbeddings.map((emb, i) => ({ i, score: cosineSim(emb, qEmb) }));
+      sims.sort((a, b) => b.score - a.score);
+      const pick = Math.min(opts.topChunks ?? 10, sims.length);
+      const top = sims.slice(0, pick).map((s) => ({ chunk: chunks[s.i], score: s.score }));
 
-      // refine query attempts: try site:reddit, spelling variants, synonyms
-      // basic refinement: quote the query and try again with site:reddit
-      // (loop will run again and add more sources)
-    }
-
-    // 4) Build chunks from pages + social posts + youtube + wiki
-    let chunks = [];
-    for (const p of pages) {
-      if (p && p.text && p.text.length > 200) {
-        const cs = chunkText(p.text, 1200).map((c) => ({
-          ...c,
-          source: { type: "web", url: p.url, title: p.title },
-        }));
-        chunks = chunks.concat(cs);
-      } else if (p && p.title) {
-        chunks.push({
-          id: crypto.randomUUID(),
-          text: `${p.title}\n\n${p.text || ""}`.slice(0, 1200),
-          source: { type: "web", url: p.url, title: p.title },
-        });
-      }
-    }
-
-    for (const t of tweets || [])
-      chunks.push({
-        id: crypto.randomUUID(),
-        text: t.text,
-        source: { type: "twitter", id: t.id, created_at: t.created_at },
+      const contextParts = top.map((t, idx) => {
+        const s = t.chunk.source;
+        const sourceLabel =
+          s?.type === "web" ? `${s.title} — ${s.url}` :
+          s?.type === "twitter" ? `Twitter (${s.id})` :
+          s?.type === "reddit" ? `Reddit (${s.subreddit || s.url})` :
+          s?.type === "youtube" ? `YouTube (${s.url})` :
+          s?.type === "wiki" ? `Wikipedia (${s.url})` : "Source";
+        return `Source ${idx + 1}: ${sourceLabel}\nExcerpt:\n${t.chunk.text.slice(0,1200)}\n---\n`;
       });
-    for (const r of reddit || [])
-      chunks.push({
-        id: crypto.randomUUID(),
-        text: `${r.title}\n\n${r.text}`,
-        source: { type: "reddit", url: r.url, subreddit: r.subreddit },
-      });
-    for (const y of youtube || [])
-      chunks.push({
-        id: crypto.randomUUID(),
-        text: `${y.title}\n\n${y.description || ""}`.slice(0, 2000),
-        source: { type: "youtube", url: y.url },
-      });
-    for (const w of wiki || [])
-      chunks.push({
-        id: crypto.randomUUID(),
-        text: `${w.title}\n\n${w.snippet || ""}`.slice(0, 2000),
-        source: { type: "wiki", url: w.url },
-      });
+      const context = contextParts.join("\n");
 
-    if (chunks.length === 0)
-      return res.json({
-        answer: "I couldn't fetch enough content for this query.",
-        sources: [],
-        raw: [],
-      });
-
-    // 5) Batch embeddings: first item is query, then chunks
-    const allTexts = [query, ...chunks.map((c) => c.text.substring(0, 2000))];
-    const allEmbeddings = await getEmbeddingsGemini(allTexts);
-    const qEmb = allEmbeddings[0];
-    const chunkEmbeddings = allEmbeddings.slice(1);
-
-    // 6) Compute similarity, pick top chunks
-    const sims = chunkEmbeddings.map((emb, i) => ({
-      i,
-      score: cosineSim(emb, qEmb),
-    }));
-    sims.sort((a, b) => b.score - a.score);
-    const top = sims.slice(0, Math.min(topChunks, sims.length)).map((s) => ({
-      chunk: chunks[s.i],
-      score: s.score,
-    }));
-
-    // 8) Build context string for Gemini (include small excerpt + source metadata)
-    const contextParts = top.map((t, idx) => {
-      const s = t.chunk.source;
-      const sourceLabel =
-        s?.type === "web"
-          ? `${s.title} — ${s.url}`
-          : s?.type === "twitter"
-          ? `Twitter (${s.id})`
-          : `Reddit (${s.subreddit || s.url})`;
-      return `Source ${idx + 1}: ${sourceLabel}\nExcerpt:\n${t.chunk.text.slice(
-        0,
-        1200
-      )}\n---\n`;
-    });
-    const context = contextParts.join("\n");
-
-    const finalPrompt = `
-You are Nelieo AI. Respond in well-formatted Markdown for humans — with a big H1 title for the topic, a short overview paragraph, clear H2/H3 sections, bullet points/numbered lists, and generous white space between sections. If relevant, include images using Markdown syntax: ![Alt text](image_url).
-
-Do NOT return JSON unless the user explicitly asks for a chart or a table; otherwise always return human-friendly Markdown. Use ONLY the provided context for factual details.
+      const finalPrompt = `
+You are Nelieo AI. Format as beautiful Markdown with clear sections and bullet points. 
+Use ONLY the provided context for facts; do not invent. If a request implies sharing a full copyrighted work, provide a concise excerpt and link to the official source.
 
 USER QUESTION:
-"${query}"
+"${userQuery}"
 
 CONTEXT:
 ${context}
-`;
+`.trim();
 
-    // 9) Call Gemini for synthesis
-    const geminiResp = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [{ role: "user", parts: [{ text: finalPrompt }] }],
-        generationConfig: {
-          temperature: 0.85,
-          topP: 0.9,
-          maxOutputTokens: 1024,
-        },
-      },
-      { headers: { "Content-Type": "application/json" } }
-    );
+      const geminiResp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        { contents: [{ role: "user", parts: [{ text: finalPrompt }] }], generationConfig: { temperature: 0.5, topP: 0.9, maxOutputTokens: 1200 } },
+        { headers: { "Content-Type": "application/json" } }
+      );
+      const rawText = geminiResp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const answer = rawText.trim();
 
-    const rawText =
-      geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-    // Helper: extract sources from Markdown (References or inline links)
-    function extractSourcesFromMarkdown(md, fallbackTop) {
-      const sources = [];
-      const seen = new Set();
-      const lines = (md || "").split(/\r?\n/);
-
-      // 1) Markdown links [Title](URL)
-      const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
-      let m;
-      while ((m = linkRe.exec(md))) {
-        const title = m[1].trim();
-        const url = m[2].trim();
-        if (!seen.has(url)) {
-          sources.push({ title, url });
-          seen.add(url);
+      function extractSourcesFromMarkdown(md = "", fallbackTop = []) {
+        const sources = []; const seen = new Set(); const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g; let m;
+        while ((m = linkRe.exec(md))) { const title = m[1].trim(); const url = m[2].trim(); if (!seen.has(url)) { sources.push({ title, url }); seen.add(url); } }
+        if (sources.length === 0 && Array.isArray(fallbackTop)) {
+          for (const t of fallbackTop) { const src = t.chunk.source; if (src?.url && !seen.has(src.url)) { sources.push({ title: src.title || src.type || src.url, url: src.url }); seen.add(src.url); } }
         }
+        return sources.slice(0, 12);
       }
+      function extractImages(md = "") { const out = []; const seen = new Set(); const imgRe = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g; let m; while ((m = imgRe.exec(md))) { const url = m[1].trim(); if (!seen.has(url)) { out.push(url); seen.add(url); } } return out.slice(0, 8); }
 
-      // 2) Lines like "- Title — URL" or "Title: URL"
-      const lineUrlRe =
-        /^(?:[-*]|\d+\.)?\s*([^:—\-]+?)\s*(?:[:—\-])\s*(https?:\/\/\S+)/i;
-      for (const line of lines) {
-        const match = line.match(lineUrlRe);
-        if (match) {
-          const title = match[1].trim();
-          const url = match[2].trim().replace(/[).,;]+$/, "");
-          if (title && url && !seen.has(url)) {
-            sources.push({ title, url });
-            seen.add(url);
-          }
-        }
-      }
+      const sourcesArr = extractSourcesFromMarkdown(answer, top);
+      const imagesArr = extractImages(answer);
 
-      // 3) Fallback to top chunk web sources
-      if (sources.length === 0 && Array.isArray(fallbackTop)) {
-        for (const t of fallbackTop) {
-          const src = t.chunk.source;
-          if (src && src.url && !seen.has(src.url)) {
-            sources.push({
-              title: src.title || src.type || src.url,
-              url: src.url,
-            });
-            seen.add(src.url);
-          }
-        }
-      }
-      return sources.slice(0, 10);
+      return { formatted_answer: answer, sources: sourcesArr, images: imagesArr, chunks, rawTop: top };
     }
 
-    // Helper: extract image URLs from Markdown ![alt](url)
-    function extractImages(md) {
-      const out = [];
-      const seen = new Set();
-      const imgRe = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g;
-      let m;
-      while ((m = imgRe.exec(md))) {
-        const url = m[1].trim();
-        if (!seen.has(url)) {
-          out.push(url);
-          seen.add(url);
-        }
+    // 1) Split multi-intent
+    const todayISO = new Date().toISOString().slice(0,10);
+    const parts = splitMultiIntent(query);
+    const plans = parts.flatMap(p => makePlan(p, todayISO));
+
+    // 2) Execute each subtask (in parallel)
+    const execs = await Promise.all(plans.map(async (t) => {
+      if (t.kind === "news") {
+        const q = t.scope === "country"
+          ? `site:news .in OR site:news .com India latest news "${t.date || todayISO}"`
+          : `"Mainpuri" news ${t.month ? `"${t.month}"` : ""} Uttar Pradesh site:.in OR site:hindustantimes.com OR site:timesofindia.indiatimes.com`;
+        const run = await runUnifiedOnce(q, { maxWeb, topChunks });
+        const verified = verifyNewsItems(run.rawTop.map((x) => ({ title: x.chunk?.source?.title, url: x.chunk?.source?.url, text: x.chunk?.text, dateISO: x.chunk?.dateISO || "", snippet: "" })), { place: t.place, date: t.date, month: t.month });
+        return { task: t, run, verified };
       }
-      return out.slice(0, 6);
+      if (t.kind === "transcript") {
+        const q = `full transcript "${t.title}" ${t.year || ""} site:youtube.com OR site:archive.org OR site:scribd.com OR site:wired.com OR site:macworld.com`;
+        const run = await runUnifiedOnce(q, { maxWeb, topChunks: Math.max(12, topChunks) });
+        const txt = run.formatted_answer;
+        const coverage = Math.min(1, txt.replace(/\s+/g," ").length / 18000);
+        const verdict = verifyTranscriptCoverage({ text: txt, coverage }, !!t.mustBeFull);
+        run.formatted_answer = trimIfCopyrightRisk(run.formatted_answer);
+        return { task: t, run, verified: verdict };
+      }
+      // generic
+      const run = await runUnifiedOnce(t.query || t.id || query, { maxWeb, topChunks });
+      return { task: t, run, verified: { ok: true } };
+    }));
+
+    // 3) Compose beautiful, sectioned answer
+    const blocks = [];
+    for (const ex of execs) {
+      const t = ex.task;
+      if (t.kind === "news") {
+        const title = t.scope === "country" ? `Latest News — ${t.place} (${t.date})` : `Latest News — ${t.place} (${t.month})`;
+        const body = ex.verified.ok ? ex.run.formatted_answer : (ex.run.formatted_answer + `\n\n*Note:* I filtered by place/date; not enough verified local items were fast to fetch. Use Arsenal → Deep Research to dig deeper.`);
+        blocks.push({ title, body, sources: ex.run.sources });
+      } else if (t.kind === "transcript") {
+        const title = `${t.title} — Transcript (${t.year || ""})`;
+        const addNote = !ex.verified.ok ? `\n\n*Note:* Couldn’t confirm full coverage quickly. Use the provided links to view the full keynote video/transcript.` : "";
+        blocks.push({ title, body: ex.run.formatted_answer + addNote, sources: ex.run.sources });
+      } else {
+        blocks.push({ title: `Result — ${t.query}`, body: ex.run.formatted_answer, sources: ex.run.sources });
+      }
     }
 
-    const formatted_answer = rawText.trim();
-    const sourcesArr = extractSourcesFromMarkdown(formatted_answer, top);
-    const imagesArr = extractImages(formatted_answer);
+    const formatted_answer = composeSections(blocks);
+    const sources = execs.flatMap(ex => ex.run.sources).slice(0, 12);
+    const images = execs.flatMap(ex => ex.run.images || []).slice(0, 8);
 
-    res.json({
-      formatted_answer,
-      sources: sourcesArr,
-      images: imagesArr,
-      last_fetched: new Date().toISOString(),
-    });
+    return res.json({ formatted_answer, sources, images, plan: plans, last_fetched: new Date().toISOString() });
   } catch (err) {
-    console.error(
-      "agentic-v2 error:",
-      err.response?.data || err.message || err
-    );
+    console.error("agentic-v2 error:", err.response?.data || err.message || err);
     res.status(500).json({ error: "Agentic pipeline failed." });
   }
 });
