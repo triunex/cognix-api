@@ -645,6 +645,33 @@ function checkConfidence(newResults, query) {
   return Math.min(1, frac * 1.25); // scale up slightly
 }
 
+// ----- Intent Classifier -----
+function classifyIntent(q) {
+  q = String(q || "").toLowerCase();
+  if (q.includes("news") || /\d{4}/.test(q)) return "news";
+  if (q.includes("transcript") || q.includes("speech") || q.includes("launch"))
+    return "transcript";
+  if (q.includes("paper") || q.includes("theorem") || q.includes("research"))
+    return "science";
+  if (q.includes("in india") || q.includes("mainpuri") || q.includes("near me"))
+    return "local";
+  return "general";
+}
+
+// ----- Query Expansion -----
+function expandQuery(q, intent) {
+  const queries = [q];
+  if (intent === "news")
+    queries.push(`${q} site:indiatimes.com`, `${q} site:reuters.com`);
+  if (intent === "transcript")
+    queries.push(`${q} site:youtube.com`, `${q} site:archive.org`);
+  if (intent === "science")
+    queries.push(`${q} site:arxiv.org`, `${q} site:nature.com`);
+  if (intent === "local")
+    queries.push(`${q} site:amarujala.com`, `${q} site:hindustantimes.com`);
+  return queries;
+}
+
 app.post("/api/search", async (req, res) => {
   const query = req.body.query;
 
@@ -2326,6 +2353,151 @@ ${context}
         chunks,
         rawTop: top,
       };
+    }
+
+    // --- Infinity / multi-hop mode ---
+    if (req.body && req.body.infinity) {
+      // classify and expand
+      const intent = classifyIntent(query);
+      const subQueries = expandQuery(query, intent);
+
+      let mergedChunks = [];
+      let mergedTop = [];
+
+      for (const sq of subQueries) {
+        try {
+          const run = await runUnifiedOnce(sq, { maxWeb, topChunks });
+          if (Array.isArray(run.chunks)) mergedChunks.push(...run.chunks);
+          if (Array.isArray(run.rawTop)) mergedTop.push(...run.rawTop);
+        } catch (e) {
+          console.warn(
+            "runUnifiedOnce failed for subquery",
+            sq,
+            e?.message || e
+          );
+        }
+      }
+
+      if (mergedChunks.length === 0) {
+        return res.json({
+          formatted_answer: "I couldn't fetch enough content for this query.",
+          sources: [],
+          images: [],
+          last_fetched: new Date().toISOString(),
+        });
+      }
+
+      const allTexts = [
+        query,
+        ...mergedChunks.map((c) => c.text.substring(0, 2000)),
+      ];
+      const allEmbeddings = await getEmbeddingsGemini(allTexts);
+      const qEmb = allEmbeddings[0];
+      const chunkEmbeddings = allEmbeddings.slice(1);
+
+      const sims2 = chunkEmbeddings.map((emb, i) => ({
+        i,
+        score: cosineSim(emb, qEmb),
+      }));
+      sims2.sort((a, b) => b.score - a.score);
+      const pick = Math.min(topChunks, sims2.length);
+      const topChunksPicked = sims2
+        .slice(0, pick)
+        .map((s) => ({ chunk: mergedChunks[s.i], score: s.score }));
+
+      const contextPartsInf = topChunksPicked.map((t, idx) => {
+        const s = t.chunk.source || {};
+        const label =
+          s.type === "web"
+            ? `${s.title} — ${s.url}`
+            : s.type === "twitter"
+            ? `Twitter (${s.id})`
+            : s.type === "reddit"
+            ? `Reddit (${s.subreddit})`
+            : `Other Source`;
+        return `Source ${idx + 1}: ${label}\nExcerpt:\n${t.chunk.text.slice(
+          0,
+          1200
+        )}\n---\n`;
+      });
+      const contextInf = contextPartsInf.join("\n");
+
+      const finalPromptInf = `
+You are Nelieo AI, the most advanced research assistant.
+Always reply in well-formatted Markdown.
+Always include sources (with direct URLs).
+Never hallucinate. If data missing, say it clearly.
+
+STRUCTURE:
+# Title
+## Abstract (2-3 lines overview)
+## Background
+## Key Findings / Answer
+## Analysis
+## Conclusion
+
+If the query is news → show headlines with date, outlet, link.
+If transcript → show verified excerpt and link to video/transcript.
+If science → explain rigorously, as if to PhD students.
+
+USER QUERY: ${query}
+
+CONTEXT:
+${contextInf}
+`;
+
+      const geminiRespInf = await axios.post(
+        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          contents: [{ role: "user", parts: [{ text: finalPromptInf }] }],
+          generationConfig: {
+            temperature: 0.7,
+            topP: 0.9,
+            maxOutputTokens: 1500,
+          },
+        },
+        { headers: { "Content-Type": "application/json" } }
+      );
+
+      const rawTextInf =
+        geminiRespInf.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+      function extractSourcesFromMarkdownLocal(md = "") {
+        const sources = [];
+        const seen = new Set();
+        const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+        let m;
+        while ((m = linkRe.exec(md))) {
+          const title = m[1].trim();
+          const url = m[2].trim();
+          if (!seen.has(url)) {
+            sources.push({ title, url });
+            seen.add(url);
+          }
+        }
+        return sources.slice(0, 12);
+      }
+      function extractImagesLocal(md = "") {
+        const out = [];
+        const seen = new Set();
+        const imgRe = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g;
+        let m;
+        while ((m = imgRe.exec(md))) {
+          const url = m[1].trim();
+          if (!seen.has(url)) {
+            out.push(url);
+            seen.add(url);
+          }
+        }
+        return out.slice(0, 8);
+      }
+
+      return res.json({
+        formatted_answer: rawTextInf.trim(),
+        sources: extractSourcesFromMarkdownLocal(rawTextInf),
+        images: extractImagesLocal(rawTextInf),
+        last_fetched: new Date().toISOString(),
+      });
     }
 
     // 1) Split multi-intent
