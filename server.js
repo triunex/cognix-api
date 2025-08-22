@@ -24,10 +24,11 @@ const app = express();
 // --- Arsenal config store (simple in-memory map; replace with DB later) ---
 const arsenalStore = new Map(); // key: userId, value: ArsenalConfig
 
-// More explicit CORS handling to resolve preflight issues
+// More explicit CORS handling to resolve preflight issues (add x-user-id header)
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin === "http://localhost:8080") {
+  const allowedOrigins = ["http://localhost:8080", "http://localhost:5173"];
+  if (origin && allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader(
@@ -36,14 +37,16 @@ app.use((req, res, next) => {
   );
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "X-Requested-With,content-type,Authorization"
+    [
+      "X-Requested-With",
+      "Content-Type",
+      "Authorization",
+      "x-user-id",
+      "x-user-id", // ensure lowercase variant covered
+    ].join(",")
   );
-  res.setHeader("Access-Control-Allow-Credentials", true);
-
-  // Intercept OPTIONS method for preflight
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
