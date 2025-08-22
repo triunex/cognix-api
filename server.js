@@ -1014,61 +1014,7 @@ async function searchReddit(query, maxResults = 6) {
       };
     }
 
-    // SSE endpoint: runs deep research and streams progress + final data
-    app.get("/api/deepresearch/stream", async (req, res) => {
-      const endHeartbeat = sseInit(res);
-      const query = req.query.query?.toString() || "";
-      const depth = req.query.depth?.toString() || "phd";
-      const max_time = Number(req.query.max_time || 300);
-      const rounds = Number(req.query.rounds || 3);
-      const maxWeb = Number(req.query.maxWeb || 24);
-      const sources = req.query.sources
-        ? String(req.query.sources).split(",")
-        : ["web", "news", "wikipedia", "reddit", "twitter", "youtube", "arxiv"];
-
-      if (!query) {
-        sseSend(res, "error", { error: "Missing query" });
-        res.end();
-        endHeartbeat();
-        return;
-      }
-
-      try {
-        sseSend(res, "start", { query, depth, rounds, max_time });
-
-        const result = await runDeepResearchWithHooks({
-          query,
-          max_time,
-          depth,
-          rounds,
-          maxWeb,
-          sources,
-          onStage: (stage, payload) =>
-            sseSend(res, "stage", { stage, ...payload }),
-          onMetrics: (m) => sseSend(res, "metrics", m),
-        });
-
-        sseSend(res, "answer", {
-          formatted_answer: result.formatted_answer,
-          sources: result.sourcesArr,
-          images: result.imagesArr,
-          meta: result.meta,
-          last_fetched: new Date().toISOString(),
-        });
-
-        sseSend(res, "done", { ok: true });
-        res.end();
-        endHeartbeat();
-      } catch (err) {
-        console.error(
-          "deepresearch/stream error:",
-          err?.response?.data || err.message || err
-        );
-        sseSend(res, "error", { error: "DeepResearch pipeline failed." });
-        res.end();
-        endHeartbeat();
-      }
-    });
+  // (nested SSE route definition removed; replaced by top-level later)
     const posts =
       (resp.data?.data?.children || []).map((c) => ({
         id: c.data.id,
@@ -1797,10 +1743,20 @@ app.post("/api/arsenal", async (req, res) => {
     const wantsSmart = featureNames.includes("Smart Search");
     const wantsPhD = featureNames.includes("Explain Like PhD");
 
-    if (wantsSmart || wantsDeep) {
-      const payload = wantsDeep
-        ? { query, maxWeb: 15, topChunks: 20 }
-        : { query };
+    if (wantsDeep) {
+      // Forward deep research requests to the internal deepresearch pipeline
+      const base = `http://localhost:${process.env.PORT || 10000}`;
+      const payload = { query, max_time: 300, depth: "phd", maxWeb: 24, rounds: 3 };
+      console.log("[arsenal] calling deepresearch", payload);
+      try {
+        const deepResp = await axios.post(`${base}/api/deepresearch`, payload, { timeout: 1000 * 60 * 5 });
+        response = deepResp.data || {};
+      } catch (e) {
+        console.error("[arsenal] deepresearch failed", e.response?.status, e.response?.data || e.message);
+        response = { answer: "DeepResearch failed", error: e.message };
+      }
+    } else if (wantsSmart) {
+      const payload = { query };
       // Call backend directly (not via Vite dev server) using current process PORT
       const base = `http://localhost:${process.env.PORT || 10000}`;
       console.log("[arsenal] calling agentic-v2", payload);
@@ -2176,6 +2132,114 @@ Make the language cinematic, vivid, and supply scene-level prompts that will res
     });
   }
 });
+
+// ---------------- Re-added Deep Research Streaming SSE Route (top-level) ----------------
+// Provides progressive deep research events (start, stage, metrics, answer, done, error)
+// without altering existing logic elsewhere. Self-contained helpers to avoid scoping issues.
+if (!app._router?.stack?.some(r => r.route && r.route.path === '/api/deepresearch/stream')) {
+  app.get('/api/deepresearch/stream', async (req, res) => {
+    // --- SSE init ---
+    function sseInit(res) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+      const ping = setInterval(() => {
+        try { res.write('event: ping\ndata: {}\n\n'); } catch {}
+      }, 15000);
+      return () => clearInterval(ping);
+    }
+    function sseSend(res, type, payload) {
+      try {
+        res.write(`event: ${type}\n`);
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      } catch {}
+    }
+    const endHeartbeat = sseInit(res);
+    const query = req.query.query?.toString() || '';
+    const depth = req.query.depth?.toString() || 'phd';
+    const max_time = Number(req.query.max_time || 300);
+    const rounds = Number(req.query.rounds || 3);
+    const maxWeb = Number(req.query.maxWeb || 24);
+    const sources = req.query.sources ? String(req.query.sources).split(',') : ['web','news','wikipedia','reddit','twitter','youtube','arxiv'];
+    if (!query) { sseSend(res, 'error', { error: 'Missing query' }); res.end(); endHeartbeat(); return; }
+
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    async function runDeepResearchWithHooks(opts) {
+      const { query, max_time=300, depth='phd', maxWeb=24, rounds=3, sources=['web','news','wikipedia','reddit','twitter','youtube','arxiv'], onStage=()=>{}, onMetrics=()=>{} } = opts;
+      const deadline = Date.now() + clamp(max_time, 60, 420) * 1000;
+      const timeLeft = () => Math.max(0, deadline - Date.now());
+      const withTimeout = (p, ms) => Promise.race([p, new Promise((_,r)=>setTimeout(()=>r(new Error('timeout')), ms))]);
+      const normalizeUrl = (u) => { try { const url = new URL(u); url.hash=''; url.searchParams.sort(); return url.toString(); } catch { return u; } };
+      const pushUnique = (arr, items, key=(x)=>x) => { const seen=new Set(arr.map(x=>key(x))); for(const it of items||[]){ const k=key(it); if(k && !seen.has(k)){ arr.push(it); seen.add(k);} } return arr; };
+      let serpOrganic=[], newsHits=[], wiki=[], reddit=[], tweets=[], youtube=[], arxiv=[], pages=[]; let round=0;
+      const strongEnough=()=>{ const combined=[...serpOrganic,...newsHits,...wiki,...reddit,...tweets,...youtube,...arxiv]; const c=checkConfidence(combined, query); const diversity=(serpOrganic.length>3?1:0)+(newsHits.length>2?1:0)+(wiki.length>0?1:0)+(reddit.length>0?1:0)+(tweets.length>0?1:0)+(youtube.length>0?1:0)+(arxiv.length>0?1:0); return c>=0.86 && diversity>=3; };
+      function expandQueries(base){ const y=new Date().getFullYear(); return [base,`"${base}"`,`${base} site:wikipedia.org`,`${base} site:arxiv.org`,`${base} filetype:pdf`,`${base} ${y}`,`${base} explained`]; }
+      onStage('init',{ query, depth, rounds });
+      const qVariants=expandQueries(query);
+      while(round<rounds && timeLeft()>2000 && !strongEnough()){
+        const qNow=qVariants[Math.min(round, qVariants.length-1)];
+        onStage('collect',{ round: round+1, query: qNow });
+        const tasks=[];
+        if(sources.includes('web')){
+          tasks.push((async()=>{ try { const resp = await withTimeout(axios.get('https://serpapi.com/search',{ params:{ engine:'google', q:qNow, api_key: process.env.SERPAPI_API_KEY}, timeout: Math.min(9000,timeLeft()) }), Math.min(10000,timeLeft())); const org=(resp?.data?.organic_results||[]).slice(0,maxWeb); pushUnique(serpOrganic, org, r=>normalizeUrl(r.link)); } catch {} })());
+          tasks.push((async()=>{ try { const extras=await runExtraSearches(qNow,['bing','duckduckgo']); for(const e of extras||[]) if(e?.organic_results) pushUnique(serpOrganic, e.organic_results.slice(0,12), r=>normalizeUrl(r.link)); } catch {} })());
+        }
+        if(sources.includes('news')) tasks.push((async()=>{ const items=await (async function fetchGoogleNews(q,n=12){ try { const resp=await withTimeout(axios.get('https://serpapi.com/search',{ params:{ engine:'google_news', q, api_key: process.env.SERPAPI_API_KEY}, timeout: Math.min(10000,timeLeft()) }), Math.min(11000,timeLeft())); return (resp?.data?.news_results||[]).slice(0,n).map(r=>({ title:r.title, link:r.link, date:r.date, snippet:r.snippet })); } catch { return []; } })(qNow,12); pushUnique(newsHits, items, r=>normalizeUrl(r.link)); })());
+        if(sources.includes('twitter')) tasks.push(searchTwitterRecent(qNow,10).then(x=>{ if(x) tweets=x; }).catch(()=>{}));
+        if(sources.includes('reddit')) tasks.push(searchReddit(qNow,10).then(x=>{ if(x) reddit=x; }).catch(()=>{}));
+        if(sources.includes('youtube')) tasks.push(searchYouTube(qNow,8).then(x=>{ if(x) youtube=x; }).catch(()=>{}));
+        if(sources.includes('wikipedia')) tasks.push(searchWikipedia(qNow).then(x=>{ if(x) wiki=x; }).catch(()=>{}));
+        if(sources.includes('arxiv')) tasks.push((async()=>{ const x=await (async function fetchArxiv(q,n=6){ try { const url=`http://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(q)}&start=0&max_results=${n}`; const resp=await withTimeout(axios.get(url,{ timeout: Math.min(10000,timeLeft()) }), Math.min(11000,timeLeft())); const xml=resp?.data||''; const entries=[]; const entryRe=/<entry>([\s\S]*?)<\/entry>/g; let m; while((m=entryRe.exec(xml))){ const block=m[1]; const title=(block.match(/<title>([\s\S]*?)<\/title>/)||[])[1]?.trim().replace(/\s+/g,' '); const link=(block.match(/<link[^>]*href="([^"]+)"/ )||[])[1]; if(title && link) entries.push({ title, link, snippet:'arXiv paper' }); } return entries.slice(0,n); } catch { return []; } })(qNow,6); if(x) arxiv=x; })().catch(()=>{}));
+        await Promise.allSettled(tasks);
+        onMetrics({ round: round+1, serp: serpOrganic.length, news: newsHits.length, wiki: wiki.length, reddit: reddit.length, tweets: tweets.length, youtube: youtube.length, arxiv: arxiv.length });
+        onStage('reading',{ round: round+1 });
+        const linkCards=[...(serpOrganic||[]).slice(0,26).map(r=>({ title:r.title, link:r.link, snippet:r.snippet })), ...(newsHits||[]).slice(0,16).map(r=>({ title:r.title, link:r.link, snippet:r.snippet })), ...(arxiv||[]).slice(0,8).map(r=>({ title:r.title, link:r.link, snippet:r.snippet }))];
+        const links=linkCards.map(l=>({ ...l, link: normalizeUrl(l.link)})).filter((v,i,a)=>a.findIndex(x=>x.link===v.link)===i);
+        const fetchBudget=Math.min(16, Math.max(6, Math.floor(timeLeft()/1500)));
+        const toGrab=links.slice(0,fetchBudget);
+        const fetched=await Promise.allSettled(toGrab.map(l=>fetchPageTextFast(l.link).catch(()=>null)));
+        for(let i=0;i<fetched.length;i++){ const v=fetched[i], meta=toGrab[i]; if(v.status==='fulfilled' && v.value && (v.value.text||v.value.title)) pages.push({ ...v.value, url: meta.link, title: v.value.title || meta.title }); }
+        onMetrics({ pages: pages.length });
+        round++;
+      }
+      onStage('ranking',{ pages: pages.length });
+      let chunks=[]; for(const p of pages){ const txt=(p?.text||'').trim(); if(txt && txt.length>200){ const cs=chunkText(txt,1800).map(c=>({ ...c, source:{ type:'web', url:p.url, title:p.title }})); chunks=chunks.concat(cs); } }
+      for(const arr of [ (newsHits||[]).map(n=>({ text:`${n.title}\n\n${n.snippet||''}`.slice(0,1800), source:{ type:'news', url:n.link, title:n.title, date:n.date }})), (wiki||[]).map(w=>({ text:`${w.title}\n\n${w.snippet||''}`.slice(0,1800), source:{ type:'wiki', url:w.url, title:w.title }})), (reddit||[]).map(r=>({ text:`${r.title}\n\n${r.text||''}`.slice(0,1800), source:{ type:'reddit', url:r.url, subreddit:r.subreddit }})), (tweets||[]).map(t=>({ text:t.text, source:{ type:'twitter', id:t.id, created_at:t.created_at }})), (youtube||[]).map(y=>({ text:`${y.title}\n\n${y.description||''}`.slice(0,1800), source:{ type:'youtube', url:y.url, title:y.title }})), (arxiv||[]).map(a=>({ text:`${a.title}\n\n${a.snippet||''}`.slice(0,1800), source:{ type:'arxiv', url:a.link, title:a.title }})) ]) { for(const c of arr) chunks.push({ id: crypto.randomUUID(), ...c }); }
+      if(!chunks.length){ return { formatted_answer:'No sufficient material found within time budget.', sourcesArr:[], imagesArr:[], meta:{ rounds_executed: round, pages_fetched: pages.length, chunks_ranked: 0 } }; }
+      const allTexts=[query, ...chunks.map(c=>c.text.slice(0,2000))];
+      const embs=await withTimeout(getEmbeddingsGemini(allTexts), Math.min(25000,timeLeft()));
+      const qEmb=embs[0], cEmbs=embs.slice(1);
+      const scored=cEmbs.map((e,i)=>({ i, score: cosineSim(e,qEmb)})).sort((a,b)=>b.score-a.score);
+      const keepN = depth==='phd'?36: depth==='detailed'?24:12;
+      const top=scored.slice(0, Math.min(keepN, scored.length)).map(s=>({ chunk: chunks[s.i], score: s.score }));
+      const context=top.map((t,idx)=>{ const s=t.chunk.source||{}; const label = s.type==='web'? `${s.title||'Web'} — ${s.url}` : s.type==='news'? `${s.title||'News'} — ${s.url}` : s.type==='reddit'? `Reddit (${s.subreddit||''}) — ${s.url}` : s.type==='twitter'? `Twitter (${s.id})` : s.type==='youtube'? `YouTube — ${s.url}` : s.type==='wiki'? `Wikipedia — ${s.url}` : s.type==='arxiv'? `arXiv — ${s.url}` : s.url || 'Source'; return `Source ${idx+1}: ${label}\nExcerpt:\n${t.chunk.text}\n---\n`; }).join('\n');
+      onStage('writing',{ topChunks: top.length });
+      const maxTokens = depth==='phd'?2048: depth==='detailed'?1400:1000;
+      const gemResp = await withTimeout(axios.post(`https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, { contents:[{ role:'user', parts:[{ text: `You are Nelieo Deep Research. Produce a rigorously sourced answer...\nUSER QUESTION:\n${query}\nWRITING STYLE:\n${depth}\nCONTEXT:\n${context}` }]}], generationConfig:{ temperature:0.5, topP:0.9, maxOutputTokens: maxTokens } }, { headers:{ 'Content-Type':'application/json' }, timeout: Math.min(28000,timeLeft()) }), Math.min(30000,timeLeft()));
+      const rawText = gemResp?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+      function extractSourcesFromMarkdown(md, fallbackTop){ const sources=[]; const seen=new Set(); const linkRe=/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g; let m; while((m=linkRe.exec(md))){ const title=m[1].trim(); const url=m[2].trim(); if(!seen.has(url)){ sources.push({ title, url }); seen.add(url);} } if(sources.length===0 && Array.isArray(fallbackTop)){ for(const t of fallbackTop){ const s=t.chunk.source; if(s?.url && !seen.has(s.url)){ sources.push({ title: s.title||s.type||s.url, url: s.url }); seen.add(s.url);} } } return sources.slice(0,15); }
+      function extractImages(md){ const out=[]; const seen=new Set(); const imgRe=/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g; let m; while((m=imgRe.exec(md))){ const url=m[1].trim(); if(!seen.has(url)){ out.push(url); seen.add(url);} } return out.slice(0,6); }
+      const formatted_answer = rawText || 'No answer produced within time budget.';
+      const sourcesArr = extractSourcesFromMarkdown(formatted_answer, top);
+      const imagesArr = extractImages(formatted_answer);
+      return { formatted_answer, sourcesArr, imagesArr, meta:{ rounds_executed: round, pages_fetched: pages.length, chunks_ranked: chunks.length } };
+    }
+
+    try {
+      sseSend(res,'start',{ query, depth, rounds, max_time });
+      const result = await runDeepResearchWithHooks({ query, max_time, depth, rounds, maxWeb, sources, onStage:(stage,payload)=>sseSend(res,'stage',{ stage, ...payload }), onMetrics:(m)=>sseSend(res,'metrics',m) });
+      sseSend(res,'answer',{ formatted_answer: result.formatted_answer, sources: result.sourcesArr, images: result.imagesArr, meta: result.meta, last_fetched: new Date().toISOString() });
+      sseSend(res,'done',{ ok:true });
+      res.end(); endHeartbeat();
+    } catch(err){
+      console.error('deepresearch/stream error:', err?.response?.data || err.message || err);
+      sseSend(res,'error',{ error:'DeepResearch pipeline failed.' });
+      res.end(); endHeartbeat();
+    }
+  });
+}
 
 app.listen(10000, () => console.log("Server running on port 10000"));
 
