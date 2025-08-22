@@ -21,6 +21,9 @@ dotenv.config();
 
 const app = express();
 
+// --- Arsenal config store (simple in-memory map; replace with DB later) ---
+const arsenalStore = new Map(); // key: userId, value: ArsenalConfig
+
 // More explicit CORS handling to resolve preflight issues
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -444,7 +447,7 @@ async function getEmbeddingsGemini(texts = []) {
     };
     const resp = await axios.post(url, body, {
       headers: { "Content-Type": "application/json" },
-    });
+    });0
     return (resp.data?.embeddings || []).map((e) => e.values);
   } catch (e) {
     console.error("Gemini embeddings error:", e.response?.data || e.message);
@@ -1633,6 +1636,191 @@ app.get("/api/warm-gemini", async (req, res) => {
     return res.status(500).send("Error");
   }
 });
+
+// ------------- Arsenal Config API -------------
+app.get("/api/arsenal-config", async (req, res) => {
+  try {
+    const userId = req.headers["x-user-id"] || "demo"; // plug your auth here
+    const cfg = arsenalStore.get(userId) || {
+      features: { deepResearch: false, smartSearch: true, explainLikePhD: false },
+      apps: { gmail: false, reddit: false, twitter: false, youtube: false, notion: false, whatsapp: false },
+    };
+    res.json({ ok: true, config: cfg });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "Failed to load arsenal config" });
+  }
+});
+
+app.post("/api/arsenal-config", async (req, res) => {
+  try {
+    const userId = req.headers["x-user-id"] || "demo";
+    const cfg = req.body?.config;
+    if (!cfg) return res.status(400).json({ ok: false, error: "Missing config" });
+    arsenalStore.set(userId, cfg);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "Failed to save arsenal config" });
+  }
+});
+
+// ------------- Arsenal Orchestrator -------------
+app.post("/api/arsenal", async (req, res) => {
+  const { query, overrideConfig } = req.body || {};
+  const userId = req.headers["x-user-id"] || "demo";
+  if (!query) return res.status(400).json({ error: "Missing query" });
+
+  try {
+    const cfg = overrideConfig || arsenalStore.get(userId) || {
+      features: { deepResearch: false, smartSearch: true, explainLikePhD: false },
+      apps: { gmail: false, reddit: false, twitter: false, youtube: false, notion: false, whatsapp: false },
+    };
+
+    // fan-out calls based on config
+    const tasks = [];
+
+    // Features
+    if (cfg.features?.smartSearch) {
+      tasks.push(callAgenticV2(query));
+    }
+    if (cfg.features?.deepResearch) {
+      tasks.push(callDeepResearch(query));
+    }
+    if (cfg.features?.explainLikePhD) {
+      tasks.push(callExplainLikePhD(query));
+    }
+
+    // Apps (stubs you can wire to OAuth later)
+    if (cfg.apps?.gmail)   tasks.push(callGmail(query));
+    if (cfg.apps?.reddit)  tasks.push(callReddit(query));
+    if (cfg.apps?.twitter) tasks.push(callTwitter(query));
+    if (cfg.apps?.youtube) tasks.push(callYouTube(query));
+    if (cfg.apps?.notion)  tasks.push(callNotion(query));
+
+    const results = await Promise.allSettled(tasks);
+    const merged = mergeArsenalResults(results);
+
+    res.json(merged);
+  } catch (err) {
+    console.error("arsenal error:", err?.response?.data || err.message || err);
+    res.status(500).json({ error: "Arsenal pipeline failed." });
+  }
+});
+
+// ---- helpers (minimal, non-destructive) ----
+async function callAgenticV2(query) {
+  try {
+    const resp = await axios.post("http://localhost:3000/api/agentic-v2", { query, maxWeb: 8, topChunks: 10 }, { timeout: 20000 });
+    return { tag: "smartSearch", ok: true, data: resp.data };
+  } catch (e) {
+    return { tag: "smartSearch", ok: false, error: e.message };
+  }
+}
+
+async function callDeepResearch(query) {
+  // v1: call agentic-v2 twice with small refinements; v2: replace with your multi-hop pipeline
+  const subQueries = [
+    query,
+    `${query} site:gov.in OR site:nic.in`,
+    `${query} after:2024`,
+  ];
+  const calls = subQueries.map(q =>
+    axios.post("http://localhost:3000/api/agentic-v2", { query: q, maxWeb: 10, topChunks: 12 }, { timeout: 20000 })
+      .then(r => r.data)
+      .catch(() => null)
+  );
+  const batch = (await Promise.all(calls)).filter(Boolean);
+  return { tag: "deepResearch", ok: true, data: batch };
+}
+
+async function callExplainLikePhD(query) {
+  // v1: use Gemini with a fixed “academic” prompt; feel free to swap to your LLM
+  const prompt = `
+You are Nelieo AI (Arsenal: Explain Like PhD). Write a rigorous, well-cited academic explanation for:
+
+"${query}"
+
+Structure:
+- Abstract (3–4 sentences)
+- Background (concise)
+- Core Explanation (step-by-step; math in LaTeX if needed)
+- Counterpoints & Limitations
+- Further Reading (bullet list)
+
+Keep it under 700 words unless topic demands more. 
+  `.trim();
+
+  try {
+    const resp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      { contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 900 } },
+      { headers: { "Content-Type": "application/json" }, timeout: 20000 }
+    );
+    const text = resp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    return { tag: "explainLikePhD", ok: true, data: { formatted_answer: text } };
+  } catch (e) {
+    return { tag: "explainLikePhD", ok: false, error: e.message };
+  }
+}
+
+// --- app stubs (replace with real integrations later) ---
+async function callGmail(query)   { return { tag: "gmail",   ok: true, data: { items: [], note: "Gmail integration stub" } }; }
+async function callReddit(query)  { return { tag: "reddit",  ok: true, data: { items: [], note: "Reddit integration stub" } }; }
+async function callTwitter(query) { return { tag: "twitter", ok: true, data: { items: [], note: "Twitter integration stub" } }; }
+async function callYouTube(query) { return { tag: "youtube", ok: true, data: { items: [], note: "YouTube integration stub" } }; }
+async function callNotion(query)  { return { tag: "notion",  ok: true, data: { items: [], note: "Notion integration stub" } }; }
+
+// --- merge to pretty markdown (keeps each section distinct) ---
+function mergeArsenalResults(resultsSettled) {
+  const sections = [];
+  const sources = new Set();
+  let images = [];
+
+  const pushSection = (title, body) => {
+    if (!body) return;
+    sections.push(`## ${title}\n\n${body.trim()}`);
+  };
+
+  for (const r of resultsSettled) {
+    if (r.status !== "fulfilled") continue;
+    const { tag, ok, data } = r.value || {};
+    if (!ok) continue;
+
+    if (tag === "smartSearch" && data?.formatted_answer) {
+      pushSection("⚡ Smart Search", data.formatted_answer);
+      (data.sources || []).forEach(s => s?.url && sources.add(s.url));
+      images = images.concat(data.images || []);
+    }
+
+    if (tag === "deepResearch") {
+      const blocks = (data || []).map((d, i) => {
+        (d?.sources || []).forEach(s => s?.url && sources.add(s.url));
+        return d?.formatted_answer ? `**Pass ${i + 1}:**\n\n${d.formatted_answer}\n` : "";
+      }).filter(Boolean).join("\n---\n");
+      pushSection("🧠 Deep Research", blocks || "_No deep results_");
+    }
+
+    if (tag === "explainLikePhD") {
+      pushSection("🎓 Explain Like PhD", data?.formatted_answer || "");
+    }
+
+    if (tag === "gmail")   pushSection("📧 Gmail",   data?.note || "—");
+    if (tag === "reddit")  pushSection("🧵 Reddit",  data?.note || "—");
+    if (tag === "twitter") pushSection("🐦 Twitter", data?.note || "—");
+    if (tag === "youtube") pushSection("📺 YouTube", data?.note || "—");
+    if (tag === "notion")  pushSection("📒 Notion",  data?.note || "—");
+  }
+
+  const markdown = [
+    `# Arsenal Answer`,
+    sections.join("\n\n---\n\n"),
+    sources.size
+      ? `\n---\n\n### Sources\n${[...sources].slice(0, 12).map(u => `- ${u}`).join("\n")}`
+      : "",
+  ].join("\n\n");
+
+  return { formatted_answer: markdown, images: [...new Set(images)].slice(0, 6) };
+}
+
 
 // Replace the generatePdfHtml function with the improved version
 function generatePdfHtml(content, style = "normal") {
