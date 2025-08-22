@@ -1178,48 +1178,103 @@ app.get("/api/article", async (req, res) => {
   }
 });
 
-app.post("/api/summarize-article", async (req, res) => {
-  const { content } = req.body;
-  if (!content)
-    return res.status(400).json({ error: "Missing article content." });
-
-  const prompt = `
-Summarize the following article into a concise, friendly summary with clear bullet points:
-Avoid using hashtags (#), asterisks (*), or markdown symbols.
-
-${content}
-`;
+app.post("/api/arsenal", async (req, res) => {
+  const { query, arsenalConfig } = req.body || {};
+  if (!query) return res.status(400).json({ error: "Missing query" });
+  const userId = req.headers["x-user-id"] || "demo";
 
   try {
-    const geminiRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
-    );
+    console.log("[arsenal] inbound", { query, hasConfig: !!arsenalConfig });
+    // Normalize features list (accept either array of names OR boolean feature object from stored config)
+    let featureNames = Array.isArray(arsenalConfig?.features)
+      ? arsenalConfig.features
+      : [];
 
-    const reply = geminiRes.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    res.json({ summary: reply });
+    if (featureNames.length === 0) {
+      // Try boolean style passed inline
+      const boolObj =
+        arsenalConfig?.features && !Array.isArray(arsenalConfig.features)
+          ? arsenalConfig.features
+          : null;
+      // Or pull from stored config
+      const stored = arsenalStore.get(userId);
+      const src = boolObj || stored?.features;
+      if (src) {
+        if (src.smartSearch) featureNames.push("Smart Search");
+        if (src.deepResearch) featureNames.push("Deep Research");
+        if (src.explainLikePhD) featureNames.push("Explain Like PhD");
+      }
+    }
+
+    // Choose precedence order: Deep Research > Smart Search > Explain Like PhD (or adjust)
+    let response; // will become object with answer / formatted_answer
+
+    const wantsDeep = featureNames.includes("Deep Research");
+    const wantsSmart = featureNames.includes("Smart Search");
+    const wantsPhD = featureNames.includes("Explain Like PhD");
+
+    if (wantsSmart || wantsDeep) {
+      const payload = wantsDeep
+        ? { query, maxWeb: 15, topChunks: 20 }
+        : { query };
+      // Call backend directly (not via Vite dev server) using current process PORT
+      const base = `http://localhost:${process.env.PORT || 10000}`;
+      console.log("[arsenal] calling agentic-v2", payload);
+      try {
+        const agenticResp = await axios.post(`${base}/api/agentic-v2`, payload);
+        response = agenticResp.data || {};
+      } catch (e) {
+        console.error(
+          "[arsenal] agentic-v2 failed",
+          e.response?.status,
+          e.response?.data || e.message
+        );
+        response = { answer: "Agentic search failed", error: e.message };
+      }
+    } else if (wantsPhD) {
+      const phDPrompt = `Explain the following as if you are writing a PhD dissertation:\n\n"${query}"`;
+      const geminiResp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          contents: [{ role: "user", parts: [{ text: phDPrompt }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+        }
+      );
+      response = {
+        answer:
+          geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "",
+      };
+    } else {
+      response = { answer: "No matching Arsenal feature selected." };
+    }
+
+    // Ensure unified shape for frontend (ChatPage expects formatted_answer)
+    if (response && typeof response === "object") {
+      const fallback =
+        response.answer ||
+        response.formatted_answer ||
+        response.content ||
+        response.text ||
+        response.reply ||
+        "";
+      if (!response.formatted_answer) response.formatted_answer = fallback;
+      if (!response.answer) response.answer = fallback;
+    }
+
+    res.json(response);
   } catch (err) {
-    console.error("Gemini summarization error:", err.message);
-    res.status(500).json({ error: "Could not summarize article." });
+    console.error("Arsenal error:", err?.response?.data || err.message || err);
+    res.status(500).json({ error: "Arsenal pipeline failed." });
   }
 });
-app.post("/api/vision", async (req, res) => {
-  const { image } = req.body;
-
+// Reconstructed vision describe endpoint (previous code fragment had lost its wrapper)
+app.post("/api/vision-describe", async (req, res) => {
+  const { image } = req.body || {};
   if (!image || typeof image !== "string") {
     return res.status(400).json({ error: "Missing or invalid image data." });
   }
-
   try {
     const base64Image = image.replace(/^data:image\/\w+;base64,/, "");
-
     const response = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
@@ -1240,13 +1295,8 @@ app.post("/api/vision", async (req, res) => {
           },
         ],
       },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
+      { headers: { "Content-Type": "application/json" } }
     );
-
     const reply =
       response.data.candidates?.[0]?.content?.parts?.[0]?.text ||
       "No description available.";
@@ -1669,12 +1719,10 @@ app.get("/api/arsenal-config", (req, res) => {
     res.json({ ok: true, config: cfg });
   } catch (e) {
     console.error("Arsenal GET error:", e);
-    res
-      .status(500)
-      .json({
-        ok: false,
-        error: e?.message || "Failed to load arsenal config",
-      });
+    res.status(500).json({
+      ok: false,
+      error: e?.message || "Failed to load arsenal config",
+    });
   }
 });
 
@@ -1691,66 +1739,62 @@ app.post("/api/arsenal-config", async (req, res) => {
   }
 });
 
-// ------------- Arsenal Orchestrator -------------
+// ------------- Arsenal Orchestrator (simplified implementation) -------------
 app.post("/api/arsenal", async (req, res) => {
-  const { query, overrideConfig } = req.body || {};
-  const userId = req.headers["x-user-id"] || "demo";
+  const { query, arsenalConfig } = req.body || {};
   if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
-    const cfg = overrideConfig ||
-      arsenalStore.get(userId) || {
-        features: {
-          deepResearch: false,
-          smartSearch: true,
-          explainLikePhD: false,
-        },
-        apps: {
-          gmail: false,
-          reddit: false,
-          twitter: false,
-          youtube: false,
-          notion: false,
-          whatsapp: false,
-        },
+    let response;
+
+    if (arsenalConfig?.features?.includes("Smart Search")) {
+      // Forward to Agentic V2
+      const agenticResp = await axios.post(
+        "http://localhost:8080/api/agentic-v2",
+        { query }
+      );
+      response = agenticResp.data;
+    } else if (arsenalConfig?.features?.includes("Deep Research")) {
+      // Call Agentic V2 but with longer depth
+      const agenticResp = await axios.post(
+        "http://localhost:8080/api/agentic-v2",
+        { query, maxWeb: 15, topChunks: 20 }
+      );
+      response = agenticResp.data;
+    } else if (arsenalConfig?.features?.includes("Explain Like PhD")) {
+      // Call Gemini with academic style
+      const phDPrompt = `Explain the following as if you are writing a PhD dissertation:\n\n"${query}"`;
+      const geminiResp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          contents: [{ role: "user", parts: [{ text: phDPrompt }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+        }
+      );
+      response = {
+        answer:
+          geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "",
       };
-
-    // fan-out calls based on config
-    const tasks = [];
-
-    // Features
-    if (cfg.features?.smartSearch) {
-      tasks.push(callAgenticV2(query));
-    }
-    if (cfg.features?.deepResearch) {
-      tasks.push(callDeepResearch(query));
-    }
-    if (cfg.features?.explainLikePhD) {
-      tasks.push(callExplainLikePhD(query));
+    } else {
+      response = { answer: "No matching Arsenal feature selected." };
     }
 
-    // Apps (stubs you can wire to OAuth later)
-    if (cfg.apps?.gmail) tasks.push(callGmail(query));
-    if (cfg.apps?.reddit) tasks.push(callReddit(query));
-    if (cfg.apps?.twitter) tasks.push(callTwitter(query));
-    if (cfg.apps?.youtube) tasks.push(callYouTube(query));
-    if (cfg.apps?.notion) tasks.push(callNotion(query));
-
-    const results = await Promise.allSettled(tasks);
-    const merged = mergeArsenalResults(results);
-
-    res.json(merged);
+    res.json(response);
   } catch (err) {
-    console.error("arsenal error:", err?.response?.data || err.message || err);
+    console.error("Arsenal error:", err.message);
     res.status(500).json({ error: "Arsenal pipeline failed." });
   }
 });
 
 // ---- helpers (minimal, non-destructive) ----
+// Base URL for internal agentic-v2 calls (avoid port mismatch). Falls back to this server's port.
+const AGENTIC_BASE =
+  process.env.AGENTIC_BASE_URL ||
+  `http://localhost:${process.env.PORT || 10000}`;
 async function callAgenticV2(query) {
   try {
     const resp = await axios.post(
-      "http://localhost:3000/api/agentic-v2",
+      `${AGENTIC_BASE}/api/agentic-v2`,
       { query, maxWeb: 8, topChunks: 10 },
       { timeout: 20000 }
     );
@@ -1770,7 +1814,7 @@ async function callDeepResearch(query) {
   const calls = subQueries.map((q) =>
     axios
       .post(
-        "http://localhost:3000/api/agentic-v2",
+        `${AGENTIC_BASE}/api/agentic-v2`,
         { query: q, maxWeb: 10, topChunks: 12 },
         { timeout: 20000 }
       )
