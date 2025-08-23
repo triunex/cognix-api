@@ -22,8 +22,38 @@ dotenv.config();
 
 const app = express();
 
-// --- Arsenal config store (simple in-memory map; replace with DB later) ---
+// --- Arsenal config store (file-backed fallback; replace with DB later) ---
+// Note: this is a lightweight persistence to help Render/dev instances keep
+// the config between restarts for short-lived deployments. For production
+// durability across deploys and instances prefer an external DB (Firestore,
+// Postgres, etc.).
+const ARSENAL_STORE_FILE = path.resolve("arsenal-store.json");
 const arsenalStore = new Map(); // key: userId, value: ArsenalConfig
+
+// Load existing store from disk if present (top-level await allowed)
+try {
+  const raw = await fs.readFile(ARSENAL_STORE_FILE, { encoding: "utf8" }).catch(() => null);
+  if (raw) {
+    try {
+      const obj = JSON.parse(raw || "{}");
+      for (const [k, v] of Object.entries(obj || {})) arsenalStore.set(k, v);
+      console.log("Loaded arsenal store from disk:", Object.keys(obj).length, "entries");
+    } catch (e) {
+      console.warn("arsenal-store.json parse failed, starting with empty store:", e.message);
+    }
+  }
+} catch (e) {
+  console.warn("Failed reading arsenal store file:", e?.message || e);
+}
+
+async function persistArsenalStore() {
+  try {
+    const obj = Object.fromEntries(arsenalStore);
+    await fs.writeFile(ARSENAL_STORE_FILE, JSON.stringify(obj, null, 2), { encoding: "utf8" });
+  } catch (e) {
+    console.error("Failed to persist arsenal store:", e?.message || e);
+  }
+}
 
 // More explicit CORS handling to resolve preflight issues (add x-user-id header)
 app.use((req, res, next) => {
@@ -3493,7 +3523,7 @@ app.get("/api/warm-gemini", async (req, res) => {
 });
 
 // ------------- Arsenal Config API -------------
-app.get("/api/arsenal-config", (req, res) => {
+app.get("/api/arsenal-config", async (req, res) => {
   try {
     const userId = req.headers["x-user-id"] || "demo"; // plug your auth here
 
@@ -3518,6 +3548,8 @@ app.get("/api/arsenal-config", (req, res) => {
     if (!cfg) {
       cfg = defaultCfg;
       arsenalStore.set(userId, cfg);
+      // persist the default for this user so deployed instances reflect it
+      persistArsenalStore().catch(() => {});
     }
 
     res.json({ ok: true, config: cfg });
@@ -3537,8 +3569,11 @@ app.post("/api/arsenal-config", async (req, res) => {
     if (!cfg)
       return res.status(400).json({ ok: false, error: "Missing config" });
     arsenalStore.set(userId, cfg);
+    // persist change to disk (best-effort)
+    await persistArsenalStore();
     res.json({ ok: true });
   } catch (e) {
+    console.error("Arsenal POST error:", e?.message || e);
     res.status(500).json({ ok: false, error: "Failed to save arsenal config" });
   }
 });
