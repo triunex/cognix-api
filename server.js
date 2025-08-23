@@ -2209,6 +2209,20 @@ if (
       return;
     }
 
+    // Quick diagnostics: ensure critical API keys are present on the host.
+    const missingKeys = [];
+    if (!process.env.GEMINI_API_KEY) missingKeys.push("GEMINI_API_KEY");
+    if (!process.env.SERPAPI_API_KEY) missingKeys.push("SERPAPI_API_KEY");
+    // YOUTUBE and X (twitter) are optional fallbacks but warn if none of social collectors available
+    if (missingKeys.length) {
+      sseSend(res, "error", {
+        error: `Missing server env vars: ${missingKeys.join(", ")}. Set them and redeploy.`,
+      });
+      res.end();
+      endHeartbeat();
+      return;
+    }
+
     function clamp(v, lo, hi) {
       return Math.max(lo, Math.min(hi, v));
     }
