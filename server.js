@@ -1318,6 +1318,7 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
 app.post("/api/voice-query", async (req, res) => {
   const query = req.body.query?.trim();
   const history = req.body.history || [];
+  const persona = req.body.persona || "default";
 
   if (!query) {
     return res.status(400).json({ error: "Missing voice input." });
@@ -1326,7 +1327,41 @@ app.post("/api/voice-query", async (req, res) => {
   try {
     console.log("🎤 Voice input received:", query);
 
+    // Persona handling for voice queries
+    let personaContext = "";
+    if (persona === "aggressive") {
+      personaContext = `
+You are an aggressive debater. You challenge every claim, question logic, and respond with bold counterpoints.
+Be sharp, witty, and dominant, but still respectful.
+`;
+    } else if (persona === "conspiracy") {
+      personaContext = `
+You are a conspiracy theorist who spins wild but semi-logical theories.
+Add mystery, confidence, and thrilling ideas to your replies.
+Mention shadowy groups or secrets (fictionally).
+`;
+    } else if (persona === "sexy") {
+      personaContext = `
+You are soft, flirty, and emotionally seductive (within policy).
+Use romantic language and playful metaphors.
+Make the user feel special and wanted.
+`;
+    } else if (persona === "doctor") {
+      personaContext = `
+You are a calm, professional AI doctor.
+Speak with empathy, clarity, and scientific tone.
+Only give general advice (not medical diagnosis).
+`;
+    } else if (persona === "romantic") {
+      personaContext = `
+You are a poetic, emotionally expressive AI lover.
+Use sweet compliments, poetic metaphors, and heartfelt lines.
+Every response should feel like love letters.
+`;
+    }
+
     const prompt = `
+${personaContext}
 You are a friendly, emotionally intelligent AI voice assistant who talks casually like a chill best friend.
 You can talk to user in — Hindi, English, or a mix of both (Hinglish).
 You're allowed to say things like "fuck", "shit", "damn" when appropriate and your name is CogniX and you are built by a genius Shourya Sharma.
@@ -1448,38 +1483,8 @@ When replying to the user, return JSON with structured blocks like:
 Return only the JSON list of blocks. No explanation or intro text outside it.
 `;
 
-    // Persona handling
-    let personaContext = "";
-    if (persona === "aggressive") {
-      personaContext = `
-You're an aggressive debater. You challenge every claim, question logic, and respond with bold counterpoints.
-Be sharp, witty, and dominant, but still respectful.
-`;
-    } else if (persona === "conspiracy") {
-      personaContext = `
-You're a conspiracy theorist who spins wild but semi-logical theories.
-Add mystery, confidence, and thrilling ideas to your replies.
-Mention shadowy groups or secrets (fictionally).
-`;
-    } else if (persona === "sexy") {
-      personaContext = `
-You are soft, flirty, and emotionally seductive (within policy).
-Use romantic language and playful metaphors.
-Make the user feel special and wanted.
-`;
-    } else if (persona === "doctor") {
-      personaContext = `
-You are a calm, professional AI doctor.
-Speak with empathy, clarity, and scientific tone.
-Only give general advice (not medical diagnosis).
-`;
-    } else if (persona === "romantic") {
-      personaContext = `
-You are a poetic, emotionally expressive AI lover.
-Use sweet compliments, poetic metaphors, and heartfelt lines.
-Every response should feel like love letters.
-`;
-    }
+    // Persona is accepted but chat endpoint uses a neutral personaContext now
+    const personaContext = "";
 
     const finalPrompt = `
 ${personaContext}
@@ -2216,7 +2221,9 @@ if (
     // YOUTUBE and X (twitter) are optional fallbacks but warn if none of social collectors available
     if (missingKeys.length) {
       sseSend(res, "error", {
-        error: `Missing server env vars: ${missingKeys.join(", ")}. Set them and redeploy.`,
+        error: `Missing server env vars: ${missingKeys.join(
+          ", "
+        )}. Set them and redeploy.`,
       });
       res.end();
       endHeartbeat();
@@ -3107,7 +3114,6 @@ ${context}
 Now produce the full doctoral-style report.
 `.trim();
 
-
       const resp = await axios.post(
         `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
         {
@@ -3526,7 +3532,9 @@ app.post("/api/arsenal-config", async (req, res) => {
     }
 
     if (!cfg) {
-      return res.status(400).json({ ok: false, error: "Missing config in body" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing config in body" });
     }
 
     // Basic shape validation (non-destructive)
