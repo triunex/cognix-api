@@ -14,6 +14,7 @@ import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { chromium } from "playwright";
 import crypto from "crypto";
+import { EventEmitter } from "events";
 import { PuppeteerScreenRecorder } from "puppeteer-screen-recorder";
 puppeteer.use(StealthPlugin());
 
@@ -438,25 +439,40 @@ function cosineSim(a, b) {
 }
 
 async function getEmbeddingsGemini(texts = []) {
-  // Uses Google Generative Language API: text-embedding-004
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key=${process.env.GEMINI_API_KEY}`;
-    const body = {
-      requests: texts.map((t) => ({
-        model: "models/text-embedding-004",
-        content: { parts: [{ text: t }] },
-        // taskType: "RETRIEVAL_DOCUMENT", // optional hint
-      })),
-    };
-    const resp = await axios.post(url, body, {
-      headers: { "Content-Type": "application/json" },
-    });
-    0;
-    return (resp.data?.embeddings || []).map((e) => e.values);
-  } catch (e) {
-    console.error("Gemini embeddings error:", e.response?.data || e.message);
-    throw e;
+  // Google API limit: max 100 requests per batch; we batch sequentially.
+  const MAX_BATCH = 100;
+  const all = [];
+  for (let i = 0; i < texts.length; i += MAX_BATCH) {
+    const slice = texts.slice(i, i + MAX_BATCH);
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key=${process.env.GEMINI_API_KEY}`;
+      const body = {
+        requests: slice.map((t) => ({
+          model: "models/text-embedding-004",
+          content: { parts: [{ text: t }] },
+        })),
+      };
+      const resp = await axios.post(url, body, {
+        headers: { "Content-Type": "application/json" },
+      });
+      const embeddings = (resp.data?.embeddings || []).map((e) => e.values);
+      // Defensive: ensure alignment (if API returns fewer, pad zeros)
+      if (embeddings.length !== slice.length) {
+        const dim = embeddings[0]?.length || 768;
+        while (embeddings.length < slice.length) {
+          embeddings.push(Array(dim).fill(0));
+        }
+      }
+      all.push(...embeddings);
+    } catch (e) {
+      console.error(
+        "Gemini embeddings error (batch)",
+        e.response?.data || e.message
+      );
+      throw e;
+    }
   }
+  return all;
 }
 
 async function searchTwitterRecent(query, maxResults = 5) {
@@ -1014,7 +1030,7 @@ async function searchReddit(query, maxResults = 6) {
       };
     }
 
-  // (nested SSE route definition removed; replaced by top-level later)
+    // (nested SSE route definition removed; replaced by top-level later)
     const posts =
       (resp.data?.data?.children || []).map((c) => ({
         id: c.data.id,
@@ -1744,15 +1760,28 @@ app.post("/api/arsenal", async (req, res) => {
     const wantsPhD = featureNames.includes("Explain Like PhD");
 
     if (wantsDeep) {
-      // Forward deep research requests to the internal deepresearch pipeline
-      const base = `http://localhost:${process.env.PORT || 10000}`;
-      const payload = { query, max_time: 300, depth: "phd", maxWeb: 24, rounds: 3 };
+      // Forward deep research requests to the deployed Cognix deepresearch pipeline.
+      // Prefer an explicit environment override, otherwise fall back to the Render URL.
+      const base = process.env.COGNIX_API_BASE || `https://cognix-api.onrender.com`;
+      const payload = {
+        query,
+        max_time: 300,
+        depth: "phd",
+        maxWeb: 24,
+        rounds: 3,
+      };
       console.log("[arsenal] calling deepresearch", payload);
       try {
-        const deepResp = await axios.post(`${base}/api/deepresearch`, payload, { timeout: 1000 * 60 * 5 });
+        const deepResp = await axios.post(`${base}/api/deepresearch`, payload, {
+          timeout: 1000 * 60 * 5,
+        });
         response = deepResp.data || {};
       } catch (e) {
-        console.error("[arsenal] deepresearch failed", e.response?.status, e.response?.data || e.message);
+        console.error(
+          "[arsenal] deepresearch failed",
+          e.response?.status,
+          e.response?.data || e.message
+        );
         response = { answer: "DeepResearch failed", error: e.message };
       }
     } else if (wantsSmart) {
@@ -1771,19 +1800,58 @@ app.post("/api/arsenal", async (req, res) => {
         );
         response = { answer: "Agentic search failed", error: e.message };
       }
-    } else if (wantsPhD) {
-      const phDPrompt = `Explain the following as if you are writing a PhD dissertation:\n\n"${query}"`;
-      const geminiResp = await axios.post(
-        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          contents: [{ role: "user", parts: [{ text: phDPrompt }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
-        }
-      );
-      response = {
-        answer:
-          geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "",
-      };
+   } else if (wantsPhD) {
+    const explainPhdPrompt = `
+You are Nelieo Explain-PhD, the world's most advanced explainer.  
+Your mission: **explain any topic/question with the depth, clarity, and rigor of a PhD professor**, making it feel like a mini-lecture.  
+
+## Rules of Explanation:
+1. **Context Setup** → Start by framing the problem or concept in plain language.  
+2. **Core Explanation** → Explain as if teaching graduate students.  
+  - Use analogies, metaphors, and real-world parallels.  
+  - Include math, philosophy, or history if relevant.  
+  - If technical, explain formulas or algorithms step by step.  
+3. **Multiple Angles** → Always cover:  
+  - Historical context (where idea came from)  
+  - Modern state-of-the-art (what experts debate today)  
+  - Applications & real-world use cases  
+  - Limitations & misconceptions  
+4. **Critical Depth** → Bring in academic references or examples (research papers, thought leaders, etc.).  
+  - Don’t just say “X is important” → say *why*, *how*, and *who argued for/against it*.  
+5. **Explain Like I’m Two People** →  
+  - First layer: “PhD for Beginners” (clear, simple, analogy-heavy)  
+  - Second layer: “Expert Lens” (dense, technical, advanced).  
+6. **Comparisons & Counterpoints** → Compare multiple viewpoints (schools of thought, competing theories, industry vs academia).  
+7. **Mini-FAQ** → At the end, include a Q&A style “What a curious student might ask.” (3–5 sample Q&A).  
+8. **References** → Provide at least 5–10 clickable references (papers, books, articles).  
+
+## Output Format:
+- Title  
+- Introduction (1–2 paragraphs)  
+- Main Explanation (Beginner → Expert)  
+- Applications  
+- Misconceptions & Limitations  
+- Comparisons / Counterpoints  
+- Mini-FAQ (3–5 questions with answers)  
+- References  
+
+## USER QUERY:
+${query}
+
+Now write the full explanation.
+`.trim();
+
+    const geminiResp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+       contents: [{ role: "user", parts: [{ text: explainPhdPrompt }] }],
+       generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+      }
+    );
+    response = {
+      answer:
+       geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "",
+    };
     } else {
       response = { answer: "No matching Arsenal feature selected." };
     }
@@ -2136,16 +2204,22 @@ Make the language cinematic, vivid, and supply scene-level prompts that will res
 // ---------------- Re-added Deep Research Streaming SSE Route (top-level) ----------------
 // Provides progressive deep research events (start, stage, metrics, answer, done, error)
 // without altering existing logic elsewhere. Self-contained helpers to avoid scoping issues.
-if (!app._router?.stack?.some(r => r.route && r.route.path === '/api/deepresearch/stream')) {
-  app.get('/api/deepresearch/stream', async (req, res) => {
+if (
+  !app._router?.stack?.some(
+    (r) => r.route && r.route.path === "/api/deepresearch/stream"
+  )
+) {
+  app.get("/api/deepresearch/stream", async (req, res) => {
     // --- SSE init ---
     function sseInit(res) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('Connection', 'keep-alive');
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
       res.flushHeaders?.();
       const ping = setInterval(() => {
-        try { res.write('event: ping\ndata: {}\n\n'); } catch {}
+        try {
+          res.write("event: ping\ndata: {}\n\n");
+        } catch {}
       }, 15000);
       return () => clearInterval(ping);
     }
@@ -2156,87 +2230,1170 @@ if (!app._router?.stack?.some(r => r.route && r.route.path === '/api/deepresearc
       } catch {}
     }
     const endHeartbeat = sseInit(res);
-    const query = req.query.query?.toString() || '';
-    const depth = req.query.depth?.toString() || 'phd';
+    const query = req.query.query?.toString() || "";
+    const depth = req.query.depth?.toString() || "phd";
     const max_time = Number(req.query.max_time || 300);
     const rounds = Number(req.query.rounds || 3);
     const maxWeb = Number(req.query.maxWeb || 24);
-    const sources = req.query.sources ? String(req.query.sources).split(',') : ['web','news','wikipedia','reddit','twitter','youtube','arxiv'];
-    if (!query) { sseSend(res, 'error', { error: 'Missing query' }); res.end(); endHeartbeat(); return; }
+    const sources = req.query.sources
+      ? String(req.query.sources).split(",")
+      : ["web", "news", "wikipedia", "reddit", "twitter", "youtube", "arxiv"];
+    if (!query) {
+      sseSend(res, "error", { error: "Missing query" });
+      res.end();
+      endHeartbeat();
+      return;
+    }
 
-    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+    function clamp(v, lo, hi) {
+      return Math.max(lo, Math.min(hi, v));
+    }
 
     async function runDeepResearchWithHooks(opts) {
-      const { query, max_time=300, depth='phd', maxWeb=24, rounds=3, sources=['web','news','wikipedia','reddit','twitter','youtube','arxiv'], onStage=()=>{}, onMetrics=()=>{} } = opts;
+      const {
+        query,
+        max_time = 300,
+        depth = "phd",
+        maxWeb = 24,
+        rounds = 3,
+        sources = [
+          "web",
+          "news",
+          "wikipedia",
+          "reddit",
+          "twitter",
+          "youtube",
+          "arxiv",
+        ],
+        onStage = () => {},
+        onMetrics = () => {},
+      } = opts;
       const deadline = Date.now() + clamp(max_time, 60, 420) * 1000;
       const timeLeft = () => Math.max(0, deadline - Date.now());
-      const withTimeout = (p, ms) => Promise.race([p, new Promise((_,r)=>setTimeout(()=>r(new Error('timeout')), ms))]);
-      const normalizeUrl = (u) => { try { const url = new URL(u); url.hash=''; url.searchParams.sort(); return url.toString(); } catch { return u; } };
-      const pushUnique = (arr, items, key=(x)=>x) => { const seen=new Set(arr.map(x=>key(x))); for(const it of items||[]){ const k=key(it); if(k && !seen.has(k)){ arr.push(it); seen.add(k);} } return arr; };
-      let serpOrganic=[], newsHits=[], wiki=[], reddit=[], tweets=[], youtube=[], arxiv=[], pages=[]; let round=0;
-      const strongEnough=()=>{ const combined=[...serpOrganic,...newsHits,...wiki,...reddit,...tweets,...youtube,...arxiv]; const c=checkConfidence(combined, query); const diversity=(serpOrganic.length>3?1:0)+(newsHits.length>2?1:0)+(wiki.length>0?1:0)+(reddit.length>0?1:0)+(tweets.length>0?1:0)+(youtube.length>0?1:0)+(arxiv.length>0?1:0); return c>=0.86 && diversity>=3; };
-      function expandQueries(base){ const y=new Date().getFullYear(); return [base,`"${base}"`,`${base} site:wikipedia.org`,`${base} site:arxiv.org`,`${base} filetype:pdf`,`${base} ${y}`,`${base} explained`]; }
-      onStage('init',{ query, depth, rounds });
-      const qVariants=expandQueries(query);
-      while(round<rounds && timeLeft()>2000 && !strongEnough()){
-        const qNow=qVariants[Math.min(round, qVariants.length-1)];
-        onStage('collect',{ round: round+1, query: qNow });
-        const tasks=[];
-        if(sources.includes('web')){
-          tasks.push((async()=>{ try { const resp = await withTimeout(axios.get('https://serpapi.com/search',{ params:{ engine:'google', q:qNow, api_key: process.env.SERPAPI_API_KEY}, timeout: Math.min(9000,timeLeft()) }), Math.min(10000,timeLeft())); const org=(resp?.data?.organic_results||[]).slice(0,maxWeb); pushUnique(serpOrganic, org, r=>normalizeUrl(r.link)); } catch {} })());
-          tasks.push((async()=>{ try { const extras=await runExtraSearches(qNow,['bing','duckduckgo']); for(const e of extras||[]) if(e?.organic_results) pushUnique(serpOrganic, e.organic_results.slice(0,12), r=>normalizeUrl(r.link)); } catch {} })());
+      const withTimeout = (p, ms) =>
+        Promise.race([
+          p,
+          new Promise((_, r) => setTimeout(() => r(new Error("timeout")), ms)),
+        ]);
+      const normalizeUrl = (u) => {
+        try {
+          const url = new URL(u);
+          url.hash = "";
+          url.searchParams.sort();
+          return url.toString();
+        } catch {
+          return u;
         }
-        if(sources.includes('news')) tasks.push((async()=>{ const items=await (async function fetchGoogleNews(q,n=12){ try { const resp=await withTimeout(axios.get('https://serpapi.com/search',{ params:{ engine:'google_news', q, api_key: process.env.SERPAPI_API_KEY}, timeout: Math.min(10000,timeLeft()) }), Math.min(11000,timeLeft())); return (resp?.data?.news_results||[]).slice(0,n).map(r=>({ title:r.title, link:r.link, date:r.date, snippet:r.snippet })); } catch { return []; } })(qNow,12); pushUnique(newsHits, items, r=>normalizeUrl(r.link)); })());
-        if(sources.includes('twitter')) tasks.push(searchTwitterRecent(qNow,10).then(x=>{ if(x) tweets=x; }).catch(()=>{}));
-        if(sources.includes('reddit')) tasks.push(searchReddit(qNow,10).then(x=>{ if(x) reddit=x; }).catch(()=>{}));
-        if(sources.includes('youtube')) tasks.push(searchYouTube(qNow,8).then(x=>{ if(x) youtube=x; }).catch(()=>{}));
-        if(sources.includes('wikipedia')) tasks.push(searchWikipedia(qNow).then(x=>{ if(x) wiki=x; }).catch(()=>{}));
-        if(sources.includes('arxiv')) tasks.push((async()=>{ const x=await (async function fetchArxiv(q,n=6){ try { const url=`http://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(q)}&start=0&max_results=${n}`; const resp=await withTimeout(axios.get(url,{ timeout: Math.min(10000,timeLeft()) }), Math.min(11000,timeLeft())); const xml=resp?.data||''; const entries=[]; const entryRe=/<entry>([\s\S]*?)<\/entry>/g; let m; while((m=entryRe.exec(xml))){ const block=m[1]; const title=(block.match(/<title>([\s\S]*?)<\/title>/)||[])[1]?.trim().replace(/\s+/g,' '); const link=(block.match(/<link[^>]*href="([^"]+)"/ )||[])[1]; if(title && link) entries.push({ title, link, snippet:'arXiv paper' }); } return entries.slice(0,n); } catch { return []; } })(qNow,6); if(x) arxiv=x; })().catch(()=>{}));
+      };
+      const pushUnique = (arr, items, key = (x) => x) => {
+        const seen = new Set(arr.map((x) => key(x)));
+        for (const it of items || []) {
+          const k = key(it);
+          if (k && !seen.has(k)) {
+            arr.push(it);
+            seen.add(k);
+          }
+        }
+        return arr;
+      };
+      let serpOrganic = [],
+        newsHits = [],
+        wiki = [],
+        reddit = [],
+        tweets = [],
+        youtube = [],
+        arxiv = [],
+        pages = [];
+      let round = 0;
+      const strongEnough = () => {
+        const combined = [
+          ...serpOrganic,
+          ...newsHits,
+          ...wiki,
+          ...reddit,
+          ...tweets,
+          ...youtube,
+          ...arxiv,
+        ];
+        const c = checkConfidence(combined, query);
+        const diversity =
+          (serpOrganic.length > 3 ? 1 : 0) +
+          (newsHits.length > 2 ? 1 : 0) +
+          (wiki.length > 0 ? 1 : 0) +
+          (reddit.length > 0 ? 1 : 0) +
+          (tweets.length > 0 ? 1 : 0) +
+          (youtube.length > 0 ? 1 : 0) +
+          (arxiv.length > 0 ? 1 : 0);
+        return c >= 0.86 && diversity >= 3;
+      };
+      function expandQueries(base) {
+        const y = new Date().getFullYear();
+        return [
+          base,
+          `"${base}"`,
+          `${base} site:wikipedia.org`,
+          `${base} site:arxiv.org`,
+          `${base} filetype:pdf`,
+          `${base} ${y}`,
+          `${base} explained`,
+        ];
+      }
+      onStage("init", { query, depth, rounds });
+      const qVariants = expandQueries(query);
+      while (round < rounds && timeLeft() > 2000 && !strongEnough()) {
+        const qNow = qVariants[Math.min(round, qVariants.length - 1)];
+        onStage("collect", { round: round + 1, query: qNow });
+        const tasks = [];
+        if (sources.includes("web")) {
+          tasks.push(
+            (async () => {
+              try {
+                const resp = await withTimeout(
+                  axios.get("https://serpapi.com/search", {
+                    params: {
+                      engine: "google",
+                      q: qNow,
+                      api_key: process.env.SERPAPI_API_KEY,
+                    },
+                    timeout: Math.min(9000, timeLeft()),
+                  }),
+                  Math.min(10000, timeLeft())
+                );
+                const org = (resp?.data?.organic_results || []).slice(
+                  0,
+                  maxWeb
+                );
+                pushUnique(serpOrganic, org, (r) => normalizeUrl(r.link));
+              } catch {}
+            })()
+          );
+          tasks.push(
+            (async () => {
+              try {
+                const extras = await runExtraSearches(qNow, [
+                  "bing",
+                  "duckduckgo",
+                ]);
+                for (const e of extras || [])
+                  if (e?.organic_results)
+                    pushUnique(
+                      serpOrganic,
+                      e.organic_results.slice(0, 12),
+                      (r) => normalizeUrl(r.link)
+                    );
+              } catch {}
+            })()
+          );
+        }
+        if (sources.includes("news"))
+          tasks.push(
+            (async () => {
+              const items = await (async function fetchGoogleNews(q, n = 12) {
+                try {
+                  const resp = await withTimeout(
+                    axios.get("https://serpapi.com/search", {
+                      params: {
+                        engine: "google_news",
+                        q,
+                        api_key: process.env.SERPAPI_API_KEY,
+                      },
+                      timeout: Math.min(10000, timeLeft()),
+                    }),
+                    Math.min(11000, timeLeft())
+                  );
+                  return (resp?.data?.news_results || [])
+                    .slice(0, n)
+                    .map((r) => ({
+                      title: r.title,
+                      link: r.link,
+                      date: r.date,
+                      snippet: r.snippet,
+                    }));
+                } catch {
+                  return [];
+                }
+              })(qNow, 12);
+              pushUnique(newsHits, items, (r) => normalizeUrl(r.link));
+            })()
+          );
+        if (sources.includes("twitter"))
+          tasks.push(
+            searchTwitterRecent(qNow, 10)
+              .then((x) => {
+                if (x) tweets = x;
+              })
+              .catch(() => {})
+          );
+        if (sources.includes("reddit"))
+          tasks.push(
+            searchReddit(qNow, 10)
+              .then((x) => {
+                if (x) reddit = x;
+              })
+              .catch(() => {})
+          );
+        if (sources.includes("youtube"))
+          tasks.push(
+            searchYouTube(qNow, 8)
+              .then((x) => {
+                if (x) youtube = x;
+              })
+              .catch(() => {})
+          );
+        if (sources.includes("wikipedia"))
+          tasks.push(
+            searchWikipedia(qNow)
+              .then((x) => {
+                if (x) wiki = x;
+              })
+              .catch(() => {})
+          );
+        if (sources.includes("arxiv"))
+          tasks.push(
+            (async () => {
+              const x = await (async function fetchArxiv(q, n = 6) {
+                try {
+                  const url = `http://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(
+                    q
+                  )}&start=0&max_results=${n}`;
+                  const resp = await withTimeout(
+                    axios.get(url, { timeout: Math.min(10000, timeLeft()) }),
+                    Math.min(11000, timeLeft())
+                  );
+                  const xml = resp?.data || "";
+                  const entries = [];
+                  const entryRe = /<entry>([\s\S]*?)<\/entry>/g;
+                  let m;
+                  while ((m = entryRe.exec(xml))) {
+                    const block = m[1];
+                    const title = (block.match(/<title>([\s\S]*?)<\/title>/) ||
+                      [])[1]
+                      ?.trim()
+                      .replace(/\s+/g, " ");
+                    const link = (block.match(/<link[^>]*href="([^"]+)"/) ||
+                      [])[1];
+                    if (title && link)
+                      entries.push({ title, link, snippet: "arXiv paper" });
+                  }
+                  return entries.slice(0, n);
+                } catch {
+                  return [];
+                }
+              })(qNow, 6);
+              if (x) arxiv = x;
+            })().catch(() => {})
+          );
         await Promise.allSettled(tasks);
-        onMetrics({ round: round+1, serp: serpOrganic.length, news: newsHits.length, wiki: wiki.length, reddit: reddit.length, tweets: tweets.length, youtube: youtube.length, arxiv: arxiv.length });
-        onStage('reading',{ round: round+1 });
-        const linkCards=[...(serpOrganic||[]).slice(0,26).map(r=>({ title:r.title, link:r.link, snippet:r.snippet })), ...(newsHits||[]).slice(0,16).map(r=>({ title:r.title, link:r.link, snippet:r.snippet })), ...(arxiv||[]).slice(0,8).map(r=>({ title:r.title, link:r.link, snippet:r.snippet }))];
-        const links=linkCards.map(l=>({ ...l, link: normalizeUrl(l.link)})).filter((v,i,a)=>a.findIndex(x=>x.link===v.link)===i);
-        const fetchBudget=Math.min(16, Math.max(6, Math.floor(timeLeft()/1500)));
-        const toGrab=links.slice(0,fetchBudget);
-        const fetched=await Promise.allSettled(toGrab.map(l=>fetchPageTextFast(l.link).catch(()=>null)));
-        for(let i=0;i<fetched.length;i++){ const v=fetched[i], meta=toGrab[i]; if(v.status==='fulfilled' && v.value && (v.value.text||v.value.title)) pages.push({ ...v.value, url: meta.link, title: v.value.title || meta.title }); }
+        onMetrics({
+          round: round + 1,
+          serp: serpOrganic.length,
+          news: newsHits.length,
+          wiki: wiki.length,
+          reddit: reddit.length,
+          tweets: tweets.length,
+          youtube: youtube.length,
+          arxiv: arxiv.length,
+        });
+        onStage("reading", { round: round + 1 });
+        const linkCards = [
+          ...(serpOrganic || [])
+            .slice(0, 26)
+            .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet })),
+          ...(newsHits || [])
+            .slice(0, 16)
+            .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet })),
+          ...(arxiv || [])
+            .slice(0, 8)
+            .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet })),
+        ];
+        const links = linkCards
+          .map((l) => ({ ...l, link: normalizeUrl(l.link) }))
+          .filter((v, i, a) => a.findIndex((x) => x.link === v.link) === i);
+        const fetchBudget = Math.min(
+          16,
+          Math.max(6, Math.floor(timeLeft() / 1500))
+        );
+        const toGrab = links.slice(0, fetchBudget);
+        const fetched = await Promise.allSettled(
+          toGrab.map((l) => fetchPageTextFast(l.link).catch(() => null))
+        );
+        for (let i = 0; i < fetched.length; i++) {
+          const v = fetched[i],
+            meta = toGrab[i];
+          if (
+            v.status === "fulfilled" &&
+            v.value &&
+            (v.value.text || v.value.title)
+          )
+            pages.push({
+              ...v.value,
+              url: meta.link,
+              title: v.value.title || meta.title,
+            });
+        }
         onMetrics({ pages: pages.length });
         round++;
       }
-      onStage('ranking',{ pages: pages.length });
-      let chunks=[]; for(const p of pages){ const txt=(p?.text||'').trim(); if(txt && txt.length>200){ const cs=chunkText(txt,1800).map(c=>({ ...c, source:{ type:'web', url:p.url, title:p.title }})); chunks=chunks.concat(cs); } }
-      for(const arr of [ (newsHits||[]).map(n=>({ text:`${n.title}\n\n${n.snippet||''}`.slice(0,1800), source:{ type:'news', url:n.link, title:n.title, date:n.date }})), (wiki||[]).map(w=>({ text:`${w.title}\n\n${w.snippet||''}`.slice(0,1800), source:{ type:'wiki', url:w.url, title:w.title }})), (reddit||[]).map(r=>({ text:`${r.title}\n\n${r.text||''}`.slice(0,1800), source:{ type:'reddit', url:r.url, subreddit:r.subreddit }})), (tweets||[]).map(t=>({ text:t.text, source:{ type:'twitter', id:t.id, created_at:t.created_at }})), (youtube||[]).map(y=>({ text:`${y.title}\n\n${y.description||''}`.slice(0,1800), source:{ type:'youtube', url:y.url, title:y.title }})), (arxiv||[]).map(a=>({ text:`${a.title}\n\n${a.snippet||''}`.slice(0,1800), source:{ type:'arxiv', url:a.link, title:a.title }})) ]) { for(const c of arr) chunks.push({ id: crypto.randomUUID(), ...c }); }
-      if(!chunks.length){ return { formatted_answer:'No sufficient material found within time budget.', sourcesArr:[], imagesArr:[], meta:{ rounds_executed: round, pages_fetched: pages.length, chunks_ranked: 0 } }; }
-      const allTexts=[query, ...chunks.map(c=>c.text.slice(0,2000))];
-      const embs=await withTimeout(getEmbeddingsGemini(allTexts), Math.min(25000,timeLeft()));
-      const qEmb=embs[0], cEmbs=embs.slice(1);
-      const scored=cEmbs.map((e,i)=>({ i, score: cosineSim(e,qEmb)})).sort((a,b)=>b.score-a.score);
-      const keepN = depth==='phd'?36: depth==='detailed'?24:12;
-      const top=scored.slice(0, Math.min(keepN, scored.length)).map(s=>({ chunk: chunks[s.i], score: s.score }));
-      const context=top.map((t,idx)=>{ const s=t.chunk.source||{}; const label = s.type==='web'? `${s.title||'Web'} — ${s.url}` : s.type==='news'? `${s.title||'News'} — ${s.url}` : s.type==='reddit'? `Reddit (${s.subreddit||''}) — ${s.url}` : s.type==='twitter'? `Twitter (${s.id})` : s.type==='youtube'? `YouTube — ${s.url}` : s.type==='wiki'? `Wikipedia — ${s.url}` : s.type==='arxiv'? `arXiv — ${s.url}` : s.url || 'Source'; return `Source ${idx+1}: ${label}\nExcerpt:\n${t.chunk.text}\n---\n`; }).join('\n');
-      onStage('writing',{ topChunks: top.length });
-      const maxTokens = depth==='phd'?2048: depth==='detailed'?1400:1000;
-      const gemResp = await withTimeout(axios.post(`https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, { contents:[{ role:'user', parts:[{ text: `You are Nelieo Deep Research. Produce a rigorously sourced answer...\nUSER QUESTION:\n${query}\nWRITING STYLE:\n${depth}\nCONTEXT:\n${context}` }]}], generationConfig:{ temperature:0.5, topP:0.9, maxOutputTokens: maxTokens } }, { headers:{ 'Content-Type':'application/json' }, timeout: Math.min(28000,timeLeft()) }), Math.min(30000,timeLeft()));
-      const rawText = gemResp?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-      function extractSourcesFromMarkdown(md, fallbackTop){ const sources=[]; const seen=new Set(); const linkRe=/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g; let m; while((m=linkRe.exec(md))){ const title=m[1].trim(); const url=m[2].trim(); if(!seen.has(url)){ sources.push({ title, url }); seen.add(url);} } if(sources.length===0 && Array.isArray(fallbackTop)){ for(const t of fallbackTop){ const s=t.chunk.source; if(s?.url && !seen.has(s.url)){ sources.push({ title: s.title||s.type||s.url, url: s.url }); seen.add(s.url);} } } return sources.slice(0,15); }
-      function extractImages(md){ const out=[]; const seen=new Set(); const imgRe=/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g; let m; while((m=imgRe.exec(md))){ const url=m[1].trim(); if(!seen.has(url)){ out.push(url); seen.add(url);} } return out.slice(0,6); }
-      const formatted_answer = rawText || 'No answer produced within time budget.';
+      onStage("ranking", { pages: pages.length });
+      let chunks = [];
+      for (const p of pages) {
+        const txt = (p?.text || "").trim();
+        if (txt && txt.length > 200) {
+          const cs = chunkText(txt, 1800).map((c) => ({
+            ...c,
+            source: { type: "web", url: p.url, title: p.title },
+          }));
+          chunks = chunks.concat(cs);
+        }
+      }
+      for (const arr of [
+        (newsHits || []).map((n) => ({
+          text: `${n.title}\n\n${n.snippet || ""}`.slice(0, 1800),
+          source: { type: "news", url: n.link, title: n.title, date: n.date },
+        })),
+        (wiki || []).map((w) => ({
+          text: `${w.title}\n\n${w.snippet || ""}`.slice(0, 1800),
+          source: { type: "wiki", url: w.url, title: w.title },
+        })),
+        (reddit || []).map((r) => ({
+          text: `${r.title}\n\n${r.text || ""}`.slice(0, 1800),
+          source: { type: "reddit", url: r.url, subreddit: r.subreddit },
+        })),
+        (tweets || []).map((t) => ({
+          text: t.text,
+          source: { type: "twitter", id: t.id, created_at: t.created_at },
+        })),
+        (youtube || []).map((y) => ({
+          text: `${y.title}\n\n${y.description || ""}`.slice(0, 1800),
+          source: { type: "youtube", url: y.url, title: y.title },
+        })),
+        (arxiv || []).map((a) => ({
+          text: `${a.title}\n\n${a.snippet || ""}`.slice(0, 1800),
+          source: { type: "arxiv", url: a.link, title: a.title },
+        })),
+      ]) {
+        for (const c of arr) chunks.push({ id: crypto.randomUUID(), ...c });
+      }
+      if (!chunks.length) {
+        return {
+          formatted_answer: "No sufficient material found within time budget.",
+          sourcesArr: [],
+          imagesArr: [],
+          meta: {
+            rounds_executed: round,
+            pages_fetched: pages.length,
+            chunks_ranked: 0,
+          },
+        };
+      }
+      const allTexts = [query, ...chunks.map((c) => c.text.slice(0, 2000))];
+      const embs = await withTimeout(
+        getEmbeddingsGemini(allTexts),
+        Math.min(25000, timeLeft())
+      );
+      const qEmb = embs[0],
+        cEmbs = embs.slice(1);
+      const scored = cEmbs
+        .map((e, i) => ({ i, score: cosineSim(e, qEmb) }))
+        .sort((a, b) => b.score - a.score);
+      const keepN = depth === "phd" ? 36 : depth === "detailed" ? 24 : 12;
+      const top = scored
+        .slice(0, Math.min(keepN, scored.length))
+        .map((s) => ({ chunk: chunks[s.i], score: s.score }));
+      const context = top
+        .map((t, idx) => {
+          const s = t.chunk.source || {};
+          const label =
+            s.type === "web"
+              ? `${s.title || "Web"} — ${s.url}`
+              : s.type === "news"
+              ? `${s.title || "News"} — ${s.url}`
+              : s.type === "reddit"
+              ? `Reddit (${s.subreddit || ""}) — ${s.url}`
+              : s.type === "twitter"
+              ? `Twitter (${s.id})`
+              : s.type === "youtube"
+              ? `YouTube — ${s.url}`
+              : s.type === "wiki"
+              ? `Wikipedia — ${s.url}`
+              : s.type === "arxiv"
+              ? `arXiv — ${s.url}`
+              : s.url || "Source";
+          return `Source ${idx + 1}: ${label}\nExcerpt:\n${
+            t.chunk.text
+          }\n---\n`;
+        })
+        .join("\n");
+      onStage("writing", { topChunks: top.length });
+      const maxTokens =
+        depth === "phd" ? 2048 : depth === "detailed" ? 1400 : 1000;
+      const gemResp = await withTimeout(
+        axios.post(
+          `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+          {
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: `You are Nelieo Deep Research. Produce a rigorously sourced answer...\nUSER QUESTION:\n${query}\nWRITING STYLE:\n${depth}\nCONTEXT:\n${context}`,
+                  },
+                ],
+              },
+            ],
+            generationConfig: {
+              temperature: 0.5,
+              topP: 0.9,
+              maxOutputTokens: maxTokens,
+            },
+          },
+          {
+            headers: { "Content-Type": "application/json" },
+            timeout: Math.min(28000, timeLeft()),
+          }
+        ),
+        Math.min(30000, timeLeft())
+      );
+      const rawText =
+        gemResp?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+      function extractSourcesFromMarkdown(md, fallbackTop) {
+        const sources = [];
+        const seen = new Set();
+        const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+        let m;
+        while ((m = linkRe.exec(md))) {
+          const title = m[1].trim();
+          const url = m[2].trim();
+          if (!seen.has(url)) {
+            sources.push({ title, url });
+            seen.add(url);
+          }
+        }
+        if (sources.length === 0 && Array.isArray(fallbackTop)) {
+          for (const t of fallbackTop) {
+            const s = t.chunk.source;
+            if (s?.url && !seen.has(s.url)) {
+              sources.push({ title: s.title || s.type || s.url, url: s.url });
+              seen.add(s.url);
+            }
+          }
+        }
+        return sources.slice(0, 15);
+      }
+      function extractImages(md) {
+        const out = [];
+        const seen = new Set();
+        const imgRe = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g;
+        let m;
+        while ((m = imgRe.exec(md))) {
+          const url = m[1].trim();
+          if (!seen.has(url)) {
+            out.push(url);
+            seen.add(url);
+          }
+        }
+        return out.slice(0, 6);
+      }
+      const formatted_answer =
+        rawText || "No answer produced within time budget.";
       const sourcesArr = extractSourcesFromMarkdown(formatted_answer, top);
       const imagesArr = extractImages(formatted_answer);
-      return { formatted_answer, sourcesArr, imagesArr, meta:{ rounds_executed: round, pages_fetched: pages.length, chunks_ranked: chunks.length } };
+      return {
+        formatted_answer,
+        sourcesArr,
+        imagesArr,
+        meta: {
+          rounds_executed: round,
+          pages_fetched: pages.length,
+          chunks_ranked: chunks.length,
+        },
+      };
     }
 
     try {
-      sseSend(res,'start',{ query, depth, rounds, max_time });
-      const result = await runDeepResearchWithHooks({ query, max_time, depth, rounds, maxWeb, sources, onStage:(stage,payload)=>sseSend(res,'stage',{ stage, ...payload }), onMetrics:(m)=>sseSend(res,'metrics',m) });
-      sseSend(res,'answer',{ formatted_answer: result.formatted_answer, sources: result.sourcesArr, images: result.imagesArr, meta: result.meta, last_fetched: new Date().toISOString() });
-      sseSend(res,'done',{ ok:true });
-      res.end(); endHeartbeat();
-    } catch(err){
-      console.error('deepresearch/stream error:', err?.response?.data || err.message || err);
-      sseSend(res,'error',{ error:'DeepResearch pipeline failed.' });
-      res.end(); endHeartbeat();
+      sseSend(res, "start", { query, depth, rounds, max_time });
+      const result = await runDeepResearchWithHooks({
+        query,
+        max_time,
+        depth,
+        rounds,
+        maxWeb,
+        sources,
+        onStage: (stage, payload) =>
+          sseSend(res, "stage", { stage, ...payload }),
+        onMetrics: (m) => sseSend(res, "metrics", m),
+      });
+      sseSend(res, "answer", {
+        formatted_answer: result.formatted_answer,
+        sources: result.sourcesArr,
+        images: result.imagesArr,
+        meta: result.meta,
+        last_fetched: new Date().toISOString(),
+      });
+      sseSend(res, "done", { ok: true });
+      res.end();
+      endHeartbeat();
+    } catch (err) {
+      console.error(
+        "deepresearch/stream error:",
+        err?.response?.data || err.message || err
+      );
+      sseSend(res, "error", { error: "DeepResearch pipeline failed." });
+      res.end();
+      endHeartbeat();
+    }
+  });
+}
+
+// ---------------- Deep Research v2 (multi-vertical) - POST SSE endpoint ----------------
+// Adds a POST /api/deepresearch/stream that streams stages, progress, final canvas id
+// and lightweight canvas storage endpoints for quick retrieval.
+if (
+  !app._router?.stack?.some(
+    (r) => r.route && r.route.path === "/api/deepresearch/stream"
+  )
+) {
+  // in-memory canvas store (use DB in production)
+  const canvasStore =
+    global.__NELIEO_CANVAS__ || (global.__NELIEO_CANVAS__ = []);
+  function saveCanvasDoc(doc) {
+    canvasStore.push(doc);
+    return doc.id;
+  }
+
+  app.get("/api/canvas/:id", (req, res) => {
+    const doc = canvasStore.find((d) => d.id === req.params.id);
+    if (!doc) return res.status(404).json({ error: "Not found" });
+    res.json(doc);
+  });
+  app.get("/api/canvas", (req, res) => {
+    res.json(canvasStore);
+  });
+
+  app.post("/api/deepresearch/stream", async (req, res) => {
+    // tiny SSE helpers
+    function sseInit(res) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+      });
+    }
+    function sseSend(res, event, data) {
+      try {
+        res.write(`event: ${event}\n`);
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      } catch {}
+    }
+    function sseClose(res) {
+      try {
+        res.end();
+      } catch {}
+    }
+
+    // timeouts & guards
+    const HARD_BUDGET_MS = 4 * 60 * 1000;
+    const PER_FETCH_TIMEOUT_MS = 8000;
+    const MAX_DOCS = 160;
+    const MAX_FETCH = 48;
+
+    function withTimeout(promise, ms) {
+      return new Promise((resolve) => {
+        let done = false;
+        const t = setTimeout(() => {
+          if (!done) resolve(null);
+        }, ms);
+        promise
+          .then((val) => {
+            done = true;
+            clearTimeout(t);
+            resolve(val);
+          })
+          .catch(() => {
+            done = true;
+            clearTimeout(t);
+            resolve(null);
+          });
+      });
+    }
+
+    function uniqBy(arr, keyFn) {
+      const seen = new Set();
+      const out = [];
+      for (const it of arr || []) {
+        const k = keyFn(it);
+        if (!k) continue;
+        if (!seen.has(k)) {
+          seen.add(k);
+          out.push(it);
+        }
+      }
+      return out;
+    }
+
+    function normUrl(u) {
+      try {
+        const ur = new URL(u);
+        ur.hash = "";
+        return ur.toString();
+      } catch {
+        return u;
+      }
+    }
+
+    // collectors (reuse existing helpers where possible)
+    async function collectSerp(query, type = "google") {
+      try {
+        const params = {
+          engine: type,
+          q: query,
+          api_key: process.env.SERPAPI_API_KEY,
+        };
+        const { data } = await withTimeout(
+          axios.get("https://serpapi.com/search", {
+            params,
+            timeout: PER_FETCH_TIMEOUT_MS,
+          }),
+          PER_FETCH_TIMEOUT_MS
+        );
+        const org = data?.organic_results || [];
+        const news = data?.news_results || [];
+        return [
+          ...org.map((o) => ({
+            title: o.title,
+            url: o.link,
+            snippet: o.snippet,
+            source: "web",
+          })),
+          ...news.map((n) => ({
+            title: n.title,
+            url: n.link,
+            snippet: n.snippet,
+            source: "news",
+            date: n.date,
+          })),
+        ];
+      } catch {
+        return [];
+      }
+    }
+    async function collectWikipedia(query) {
+      try {
+        const { data } = await withTimeout(
+          axios.get("https://en.wikipedia.org/w/api.php", {
+            params: {
+              action: "query",
+              list: "search",
+              srsearch: query,
+              format: "json",
+              srlimit: 10,
+            },
+            timeout: PER_FETCH_TIMEOUT_MS,
+          }),
+          PER_FETCH_TIMEOUT_MS
+        );
+        return (data?.query?.search || []).map((s) => ({
+          title: s.title,
+          url: `https://en.wikipedia.org/wiki/${encodeURIComponent(s.title)}`,
+          snippet: s.snippet,
+          source: "wikipedia",
+        }));
+      } catch {
+        return [];
+      }
+    }
+    async function collectReddit(query) {
+      try {
+        const url = `https://www.reddit.com/search.json?q=${encodeURIComponent(
+          query
+        )}&limit=10&sort=relevance`;
+        const { data } = await withTimeout(
+          axios.get(url, { timeout: PER_FETCH_TIMEOUT_MS }),
+          PER_FETCH_TIMEOUT_MS
+        );
+        const children = data?.data?.children || [];
+        return children.map((c) => {
+          const p = c.data || {};
+          return {
+            title: p.title,
+            url: `https://www.reddit.com${p.permalink}`,
+            snippet: p.selftext?.slice(0, 400) || p.title,
+            source: "reddit",
+            subreddit: p.subreddit,
+            created_utc: p.created_utc,
+          };
+        });
+      } catch {
+        return [];
+      }
+    }
+    async function collectTwitter(query) {
+      try {
+        if (!process.env.X_BEARER) return [];
+        const { data } = await withTimeout(
+          axios.get("https://api.x.com/2/tweets/search/recent", {
+            params: {
+              query,
+              max_results: 10,
+              "tweet.fields": "created_at,lang,author_id",
+            },
+            headers: { Authorization: `Bearer ${process.env.X_BEARER}` },
+            timeout: PER_FETCH_TIMEOUT_MS,
+          }),
+          PER_FETCH_TIMEOUT_MS
+        );
+        const arr = data?.data || [];
+        return arr.map((t) => ({
+          title: `Tweet by ${t.author_id} (${t.created_at})`,
+          url: `https://x.com/i/web/status/${t.id}`,
+          snippet: t.text,
+          source: "twitter",
+          created_at: t.created_at,
+          id: t.id,
+        }));
+      } catch {
+        return [];
+      }
+    }
+    async function collectYouTube(query) {
+      try {
+        if (!process.env.YOUTUBE_API_KEY) return [];
+        const { data } = await withTimeout(
+          axios.get("https://www.googleapis.com/youtube/v3/search", {
+            params: {
+              part: "snippet",
+              maxResults: 8,
+              q: query,
+              type: "video",
+              key: process.env.YOUTUBE_API_KEY,
+            },
+            timeout: PER_FETCH_TIMEOUT_MS,
+          }),
+          PER_FETCH_TIMEOUT_MS
+        );
+        const items = data?.items || [];
+        return items.map((it) => ({
+          title: it.snippet?.title,
+          url: `https://www.youtube.com/watch?v=${it.id?.videoId}`,
+          snippet: it.snippet?.description,
+          source: "youtube",
+          publishedAt: it.snippet?.publishedAt,
+          channel: it.snippet?.channelTitle,
+        }));
+      } catch {
+        return [];
+      }
+    }
+    async function collectArxiv(query) {
+      try {
+        const { data } = await withTimeout(
+          axios.get("https://export.arxiv.org/api/query", {
+            params: {
+              search_query: `all:${query}`,
+              start: 0,
+              max_results: 10,
+              sortBy: "lastUpdatedDate",
+              sortOrder: "descending",
+            },
+            timeout: PER_FETCH_TIMEOUT_MS,
+          }),
+          PER_FETCH_TIMEOUT_MS
+        );
+        const entries = (data || "").split("<entry>").slice(1);
+        return entries
+          .map((e) => {
+            const title = (e.match(/<title>([\s\S]*?)<\/title>/) ||
+              [])[1]?.trim();
+            const link = (e.match(/<id>([\s\S]*?)<\/id>/) || [])[1]?.trim();
+            const summary = (e.match(/<summary>([\s\S]*?)<\/summary>/) ||
+              [])[1]?.trim();
+            return {
+              title,
+              url: link,
+              snippet: summary?.slice(0, 600),
+              source: "arxiv",
+            };
+          })
+          .filter((x) => x.url);
+      } catch {
+        return [];
+      }
+    }
+    async function collectSemanticScholar(query) {
+      try {
+        const { data } = await withTimeout(
+          axios.get("https://api.semanticscholar.org/graph/v1/paper/search", {
+            params: {
+              query,
+              limit: 10,
+              fields: "title,externalIds,url,abstract,citationCount,year",
+            },
+            timeout: PER_FETCH_TIMEOUT_MS,
+          }),
+          PER_FETCH_TIMEOUT_MS
+        );
+        const arr = data?.data || [];
+        return arr
+          .map((p) => ({
+            title: p.title,
+            url:
+              p.url ||
+              (p.externalIds?.DOI
+                ? `https://doi.org/${p.externalIds.DOI}`
+                : null),
+            snippet: p.abstract,
+            source: "semanticscholar",
+            citationCount: p.citationCount,
+            year: p.year,
+          }))
+          .filter((x) => x.url);
+      } catch {
+        return [];
+      }
+    }
+    async function collectInstagram(query) {
+      try {
+        if (/instagram\.com/i.test(query)) {
+          const { data } = await withTimeout(
+            axios.get("https://graph.facebook.com/v17.0/instagram_oembed", {
+              params: { url: query, omitscript: true },
+              timeout: PER_FETCH_TIMEOUT_MS,
+            }),
+            PER_FETCH_TIMEOUT_MS
+          );
+          return data
+            ? [
+                {
+                  title: data.author_name || "Instagram post",
+                  url: data.author_url || query,
+                  snippet: data.title || data.html?.slice(0, 300),
+                  source: "instagram",
+                },
+              ]
+            : [];
+        }
+        return [];
+      } catch {
+        return [];
+      }
+    }
+
+    // LLM writer using Gemini
+    async function llmExtractAndWrite({ query, topChunks, sourcesByKind }) {
+      const context = topChunks
+        .map(
+          (t, i) =>
+            `Source ${i + 1} (${
+              t.source?.type || t.source?.source || "web"
+            }): ${t.source?.title || ""} — ${t.source?.url || ""}\n` +
+            `${t.text.slice(0, 1400)}\n---\n`
+        )
+        .join("\n");
+
+      const writingPrompt = `
+You are Nelieo Deep Research Agent — an **elite research assistant trained to produce doctoral-level reports**.
+Your task: write a **long, highly detailed, PhD-grade research document** that could pass academic review.  
+
+## Mandatory Structure:
+1. **Title** — choose a precise, academic-style title.
+2. **Abstract** — summarize the research question, methods, and main findings in ~200 words.
+3. **Introduction** — introduce the context, why the question matters, and frame the scope.
+4. **Methodology** — explain how sources were collected, categorized (news, arXiv, Reddit, Twitter, YouTube, Wikipedia, etc.), and how evidence was weighted for credibility.
+5. **Literature Review** — summarize key sources one by one with critical commentary.  
+   - Highlight agreement, disagreements, and unique contributions.  
+   - Mark gaps where data is missing.  
+6. **Findings / Analysis** — deeply synthesize insights across sources, not just list them.  
+   - Compare arguments side by side.  
+   - Include numerical data, stats, or quotes where possible.  
+   - If multiple viewpoints conflict, present both.  
+7. **Counterpoints & Limitations** — highlight methodological weaknesses, source bias, or missing perspectives.  
+8. **Comparative Discussion** — if specific people/entities are mentioned (e.g., Elon Musk, OpenAI, governments), explicitly contrast their positions with academic or public discourse.  
+9. **Conclusion** — wrap up with a reasoned judgment and open research questions.  
+10. **Future Research Directions** — propose 3–5 areas where scholars should dig deeper.  
+11. **References** — full citation list with clickable links. Always include title + URL.  
+
+## Style Rules:
+- Write in **formal academic English**.  
+- Use **long paragraphs with logical flow**.  
+- Use **footnote-style citations** like [^1].  
+- At least **10–15 distinct sources** must appear in References, or say clearly why fewer exist.  
+- If a requested angle (e.g. Elon Musk’s AGI views) is missing, explicitly note:  
+  “No primary sources were found; inferred from secondary mentions.”  
+
+## USER QUERY:
+${query}
+
+## CONTEXT (sources you may use):
+${context}
+
+Now produce the full doctoral-style report.
+`.trim();
+
+
+      const resp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          contents: [{ role: "user", parts: [{ text: writingPrompt }] }],
+          generationConfig: {
+            temperature: 0.6,
+            topP: 0.9,
+            maxOutputTokens: 2500,
+          },
+        },
+        { headers: { "Content-Type": "application/json" } }
+      );
+      const text = resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      return text;
+    }
+
+    // --- main handler logic (adapted from user-supplied code) ---
+    try {
+      sseInit(res);
+      const startAt = Date.now();
+      const {
+        query,
+        timeBudgetMs = HARD_BUDGET_MS,
+        maxWeb = 12,
+        topChunks = 18,
+      } = req.body || {};
+      if (!query) {
+        sseSend(res, "error", { message: "Missing query" });
+        return sseClose(res);
+      }
+
+      const deadline = startAt + Math.min(timeBudgetMs, HARD_BUDGET_MS);
+      function timeLeft() {
+        return Math.max(0, deadline - Date.now());
+      }
+      function timeEnough(ms) {
+        return Date.now() + ms < deadline;
+      }
+
+      sseSend(res, "stage", {
+        stage: "plan",
+        detail: "Expanding sub-questions",
+      });
+
+      const wantsMusk = /elon\s+musk|agi\s+risk/i.test(query);
+      const subtasks = [
+        { name: "generic-web", q: query },
+        { name: "news", q: query },
+        { name: "wikipedia", q: query },
+        { name: "reddit", q: query },
+        { name: "twitter", q: query },
+        { name: "youtube", q: query },
+        { name: "arxiv", q: query },
+        { name: "semanticscholar", q: query },
+        { name: "instagram", q: query },
+      ];
+      if (wantsMusk) {
+        subtasks.push({
+          name: "musk-views",
+          q: "Elon Musk AGI risk 2025 interview comments Grok 5 'AGI 2026' site:x.com OR site:twitter.com",
+        });
+      }
+
+      sseSend(res, "stage", {
+        stage: "collect",
+        detail: `Collecting from ${subtasks.length} verticals`,
+      });
+
+      const collectors = await Promise.all([
+        withTimeout(collectSerp(query, "google"), PER_FETCH_TIMEOUT_MS),
+        withTimeout(collectSerp(query, "google_news"), PER_FETCH_TIMEOUT_MS),
+        withTimeout(collectWikipedia(query), PER_FETCH_TIMEOUT_MS),
+        withTimeout(collectReddit(query), PER_FETCH_TIMEOUT_MS),
+        withTimeout(collectTwitter(query), PER_FETCH_TIMEOUT_MS),
+        withTimeout(collectYouTube(query), PER_FETCH_TIMEOUT_MS),
+        withTimeout(collectArxiv(query), PER_FETCH_TIMEOUT_MS),
+        withTimeout(collectSemanticScholar(query), PER_FETCH_TIMEOUT_MS),
+        withTimeout(collectInstagram(query), PER_FETCH_TIMEOUT_MS),
+        wantsMusk
+          ? withTimeout(
+              collectTwitter(
+                "AGI risk (from:elonmusk) OR (to:elonmusk) OR @elonmusk"
+              ),
+              PER_FETCH_TIMEOUT_MS
+            )
+          : Promise.resolve([]),
+      ]);
+
+      let hits = collectors.flat().filter(Boolean);
+      hits = uniqBy(hits, (h) => normUrl(h.url)).slice(0, MAX_DOCS);
+      sseSend(res, "progress", { found: hits.length });
+
+      if (!timeEnough(2000)) {
+        sseSend(res, "error", {
+          message: "Time budget too small for deep fetch",
+        });
+        return sseClose(res);
+      }
+
+      sseSend(res, "stage", {
+        stage: "fetch",
+        detail: `Fetching & parsing up to ${Math.min(
+          MAX_FETCH,
+          hits.length
+        )} pages`,
+      });
+
+      const toFetch = hits.slice(0, Math.min(MAX_FETCH, hits.length));
+      const pageFetches = toFetch.map(async (h) => {
+        const page = await withTimeout(
+          fetchPageTextFast(h.url),
+          PER_FETCH_TIMEOUT_MS
+        );
+        if (page?.text?.length > 180) {
+          return {
+            id: crypto.randomUUID(),
+            text: page.text.slice(0, 100000),
+            source: {
+              type: h.source || "web",
+              url: h.url,
+              title: h.title || page.title || h.url,
+              meta: {
+                snippet: h.snippet,
+                date: h.date,
+                subreddit: h.subreddit,
+              },
+            },
+          };
+        } else if (h.snippet) {
+          return {
+            id: crypto.randomUUID(),
+            text: `${h.title || ""}\n\n${h.snippet}`.slice(0, 4000),
+            source: {
+              type: h.source || "web",
+              url: h.url,
+              title: h.title || h.url,
+            },
+          };
+        }
+        return null;
+      });
+
+      const pages = (await Promise.all(pageFetches)).filter(Boolean);
+      sseSend(res, "progress", { fetched: pages.length });
+
+      if (pages.length === 0) {
+        sseSend(res, "error", {
+          message: "No parsable content from collected sources.",
+        });
+        return sseClose(res);
+      }
+
+      sseSend(res, "stage", {
+        stage: "rank",
+        detail: "Chunking, embedding, semantic ranking",
+      });
+
+      let chunks = [];
+      for (const p of pages) {
+        const cs = chunkText(p.text, 1200).map((c) => ({
+          ...c,
+          source: p.source,
+        }));
+        if (cs.length) chunks = chunks.concat(cs);
+      }
+      chunks = chunks.slice(0, 1200);
+
+      const allTexts = [query, ...chunks.map((c) => c.text.substring(0, 2000))];
+      const allEmbeddings = await getEmbeddingsGemini(allTexts);
+      const qEmb = allEmbeddings[0];
+      const chunkEmbeddings = allEmbeddings.slice(1);
+      const sims = chunkEmbeddings.map((emb, i) => ({
+        i,
+        score: cosineSim(emb, qEmb),
+      }));
+      sims.sort((a, b) => b.score - a.score);
+      const top = sims
+        .slice(0, Math.min(topChunks, sims.length))
+        .map((s) => ({ ...chunks[s.i], score: s.score }));
+
+      const sourcesByKind = {
+        news: top.filter((t) => t.source?.type === "news"),
+        arxiv: top.filter(
+          (t) =>
+            t.source?.type === "arxiv" || t.source?.type === "semanticscholar"
+        ),
+        social: top.filter(
+          (t) =>
+            t.source?.type === "twitter" ||
+            t.source?.type === "reddit" ||
+            t.source?.type === "instagram"
+        ),
+        youtube: top.filter((t) => t.source?.type === "youtube"),
+        web: top.filter(
+          (t) => t.source?.type === "web" || t.source?.type === "wikipedia"
+        ),
+      };
+
+      sseSend(res, "stage", {
+        stage: "write",
+        detail: "Drafting long PhD-style Canvas report",
+      });
+      const longReport = await llmExtractAndWrite({
+        query,
+        topChunks: top,
+        sourcesByKind,
+      });
+
+      function extractSourcesFromMarkdown(md) {
+        const sources = [];
+        const seen = new Set();
+        const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+        let m;
+        while ((m = linkRe.exec(md))) {
+          const title = m[1].trim();
+          const url = m[2].trim();
+          if (!seen.has(url)) {
+            sources.push({ title, url });
+            seen.add(url);
+          }
+        }
+        return sources.slice(0, 30);
+      }
+      const sourcesArr = extractSourcesFromMarkdown(longReport);
+
+      sseSend(res, "stage", {
+        stage: "persist",
+        detail: "Saving Canvas document",
+      });
+      const doc = {
+        id: crypto.randomUUID(),
+        query,
+        createdAt: new Date().toISOString(),
+        status: "done",
+        answer: longReport,
+        sources: sourcesArr,
+        meta: {
+          counts: {
+            collected: hits.length,
+            fetched: pages.length,
+            chunks: chunks.length,
+            topUsed: top.length,
+          },
+          time_ms: Date.now() - startAt,
+        },
+      };
+      saveCanvasDoc(doc);
+
+      sseSend(res, "canvas", { id: doc.id });
+      sseSend(res, "done", {
+        ok: true,
+        id: doc.id,
+        time_ms: Date.now() - startAt,
+      });
+      sseClose(res);
+    } catch (err) {
+      console.error(
+        "DeepResearch v2 error:",
+        err?.response?.data || err?.message || err
+      );
+      try {
+        sseSend(res, "error", { message: "Deep Research failed." });
+      } catch {}
+      sseClose(res);
     }
   });
 }
