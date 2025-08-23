@@ -22,38 +22,8 @@ dotenv.config();
 
 const app = express();
 
-// --- Arsenal config store (file-backed fallback; replace with DB later) ---
-// Note: this is a lightweight persistence to help Render/dev instances keep
-// the config between restarts for short-lived deployments. For production
-// durability across deploys and instances prefer an external DB (Firestore,
-// Postgres, etc.).
-const ARSENAL_STORE_FILE = path.resolve("arsenal-store.json");
+// --- Arsenal config store (simple in-memory map; replace with DB later) ---
 const arsenalStore = new Map(); // key: userId, value: ArsenalConfig
-
-// Load existing store from disk if present (top-level await allowed)
-try {
-  const raw = await fs.readFile(ARSENAL_STORE_FILE, { encoding: "utf8" }).catch(() => null);
-  if (raw) {
-    try {
-      const obj = JSON.parse(raw || "{}");
-      for (const [k, v] of Object.entries(obj || {})) arsenalStore.set(k, v);
-      console.log("Loaded arsenal store from disk:", Object.keys(obj).length, "entries");
-    } catch (e) {
-      console.warn("arsenal-store.json parse failed, starting with empty store:", e.message);
-    }
-  }
-} catch (e) {
-  console.warn("Failed reading arsenal store file:", e?.message || e);
-}
-
-async function persistArsenalStore() {
-  try {
-    const obj = Object.fromEntries(arsenalStore);
-    await fs.writeFile(ARSENAL_STORE_FILE, JSON.stringify(obj, null, 2), { encoding: "utf8" });
-  } catch (e) {
-    console.error("Failed to persist arsenal store:", e?.message || e);
-  }
-}
 
 // More explicit CORS handling to resolve preflight issues (add x-user-id header)
 app.use((req, res, next) => {
@@ -1829,58 +1799,19 @@ app.post("/api/arsenal", async (req, res) => {
         );
         response = { answer: "Agentic search failed", error: e.message };
       }
-   } else if (wantsPhD) {
-    const explainPhdPrompt = `
-You are Nelieo Explain-PhD, the world's most advanced explainer.  
-Your mission: **explain any topic/question with the depth, clarity, and rigor of a PhD professor**, making it feel like a mini-lecture.  
-
-## Rules of Explanation:
-1. **Context Setup** → Start by framing the problem or concept in plain language.  
-2. **Core Explanation** → Explain as if teaching graduate students.  
-  - Use analogies, metaphors, and real-world parallels.  
-  - Include math, philosophy, or history if relevant.  
-  - If technical, explain formulas or algorithms step by step.  
-3. **Multiple Angles** → Always cover:  
-  - Historical context (where idea came from)  
-  - Modern state-of-the-art (what experts debate today)  
-  - Applications & real-world use cases  
-  - Limitations & misconceptions  
-4. **Critical Depth** → Bring in academic references or examples (research papers, thought leaders, etc.).  
-  - Don’t just say “X is important” → say *why*, *how*, and *who argued for/against it*.  
-5. **Explain Like I’m Two People** →  
-  - First layer: “PhD for Beginners” (clear, simple, analogy-heavy)  
-  - Second layer: “Expert Lens” (dense, technical, advanced).  
-6. **Comparisons & Counterpoints** → Compare multiple viewpoints (schools of thought, competing theories, industry vs academia).  
-7. **Mini-FAQ** → At the end, include a Q&A style “What a curious student might ask.” (3–5 sample Q&A).  
-8. **References** → Provide at least 5–10 clickable references (papers, books, articles).  
-
-## Output Format:
-- Title  
-- Introduction (1–2 paragraphs)  
-- Main Explanation (Beginner → Expert)  
-- Applications  
-- Misconceptions & Limitations  
-- Comparisons / Counterpoints  
-- Mini-FAQ (3–5 questions with answers)  
-- References  
-
-## USER QUERY:
-${query}
-
-Now write the full explanation.
-`.trim();
-
-    const geminiResp = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-       contents: [{ role: "user", parts: [{ text: explainPhdPrompt }] }],
-       generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
-      }
-    );
-    response = {
-      answer:
-       geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "",
-    };
+    } else if (wantsPhD) {
+      const phDPrompt = `Explain the following as if you are writing a PhD dissertation:\n\n"${query}"`;
+      const geminiResp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          contents: [{ role: "user", parts: [{ text: phDPrompt }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+        }
+      );
+      response = {
+        answer:
+          geminiResp.data?.candidates?.[0]?.content?.parts?.[0]?.text || "",
+      };
     } else {
       response = { answer: "No matching Arsenal feature selected." };
     }
@@ -3523,7 +3454,7 @@ app.get("/api/warm-gemini", async (req, res) => {
 });
 
 // ------------- Arsenal Config API -------------
-app.get("/api/arsenal-config", async (req, res) => {
+app.get("/api/arsenal-config", (req, res) => {
   try {
     const userId = req.headers["x-user-id"] || "demo"; // plug your auth here
 
@@ -3548,8 +3479,6 @@ app.get("/api/arsenal-config", async (req, res) => {
     if (!cfg) {
       cfg = defaultCfg;
       arsenalStore.set(userId, cfg);
-      // persist the default for this user so deployed instances reflect it
-      persistArsenalStore().catch(() => {});
     }
 
     res.json({ ok: true, config: cfg });
@@ -3569,11 +3498,8 @@ app.post("/api/arsenal-config", async (req, res) => {
     if (!cfg)
       return res.status(400).json({ ok: false, error: "Missing config" });
     arsenalStore.set(userId, cfg);
-    // persist change to disk (best-effort)
-    await persistArsenalStore();
     res.json({ ok: true });
   } catch (e) {
-    console.error("Arsenal POST error:", e?.message || e);
     res.status(500).json({ ok: false, error: "Failed to save arsenal config" });
   }
 });
