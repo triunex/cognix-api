@@ -29,6 +29,10 @@ const arsenalStore = new Map(); // key: userId, value: ArsenalConfig
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   const allowedOrigins = ["http://localhost:8080", "http://localhost:5173"];
+  // Allow a deploy-specific frontend origin if provided via env
+  if (process.env.FRONTEND_ORIGIN) {
+    allowedOrigins.push(process.env.FRONTEND_ORIGIN);
+  }
   if (origin && allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
@@ -3492,14 +3496,39 @@ app.get("/api/arsenal-config", (req, res) => {
 });
 
 app.post("/api/arsenal-config", async (req, res) => {
+  const started = Date.now();
   try {
     const userId = req.headers["x-user-id"] || "demo";
-    const cfg = req.body?.config;
-    if (!cfg)
-      return res.status(400).json({ ok: false, error: "Missing config" });
+    let cfg = req.body && req.body.config;
+
+    // Fallback: sometimes body may not be parsed in certain hosted setups; try manual parse if empty
+    if (!cfg && typeof req.body === "string") {
+      try {
+        const parsed = JSON.parse(req.body);
+        cfg = parsed.config;
+      } catch (err) {
+        // ignore JSON parse fallback error
+      }
+    }
+
+    if (!cfg) {
+      return res.status(400).json({ ok: false, error: "Missing config in body" });
+    }
+
+    // Basic shape validation (non-destructive)
+    if (
+      !cfg.features ||
+      typeof cfg.features !== "object" ||
+      !cfg.apps ||
+      typeof cfg.apps !== "object"
+    ) {
+      return res.status(400).json({ ok: false, error: "Invalid config shape" });
+    }
+
     arsenalStore.set(userId, cfg);
-    res.json({ ok: true });
+    res.json({ ok: true, ms: Date.now() - started });
   } catch (e) {
+    console.error("Arsenal POST error:", e);
     res.status(500).json({ ok: false, error: "Failed to save arsenal config" });
   }
 });
