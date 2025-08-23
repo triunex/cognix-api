@@ -1760,9 +1760,8 @@ app.post("/api/arsenal", async (req, res) => {
     const wantsPhD = featureNames.includes("Explain Like PhD");
 
     if (wantsDeep) {
-      // Forward deep research requests to the deployed Cognix deepresearch pipeline.
-      // Prefer an explicit environment override, otherwise fall back to the Render URL.
-      const base = process.env.COGNIX_API_BASE || `https://cognix-api.onrender.com`;
+      // Forward deep research requests to the internal deepresearch pipeline
+      const base = `http://localhost:${process.env.PORT || 10000}`;
       const payload = {
         query,
         max_time: 300,
