@@ -1381,16 +1381,45 @@ User said: "${query}"
 Only the answer, no links or sources.
 `;
 
-    // Format memory history for Gemini if available
-    const chatHistoryFormatted = history.map((msg) => ({
-      role: msg.role,
-      parts: [{ text: msg.content }],
-    }));
+    // Format memory history for Gemini if available.
+    // Accept two history shapes from the frontend:
+    // - Array of strings like "User: ..." or "AI: ..."
+    // - Array of objects like { role, content }
+    const chatHistoryFormatted = (Array.isArray(history) ? history : [])
+      .map((msg) => {
+        try {
+          if (typeof msg === "string") {
+            const trimmed = msg.trim();
+            const role = /^\s*(AI:|Assistant:)/i.test(trimmed)
+              ? "assistant"
+              : /^\s*(User:)/i.test(trimmed)
+              ? "user"
+              : "user";
+            const content = trimmed.replace(/^\s*(AI:|Assistant:|User:)\s*/i, "").trim();
+            if (!content) return null;
+            return { role, parts: [{ text: content }] };
+          }
+          // object shape
+          const role = (msg.role === "ai" || msg.role === "assistant") ? "assistant" : msg.role || "user";
+          const content = (msg.content || msg.text || "").toString().trim();
+          if (!content) return null;
+          return { role, parts: [{ text: content }] };
+        } catch (e) {
+          return null;
+        }
+      })
+      .filter(Boolean);
 
-    const contents = [
+    let contents = [
       ...chatHistoryFormatted,
       { role: "user", parts: [{ text: prompt }] },
     ];
+
+    // Gemini requires at least one initialized part with text/data/inlineData.
+    // If history parsing produced nothing, ensure we send a minimal user content.
+    if (!Array.isArray(contents) || contents.length === 0) {
+      contents = [{ role: "user", parts: [{ text: prompt }] }];
+    }
 
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
