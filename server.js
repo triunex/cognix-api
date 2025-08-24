@@ -1315,6 +1315,40 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
   }
 });
 
+// Helper: normalize frontend history into chat messages for LLMs
+function normalizeHistoryToMessages(history) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .map((msg) => {
+      try {
+        if (typeof msg === "string") {
+          const trimmed = msg.trim();
+          const role = /^\s*(AI:|Assistant:)/i.test(trimmed)
+            ? "assistant"
+            : /^\s*(User:)/i.test(trimmed)
+            ? "user"
+            : "user";
+          const content = trimmed.replace(/^\s*(AI:|Assistant:|User:)\s*/i, "").trim();
+          if (!content) return null;
+          return { role, content };
+        }
+        const role = (msg.role === "ai" || msg.role === "assistant") ? "assistant" : msg.role || "user";
+        const content = (msg.content || msg.text || "").toString().trim();
+        if (!content) return null;
+        return { role, content };
+      } catch (e) {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+// Helper: format history into Gemini 'contents' entries
+function formatHistoryForGemini(history) {
+  const msgs = normalizeHistoryToMessages(history);
+  return msgs.map((m) => ({ role: m.role, parts: [{ text: m.content }] }));
+}
+
 app.post("/api/voice-query", async (req, res) => {
   const query = req.body.query?.trim();
   const history = req.body.history || [];
@@ -1763,7 +1797,7 @@ app.get("/api/article", async (req, res) => {
 });
 
 app.post("/api/arsenal", async (req, res) => {
-  const { query, arsenalConfig } = req.body || {};
+  const { query, arsenalConfig, history } = req.body || {};
   if (!query) return res.status(400).json({ error: "Missing query" });
   const userId = req.headers["x-user-id"] || "demo";
 
@@ -1800,12 +1834,14 @@ app.post("/api/arsenal", async (req, res) => {
     if (wantsDeep) {
       // Forward deep research requests to the internal deepresearch pipeline
       const base = `http://localhost:${process.env.PORT || 10000}`;
+      // include normalized history so deepresearch can incorporate prior turns
       const payload = {
         query,
         max_time: 300,
         depth: "phd",
         maxWeb: 24,
         rounds: 3,
+        history: normalizeHistoryToMessages(history || []),
       };
       console.log("[arsenal] calling deepresearch", payload);
       try {
@@ -1822,7 +1858,8 @@ app.post("/api/arsenal", async (req, res) => {
         response = { answer: "DeepResearch failed", error: e.message };
       }
     } else if (wantsSmart) {
-      const payload = { query };
+      // agentic-v2 can also receive history to make multi-turn behavior
+      const payload = { query, history: normalizeHistoryToMessages(history || []) };
       // Call backend directly (not via Vite dev server) using current process PORT
       const base = `http://localhost:${process.env.PORT || 10000}`;
       console.log("[arsenal] calling agentic-v2", payload);
@@ -1839,10 +1876,15 @@ app.post("/api/arsenal", async (req, res) => {
       }
     } else if (wantsPhD) {
       const phDPrompt = `Explain the following as if you are writing a PhD dissertation:\n\n"${query}"`;
+      // prepend conversation history (if any) so Gemini sees prior turns
+      const contents = [
+        ...formatHistoryForGemini(history || []),
+        { role: "user", parts: [{ text: phDPrompt }] },
+      ].filter(Boolean);
       const geminiResp = await axios.post(
         `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
         {
-          contents: [{ role: "user", parts: [{ text: phDPrompt }] }],
+          contents,
           generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
         }
       );
@@ -3586,33 +3628,37 @@ app.post("/api/arsenal-config", async (req, res) => {
 
 // ------------- Arsenal Orchestrator (simplified implementation) -------------
 app.post("/api/arsenal", async (req, res) => {
-  const { query, arsenalConfig } = req.body || {};
+  const { query, arsenalConfig, history } = req.body || {};
   if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
     let response;
 
     if (arsenalConfig?.features?.includes("Smart Search")) {
-      // Forward to Agentic V2
+      // Forward to Agentic V2 and include history
       const agenticResp = await axios.post(
         "http://localhost:8080/api/agentic-v2",
-        { query }
+        { query, history: normalizeHistoryToMessages(history || []) }
       );
       response = agenticResp.data;
     } else if (arsenalConfig?.features?.includes("Deep Research")) {
-      // Call Agentic V2 but with longer depth
+      // Call Agentic V2 but with longer depth and history
       const agenticResp = await axios.post(
         "http://localhost:8080/api/agentic-v2",
-        { query, maxWeb: 15, topChunks: 20 }
+        { query, maxWeb: 15, topChunks: 20, history: normalizeHistoryToMessages(history || []) }
       );
       response = agenticResp.data;
     } else if (arsenalConfig?.features?.includes("Explain Like PhD")) {
-      // Call Gemini with academic style
+      // Call Gemini with academic style, prefixed by history
       const phDPrompt = `Explain the following as if you are writing a PhD dissertation:\n\n"${query}"`;
+      const contents = [
+        ...formatHistoryForGemini(history || []),
+        { role: "user", parts: [{ text: phDPrompt }] },
+      ].filter(Boolean);
       const geminiResp = await axios.post(
         `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
         {
-          contents: [{ role: "user", parts: [{ text: phDPrompt }] }],
+          contents,
           generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
         }
       );
@@ -3626,7 +3672,7 @@ app.post("/api/arsenal", async (req, res) => {
 
     res.json(response);
   } catch (err) {
-    console.error("Arsenal error:", err.message);
+    console.error("Arsenal error:", err.message || err);
     res.status(500).json({ error: "Arsenal pipeline failed." });
   }
 });
@@ -3647,6 +3693,46 @@ async function callAgenticV2(query) {
   } catch (e) {
     return { tag: "smartSearch", ok: false, error: e.message };
   }
+}
+
+// --- history helpers: normalize frontend history and format for Gemini ---
+function normalizeHistoryToMessages(history) {
+  // history may be an array of strings like "User: ..." or objects { role, content }
+  if (!Array.isArray(history)) return [];
+  const out = [];
+  for (const h of history) {
+    if (!h) continue;
+    if (typeof h === "string") {
+      // try split like "User: hello" or "AI: reply"
+      const m = h.match(/^\s*(User|AI|Assistant|System|Me|You)\s*[:\-]\s*(.*)$/i);
+      if (m) {
+        const r = m[1].toLowerCase().startsWith("user") ? "user" : "assistant";
+        const c = m[2].trim();
+        if (c) out.push({ role: r, content: c });
+      } else {
+        const txt = h.toString().trim();
+        if (txt) out.push({ role: "user", content: txt });
+      }
+    } else if (typeof h === "object") {
+      const role = (h.role || h.sender || "user").toString().toLowerCase();
+      const content = (h.content || h.text || h.message || h.body || "").toString();
+      if (content && content.trim()) out.push({ role: role.startsWith("assistant") || role.startsWith("ai") ? "assistant" : "user", content: content.trim() });
+    }
+  }
+  return out;
+}
+
+function formatHistoryForGemini(history) {
+  const msgs = normalizeHistoryToMessages(history || []);
+  if (!msgs.length) return [];
+  return msgs
+    .map((m) => {
+      const role = m.role === "assistant" ? "assistant" : "user";
+      const text = (m.content || "").toString();
+      if (!text || !text.trim()) return null;
+      return { role, parts: [{ text: text.trim() }] };
+    })
+    .filter(Boolean);
 }
 
 async function callDeepResearch(query) {
