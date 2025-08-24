@@ -2632,7 +2632,10 @@ if (
               maxOutputTokens: maxTokens,
             },
           },
-          { headers: { "Content-Type": "application/json" }, timeout: Math.min(28000, timeLeft()) }
+          {
+            headers: { "Content-Type": "application/json" },
+            timeout: Math.min(28000, timeLeft()),
+          }
         ),
         Math.min(30000, timeLeft())
       );
@@ -3912,6 +3915,103 @@ app.post("/api/autopilot-agent", async (req, res) => {
   } catch (err) {
     console.error("Autopilot Agent Error:", err);
     res.status(500).json({ error: "Agent failed to run" });
+  }
+});
+
+// ---------------- Judge Mode ----------------
+app.post("/api/judge", async (req, res) => {
+  try {
+    const { query } = req.body || {};
+    if (!query) return res.status(400).json({ error: "Missing query" });
+
+    const judgePrompt = `
+You are an impartial but brilliant judge.  
+Your job is to critically evaluate arguments, evidence, and perspectives.  
+
+Rules:  
+- Identify all claims from multiple viewpoints (for vs against).  
+- Examine the quality of evidence (source credibility, logical strength, hidden bias).  
+- Use structured reasoning: What is strong? What is weak? What is missing?  
+- Conclude with a balanced but decisive VERDICT (who/what is stronger and why).  
+
+Format:  
+1. Case Summary (what’s being debated)  
+2. Arguments For  
+3. Arguments Against  
+4. Bias/Flaws in reasoning  
+5. Final Verdict
+`;
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: judgePrompt },
+          { role: "user", content: query },
+        ],
+      }),
+    });
+
+    const data = await response.json();
+    const answer =
+      data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || null;
+    res.json({ answer });
+  } catch (err) {
+    console.error("Judge API Error:", err);
+    res.status(500).json({ error: "Judge mode failed" });
+  }
+});
+
+// ---------------- Contrarian Mode ----------------
+app.post("/api/contrarian", async (req, res) => {
+  try {
+    const { query } = req.body || {};
+    if (!query) return res.status(400).json({ error: "Missing query" });
+
+    const contrarianPrompt = `
+You are a brilliant contrarian thinker.  
+Your goal is to challenge consensus views, play devil’s advocate, and surface overlooked risks or hidden flaws.  
+
+Rules:  
+- Take the main claim and flip it.  
+- Build the strongest possible argument for the opposite side.  
+- Expose hidden risks, weaknesses, unintended consequences.  
+- Be provocative but rational — no trolling, just razor-sharp contrarian logic.  
+
+Format:  
+1. Common Consensus (what most people believe)  
+2. Contrarian Challenge (why this belief could be wrong/dangerous)  
+3. Evidence/Examples supporting contrarian view  
+4. What people miss if they ignore this contrarian insight
+`;
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: contrarianPrompt },
+          { role: "user", content: query },
+        ],
+      }),
+    });
+
+    const data = await response.json();
+    const answer =
+      data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || null;
+    res.json({ answer });
+  } catch (err) {
+    console.error("Contrarian API Error:", err);
+    res.status(500).json({ error: "Contrarian mode failed" });
   }
 });
 
