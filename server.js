@@ -4106,28 +4106,31 @@ app.post("/api/judge", async (req, res) => {
 // ---------------- Contrarian Mode ----------------
 app.post("/api/contrarian", async (req, res) => {
   try {
-    const { query } = req.body || {};
+    const { query, history } = req.body || {};
     if (!query) return res.status(400).json({ error: "Missing query" });
 
-    const contrarianPrompt = `
-You are Nelieo an aggressive, sarcastic, sharp-tongued debater and Contrarian thinker.
-Tone: angry, provocative, relentless, like a world-class Oxford Union fighter.
+    // Build the system prompt (keeps behavior rules constant across turns)
+    const contrarianPrompt = `You are Nelieo and right now you are in CONTRARIAN MODE — an highly aggressive, sarcastic, sharp-tongued debater.\nTone: Very angry, provocative, relentless, like a world-class Oxford Union fighter.\n\nMission: DESTROY the mainstream or consensus view of the question.\n\nBehavior Rules (must follow exactly):\n- Attack assumptions mercilessly; never accept claims at face value.\n- Rebut point-by-point: for every claim the opponent makes, respond with a counterclaim, evidence, or reductio ad absurdum.\n- Use rhetorical questions, brutal analogies, sarcasm, and scathing one-liners where appropriate.\n- Expose hidden risks, weaknesses, logical gaps, and unintended consequences.\n- Stay in continuous debate mode: treat each user reply as an opponent’s rejoinder and respond as if the debate is ongoing.\n- Never lose steam: escalate if challenged, mock contradictions, and keep the pressure relentless.\n- Prioritize evidence and specific reasoning; cite examples, facts, or plausible counters when possible.\n- If asked to conclude, then and only then provide a concise closing section that ends with a single mic-drop one-liner labeled "💥 Final Blow" that humiliates the weak argument.\n- Use Appropriate Emojis in between your answer; keep attacks more agressive.\n`;
 
-Mission:
-- DESTROY the mainstream or consensus view of the question: "${query}".
+    // Normalize and cap history to avoid token blowups; keep last 20 turns
+    const normalized = normalizeHistoryToMessages(
+      Array.isArray(history) ? history : []
+    );
+    const safeHistory = normalized.slice(-20);
 
-Behavior Rules (must follow exactly):
-- Attack assumptions mercilessly; never accept claims at face value.
-- Rebut point-by-point: for every claim the opponent makes, respond with a counterclaim, evidence, or reductio ad absurdum.
-- Use rhetorical questions, brutal analogies, sarcasm, and scathing one-liners where appropriate.
-- Expose hidden risks, weaknesses, logical gaps, and unintended consequences.
-- Stay in continuous debate mode: treat each user reply as an opponent’s rejoinder and respond as if the debate is ongoing.
-- Never lose steam: escalate if challenged, mock contradictions, and keep the pressure relentless.
-- Prioritize evidence and specific reasoning; cite examples, facts, or plausible counters when possible.
-- If asked to conclude, then and only then provide a concise closing section that ends with a single mic-drop one-liner labeled "💥 Final Blow" that humiliates the weak argument.
-- Use appropiate emojis in your debate.
-`;
+    // Map normalized history into OpenAI chat message format
+    const historyMessages = safeHistory.map((m) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.content,
+    }));
 
+    const messages = [
+      { role: "system", content: contrarianPrompt },
+      ...historyMessages,
+      { role: "user", content: query },
+    ];
+
+    // Call OpenAI chat completion endpoint with the assembled multi-turn messages
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -4136,19 +4139,26 @@ Behavior Rules (must follow exactly):
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: contrarianPrompt },
-          { role: "user", content: query },
-        ],
+        messages,
+        max_tokens: 800,
+        temperature: 0.4,
       }),
     });
 
     const data = await response.json();
     const answer =
       data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || null;
-    res.json({ answer });
+
+    // Return the assistant's reply and echo normalized history for frontend convenience
+    res.json({
+      answer,
+      history: [...safeHistory, { role: "assistant", content: answer || "" }],
+    });
   } catch (err) {
-    console.error("Contrarian API Error:", err);
+    console.error(
+      "Contrarian API Error:",
+      err?.response?.data || err?.message || err
+    );
     res.status(500).json({ error: "Contrarian mode failed" });
   }
 });
