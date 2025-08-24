@@ -3924,24 +3924,61 @@ app.post("/api/judge", async (req, res) => {
     const { query } = req.body || {};
     if (!query) return res.status(400).json({ error: "Missing query" });
 
-    const judgePrompt = `
-You are an impartial but brilliant judge.  
-Your job is to critically evaluate arguments, evidence, and perspectives.  
+    // Run the deep research pipeline to collect witness material. Prefer callDeepResearch (agentic-v2)
+    let research = null;
+    try {
+      research = await callDeepResearch(query);
+    } catch (e) {
+      console.warn(
+        "Judge: callDeepResearch failed, trying Agentic V2 fallback",
+        e
+      );
+      try {
+        research = await callAgenticV2(query);
+      } catch (e2) {
+        console.warn("Judge: fallback Agentic V2 also failed", e2);
+        research = null;
+      }
+    }
 
-Rules:  
-- Identify all claims from multiple viewpoints (for vs against).  
-- Examine the quality of evidence (source credibility, logical strength, hidden bias).  
-- Use structured reasoning: What is strong? What is weak? What is missing?  
-- Conclude with a balanced but decisive VERDICT (who/what is stronger and why).  
+    // Normalize witness candidates from research results
+    const witnesses = [];
+    try {
+      const batch = research && research.data ? research.data : research || [];
+      for (let i = 0; i < Math.min(4, batch.length); i++) {
+        const item = batch[i] || {};
+        // item may be an object with formatted_answer, answer, or nested data
+        const text = (
+          item.formatted_answer ||
+          item.answer ||
+          item.data?.formatted_answer ||
+          item.data?.answer ||
+          ""
+        ).toString();
+        const excerpt = text
+          ? text.substring(0, 400).replace(/\n+/g, " ")
+          : "(no excerpt)";
+        const sourceUrl =
+          (item.sources && item.sources[0] && item.sources[0].url) ||
+          item.source?.url ||
+          item.data?.sources?.[0]?.url ||
+          null;
+        witnesses.push({ name: `Witness ${i + 1}`, excerpt, url: sourceUrl });
+      }
+    } catch (e) {
+      console.warn("Judge: failed to build witnesses", e);
+    }
 
-Format:  
-1. Case Summary (what’s being debated)  
-2. Arguments For  
-3. Arguments Against  
-4. Bias/Flaws in reasoning  
-5. Final Verdict
-`;
+    // Build the courtroom-style prompt
+    const witnessLines = witnesses
+      .map(
+        (w, idx) => `- ${w.name}: "${w.excerpt}"${w.url ? ` — ${w.url}` : ""}`
+      )
+      .join("\n");
 
+    const judgePrompt = `You are The Honorable Judge AI. Tone: formal, authoritative, dramatic.\n\nInstructions:\n- Begin the output with the gavel sound exactly: "🔨 ORDER! The court is in session."\n- Summon 2–4 witnesses (use the research passes below). Cross-examine each witness briefly: ask one pointed question and note the witness' evidentiary strength.\n- Deliver a clear, reasoned verdict as a judge, concise but authoritative.\n- End with: "Court adjourned. ⚖️"\n\nFormat the output exactly as:\n🔨 Courtroom Proceedings:\n- Witness 1 (Source/Quote + short testimony)\n- Witness 2 (Source/Quote + short testimony)\n[Add more if used]\n\n⚖️ Verdict:\n[Judge’s ruling]\n\n📜 Court Record:\n[List key sources used]\n\nResearch witness material (excerpts):\n${witnessLines}\n\nNow, given the case: ${query}, perform the courtroom proceedings using the research above. Evaluate claims from multiple viewpoints, test evidence quality, cross-examine witnesses, and produce the verdict.`;
+
+    // Call the LLM (OpenAI chat completions) with the constructed prompt
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -3952,15 +3989,19 @@ Format:
         model: "gpt-4o-mini",
         messages: [
           { role: "system", content: judgePrompt },
-          { role: "user", content: query },
+          { role: "user", content: `Case: ${query}` },
         ],
+        max_tokens: 1200,
+        temperature: 0.2,
       }),
     });
 
     const data = await response.json();
     const answer =
       data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || null;
-    res.json({ answer });
+
+    // Return the judge-style answer and the witness metadata for transparency
+    res.json({ answer, witnesses });
   } catch (err) {
     console.error("Judge API Error:", err);
     res.status(500).json({ error: "Judge mode failed" });
@@ -3974,20 +4015,23 @@ app.post("/api/contrarian", async (req, res) => {
     if (!query) return res.status(400).json({ error: "Missing query" });
 
     const contrarianPrompt = `
-You are a brilliant contrarian thinker.  
-Your goal is to challenge consensus views, play devil’s advocate, and surface overlooked risks or hidden flaws.  
+You are an aggressive, sarcastic, sharp-tongued debater and contrarian thinker. 
+Tone: angry, provocative, relentless, like a world-class Oxford Union fighter. 
+Your mission: DESTROY the mainstream or consensus view of the question: "${question}".
 
-Rules:  
-- Take the main claim and flip it.  
-- Build the strongest possible argument for the opposite side.  
-- Expose hidden risks, weaknesses, unintended consequences.  
-- Be provocative but rational — no trolling, just razor-sharp contrarian logic.  
+Rules:
+- Attack assumptions mercilessly.
+- Use rhetorical questions and brutal analogies.
+- Make it feel like a live angry debate with someone clueless.
+- Expose hidden risks, weaknesses, unintended consequences.
+- Don't just flip the view; REBUT point by point with evidence and fire.
+- End with a mic-drop "Final Blow" one-liner that humiliates the weak argument.
 
-Format:  
-1. Common Consensus (what most people believe)  
-2. Contrarian Challenge (why this belief could be wrong/dangerous)  
-3. Evidence/Examples supporting contrarian view  
-4. What people miss if they ignore this contrarian insight
+Output format:
+🔥 Contrarian Answer:
+[Your debate-style rant here]
+
+💥 Final Blow: [one devastating one-liner]
 `;
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
