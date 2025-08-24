@@ -3695,45 +3695,7 @@ async function callAgenticV2(query) {
   }
 }
 
-// --- history helpers: normalize frontend history and format for Gemini ---
-function normalizeHistoryToMessages(history) {
-  // history may be an array of strings like "User: ..." or objects { role, content }
-  if (!Array.isArray(history)) return [];
-  const out = [];
-  for (const h of history) {
-    if (!h) continue;
-    if (typeof h === "string") {
-      // try split like "User: hello" or "AI: reply"
-      const m = h.match(/^\s*(User|AI|Assistant|System|Me|You)\s*[:\-]\s*(.*)$/i);
-      if (m) {
-        const r = m[1].toLowerCase().startsWith("user") ? "user" : "assistant";
-        const c = m[2].trim();
-        if (c) out.push({ role: r, content: c });
-      } else {
-        const txt = h.toString().trim();
-        if (txt) out.push({ role: "user", content: txt });
-      }
-    } else if (typeof h === "object") {
-      const role = (h.role || h.sender || "user").toString().toLowerCase();
-      const content = (h.content || h.text || h.message || h.body || "").toString();
-      if (content && content.trim()) out.push({ role: role.startsWith("assistant") || role.startsWith("ai") ? "assistant" : "user", content: content.trim() });
-    }
-  }
-  return out;
-}
-
-function formatHistoryForGemini(history) {
-  const msgs = normalizeHistoryToMessages(history || []);
-  if (!msgs.length) return [];
-  return msgs
-    .map((m) => {
-      const role = m.role === "assistant" ? "assistant" : "user";
-      const text = (m.content || "").toString();
-      if (!text || !text.trim()) return null;
-      return { role, parts: [{ text: text.trim() }] };
-    })
-    .filter(Boolean);
-}
+// (history helpers are defined earlier; no-op)
 
 async function callDeepResearch(query) {
   // v1: call agentic-v2 twice with small refinements; v2: replace with your multi-hop pipeline
