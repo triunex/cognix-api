@@ -1328,11 +1328,16 @@ function normalizeHistoryToMessages(history) {
             : /^\s*(User:)/i.test(trimmed)
             ? "user"
             : "user";
-          const content = trimmed.replace(/^\s*(AI:|Assistant:|User:)\s*/i, "").trim();
+          const content = trimmed
+            .replace(/^\s*(AI:|Assistant:|User:)\s*/i, "")
+            .trim();
           if (!content) return null;
           return { role, content };
         }
-        const role = (msg.role === "ai" || msg.role === "assistant") ? "assistant" : msg.role || "user";
+        const role =
+          msg.role === "ai" || msg.role === "assistant"
+            ? "assistant"
+            : msg.role || "user";
         const content = (msg.content || msg.text || "").toString().trim();
         if (!content) return null;
         return { role, content };
@@ -1429,12 +1434,17 @@ Only the answer, no links or sources.
               : /^\s*(User:)/i.test(trimmed)
               ? "user"
               : "user";
-            const content = trimmed.replace(/^\s*(AI:|Assistant:|User:)\s*/i, "").trim();
+            const content = trimmed
+              .replace(/^\s*(AI:|Assistant:|User:)\s*/i, "")
+              .trim();
             if (!content) return null;
             return { role, parts: [{ text: content }] };
           }
           // object shape
-          const role = (msg.role === "ai" || msg.role === "assistant") ? "assistant" : msg.role || "user";
+          const role =
+            msg.role === "ai" || msg.role === "assistant"
+              ? "assistant"
+              : msg.role || "user";
           const content = (msg.content || msg.text || "").toString().trim();
           if (!content) return null;
           return { role, parts: [{ text: content }] };
@@ -1859,7 +1869,10 @@ app.post("/api/arsenal", async (req, res) => {
       }
     } else if (wantsSmart) {
       // agentic-v2 can also receive history to make multi-turn behavior
-      const payload = { query, history: normalizeHistoryToMessages(history || []) };
+      const payload = {
+        query,
+        history: normalizeHistoryToMessages(history || []),
+      };
       // Call backend directly (not via Vite dev server) using current process PORT
       const base = `http://localhost:${process.env.PORT || 10000}`;
       console.log("[arsenal] calling agentic-v2", payload);
@@ -3645,7 +3658,12 @@ app.post("/api/arsenal", async (req, res) => {
       // Call Agentic V2 but with longer depth and history
       const agenticResp = await axios.post(
         "http://localhost:8080/api/agentic-v2",
-        { query, maxWeb: 15, topChunks: 20, history: normalizeHistoryToMessages(history || []) }
+        {
+          query,
+          maxWeb: 15,
+          topChunks: 20,
+          history: normalizeHistoryToMessages(history || []),
+        }
       );
       response = agenticResp.data;
     } else if (arsenalConfig?.features?.includes("Explain Like PhD")) {
@@ -4092,23 +4110,22 @@ app.post("/api/contrarian", async (req, res) => {
     if (!query) return res.status(400).json({ error: "Missing query" });
 
     const contrarianPrompt = `
-You are an aggressive, sarcastic, sharp-tongued debater and contrarian thinker. 
-Tone: angry, provocative, relentless, like a world-class Oxford Union fighter. 
-Your mission: DESTROY the mainstream or consensus view of the question: "${query}".
+You are Nelieo an aggressive, sarcastic, sharp-tongued debater and Contrarian thinker.
+Tone: angry, provocative, relentless, like a world-class Oxford Union fighter.
 
-Rules:
-- Attack assumptions mercilessly.
-- Use rhetorical questions and brutal analogies.
-- Make it feel like a live angry debate with someone clueless.
-- Expose hidden risks, weaknesses, unintended consequences.
-- Don't just flip the view; REBUT point by point with evidence and fire.
-- End with a mic-drop "Final Blow" one-liner that humiliates the weak argument.
+Mission:
+- DESTROY the mainstream or consensus view of the question: "${query}".
 
-Output format:
-🔥 Contrarian Answer:
-[Your debate-style rant here]
-
-💥 Final Blow: [one devastating one-liner]
+Behavior Rules (must follow exactly):
+- Attack assumptions mercilessly; never accept claims at face value.
+- Rebut point-by-point: for every claim the opponent makes, respond with a counterclaim, evidence, or reductio ad absurdum.
+- Use rhetorical questions, brutal analogies, sarcasm, and scathing one-liners where appropriate.
+- Expose hidden risks, weaknesses, logical gaps, and unintended consequences.
+- Stay in continuous debate mode: treat each user reply as an opponent’s rejoinder and respond as if the debate is ongoing.
+- Never lose steam: escalate if challenged, mock contradictions, and keep the pressure relentless.
+- Prioritize evidence and specific reasoning; cite examples, facts, or plausible counters when possible.
+- If asked to conclude, then and only then provide a concise closing section that ends with a single mic-drop one-liner labeled "💥 Final Blow" that humiliates the weak argument.
+- Use appropiate emojis in your debate.
 `;
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
