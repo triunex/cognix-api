@@ -24,6 +24,51 @@ const app = express();
 
 // --- Arsenal config store (simple in-memory map; replace with DB later) ---
 const arsenalStore = new Map(); // key: userId, value: ArsenalConfig
+// --- User instructions store (persisted to disk as a lightweight fallback) ---
+const instructionsStore = new Map(); // key: userId, value: { search, chat, arsenal }
+const INSTRUCTIONS_DIR = path.resolve("data");
+const INSTRUCTIONS_FILE = path.join(INSTRUCTIONS_DIR, "instructions.json");
+
+async function loadInstructionsFromDisk() {
+  try {
+    await fs.mkdir(INSTRUCTIONS_DIR, { recursive: true }).catch(() => {});
+    const txt = await fs.readFile(INSTRUCTIONS_FILE, "utf8").catch(() => null);
+    if (!txt) return;
+    const obj = JSON.parse(txt);
+    for (const [k, v] of Object.entries(obj || {})) {
+      instructionsStore.set(k, v);
+    }
+    console.log("Loaded instructions for", Object.keys(obj).length, "users");
+  } catch (e) {
+    console.warn("Could not load instructions from disk:", e.message || e);
+  }
+}
+
+async function saveInstructionsToDisk() {
+  try {
+    const out = {};
+    for (const [k, v] of instructionsStore.entries()) out[k] = v;
+    await fs.mkdir(INSTRUCTIONS_DIR, { recursive: true }).catch(() => {});
+    await fs.writeFile(INSTRUCTIONS_FILE, JSON.stringify(out, null, 2), "utf8");
+  } catch (e) {
+    console.warn("Could not save instructions to disk:", e.message || e);
+  }
+}
+
+function getInstructionsForUser(userId = "demo") {
+  const def = { search: "", chat: "", arsenal: "" };
+  try {
+    const v = instructionsStore.get(userId);
+    if (!v) return def;
+    return {
+      search: String(v.search || "").slice(0, 5000),
+      chat: String(v.chat || "").slice(0, 5000),
+      arsenal: String(v.arsenal || "").slice(0, 5000),
+    };
+  } catch (e) {
+    return def;
+  }
+}
 
 // More explicit CORS handling to resolve preflight issues (add x-user-id header)
 app.use((req, res, next) => {
@@ -64,6 +109,9 @@ const MEDIA_DIR = path.resolve("media");
 const VIDEO_DIR = path.join(MEDIA_DIR, "videos");
 await fs.mkdir(VIDEO_DIR, { recursive: true }).catch(() => {});
 app.use("/media", express.static(MEDIA_DIR));
+
+// Load persisted instructions into memory (best-effort)
+await loadInstructionsFromDisk().catch(() => {});
 
 function parseResolution(res = "1920x1080") {
   const m = String(res).match(/(\d+)x(\d+)/);
@@ -1841,12 +1889,17 @@ app.post("/api/arsenal", async (req, res) => {
     const wantsSmart = featureNames.includes("Smart Search");
     const wantsPhD = featureNames.includes("Explain Like PhD");
 
+    // Load user instructions and prepend if present
+    const userInstructions = getInstructionsForUser(userId);
+
     if (wantsDeep) {
       // Forward deep research requests to the internal deepresearch pipeline
       const base = `http://localhost:${process.env.PORT || 10000}`;
       // include normalized history so deepresearch can incorporate prior turns
       const payload = {
-        query,
+        query: `${
+          userInstructions.arsenal ? userInstructions.arsenal + "\n\n" : ""
+        }${query}`,
         max_time: 300,
         depth: "phd",
         maxWeb: 24,
@@ -1870,7 +1923,9 @@ app.post("/api/arsenal", async (req, res) => {
     } else if (wantsSmart) {
       // agentic-v2 can also receive history to make multi-turn behavior
       const payload = {
-        query,
+        query: `${
+          userInstructions.arsenal ? userInstructions.arsenal + "\n\n" : ""
+        }${query}`,
         history: normalizeHistoryToMessages(history || []),
       };
       // Call backend directly (not via Vite dev server) using current process PORT
@@ -1888,7 +1943,9 @@ app.post("/api/arsenal", async (req, res) => {
         response = { answer: "Agentic search failed", error: e.message };
       }
     } else if (wantsPhD) {
-      const phDPrompt = `Explain the following as if you are writing a PhD dissertation:\n\n"${query}"`;
+      const phDPrompt = `Explain the following as if you are writing a PhD dissertation:\n\n"${
+        userInstructions.arsenal ? userInstructions.arsenal + "\n\n" : ""
+      }${query}"`;
       // prepend conversation history (if any) so Gemini sees prior turns
       const contents = [
         ...formatHistoryForGemini(history || []),
@@ -2060,6 +2117,39 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
   } catch (err) {
     console.error("Agent error:", err);
     res.status(500).json({ error: "Agent failed." });
+  }
+});
+
+// ---------------- User Instructions endpoints ----------------
+// Get instructions for a user (uses x-user-id header or :userId param)
+app.get("/api/instructions/:userId?", async (req, res) => {
+  const userId = req.params.userId || req.headers["x-user-id"] || "demo";
+  try {
+    const instructions = getInstructionsForUser(userId);
+    return res.json({ userId, instructions });
+  } catch (e) {
+    console.error("/api/instructions GET error:", e.message || e);
+    return res.status(500).json({ error: "Failed to load instructions." });
+  }
+});
+
+// Upsert instructions for a user. Body: { userId?, instructions: { search, chat, arsenal } }
+app.post("/api/instructions", async (req, res) => {
+  const bodyUser = req.body.userId || req.headers["x-user-id"] || "demo";
+  const payload = req.body.instructions || req.body || {};
+  try {
+    const record = {
+      search: String(payload.search || "").slice(0, 5000),
+      chat: String(payload.chat || "").slice(0, 5000),
+      arsenal: String(payload.arsenal || "").slice(0, 5000),
+    };
+    instructionsStore.set(bodyUser, record);
+    // persist to disk (best-effort)
+    await saveInstructionsToDisk().catch((e) => console.warn(e));
+    return res.json({ ok: true, userId: bodyUser, instructions: record });
+  } catch (e) {
+    console.error("/api/instructions POST error:", e.message || e);
+    return res.status(500).json({ error: "Failed to save instructions." });
   }
 });
 
