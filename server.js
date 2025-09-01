@@ -1539,7 +1539,7 @@ Output contract: return only the assistant's reply as plain text (no JSON, no ex
 `;
 
     const contentsForGemini = [
-      { role: "system", parts: [{ text: voiceSystemPrompt }] },
+      { role: "user", parts: [{ text: `SYSTEM INSTRUCTION:\n${voiceSystemPrompt}` }] },
       ...chatHistoryFormatted,
       { role: "user", parts: [{ text: prompt }] },
     ].filter(Boolean);
@@ -1717,7 +1717,7 @@ Give answer in the friendly way and talk like a smart , helpful and chill Gen Z 
 
     // Ensure model receives a system instruction first to define persona/contract
     const contentsForGemini = [
-      { role: "system", parts: [{ text: systemPrompt }] },
+      { role: "user", parts: [{ text: `SYSTEM INSTRUCTION:\n${systemPrompt}` }] },
       ...formattedHistory,
       { role: "user", parts: [{ text: promptWithStructure }] },
     ].filter(Boolean);
