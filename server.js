@@ -1370,198 +1370,6 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
   }
 });
 
-// ---------------- Adaptive Auto Answer Endpoint ----------------
-// Decides whether to answer directly, do a lightweight search, or escalate to agentic-v2.
-// Returns: { mode_used, style, answer, sources?, images? }
-app.post("/api/auto-answer", async (req, res) => {
-  const originalQuery = (req.body?.query || "").trim();
-  if (!originalQuery) return res.status(400).json({ error: "Missing query" });
-
-  const userId = req.headers["x-user-id"] || req.query.userId || "demo";
-  const userInstructions = getInstructionsForUser(userId);
-  const query = `${
-    userInstructions.search ? userInstructions.search + "\n\n" : ""
-  }${originalQuery}`;
-
-  // Fast heuristic pre-pass to avoid LLM classify when trivial
-  function heuristicSimple(q) {
-    const lower = q.toLowerCase();
-    if (
-      lower.length < 60 &&
-      /^(what is|who is|define|meaning of|synonym|time in|date|convert )/.test(
-        lower
-      )
-    )
-      return true;
-    if (/(weather|time|date) (in|at) /.test(lower)) return true;
-    return false;
-  }
-
-  // LLM classification (small token) to decide complexity & style
-  async function classify(q) {
-    if (heuristicSimple(q)) {
-      return { complexity: "simple", intent: "fact", style: "concise" };
-    }
-    const classifyPrompt = `Classify the user query and respond ONLY in minified JSON with keys: complexity(one of simple,informational,comparative,multi-step,research), intent (one of fact,how,why,compare,plan,code,news,finance,science), style (one of concise,bullets,steps,comparison,deep_report,table,faq).
-Query: "${q}"
-Return JSON:`;
-    try {
-      const resp = await axios.post(
-        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          contents: [{ role: "user", parts: [{ text: classifyPrompt }] }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
-        },
-        { headers: { "Content-Type": "application/json" } }
-      );
-      const raw = resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      try {
-        const json = JSON.parse(raw.replace(/```json|```/g, "").trim());
-        return json;
-      } catch (e) {
-        return {
-          complexity: "informational",
-          intent: "fact",
-          style: "bullets",
-        };
-      }
-    } catch (e) {
-      return { complexity: "informational", intent: "fact", style: "bullets" };
-    }
-  }
-
-  try {
-    const meta = await classify(originalQuery);
-    const complexity = meta.complexity || "informational";
-    const intent = meta.intent || "fact";
-    let style = meta.style || "bullets";
-
-    // Decision: choose execution mode
-    let mode_used = "simple"; // simple | search | agentic
-    if (complexity === "research" || complexity === "multi-step")
-      mode_used = "agentic";
-    else if (complexity === "comparative") mode_used = "agentic";
-    else if (intent === "news" || intent === "science") mode_used = "agentic";
-    else if (!heuristicSimple(originalQuery)) mode_used = "search"; // need at least lightweight search
-
-    // Map style fallbacks based on intent
-    if (style === "comparison" && intent !== "compare")
-      style = intent === "plan" ? "steps" : "bullets";
-    if (intent === "compare" && style === "concise") style = "comparison";
-    if (intent === "how" && style === "concise") style = "steps";
-    if (intent === "plan" && style === "concise") style = "steps";
-
-    // Execution branches
-    if (mode_used === "agentic") {
-      // Delegate to existing agentic-v2
-      try {
-        const agenticResp = await axios.post(
-          `${req.protocol}://${req.get("host")}/api/agentic-v2`,
-          { query: originalQuery }
-        );
-        const data = agenticResp.data || {};
-        const answerText = data.formatted_answer || data.answer || "";
-        return res.json({
-          mode_used,
-          style: style === "concise" ? "deep_report" : style,
-          // Provide fallback mapping
-          answer: answerText,
-          sources: data.sources || [],
-          images: data.images || [],
-        });
-      } catch (e) {
-        console.warn("auto-answer agentic fallback error", e.message || e);
-        // Continue to lightweight fallback
-      }
-    }
-
-    if (mode_used === "simple") {
-      // Very concise direct answer prompt (no external search to save tokens)
-      const directPrompt = `Answer the following user query in a ${
-        style === "concise"
-          ? "single short paragraph (<=80 words)"
-          : "few bullet points (<=6)"
-      }. Avoid fluff. Query: "${originalQuery}"`;
-      const resp = await axios.post(
-        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          contents: [{ role: "user", parts: [{ text: directPrompt }] }],
-          generationConfig: { temperature: 0.4, maxOutputTokens: 180 },
-        },
-        { headers: { "Content-Type": "application/json" } }
-      );
-      const text = resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      return res.json({ mode_used, style, answer: text.trim(), sources: [] });
-    }
-
-    // Lightweight search path
-    try {
-      const serpResponse = await axios.get("https://serpapi.com/search", {
-        params: {
-          engine: "google",
-          q: query,
-          api_key: process.env.SERPAPI_API_KEY,
-        },
-        timeout: 8000,
-      });
-      const results = serpResponse.data.organic_results?.slice(0, 4) || [];
-      const context = results
-        .map(
-          (r, i) =>
-            `${i + 1}. ${r.title}\n${r.snippet || ""}\nSource: ${r.link}`
-        )
-        .join("\n\n");
-      const lengthDirective =
-        style === "concise"
-          ? "Limit to <=90 words."
-          : style === "bullets"
-          ? "Respond with 5-7 crisp bullet points."
-          : style === "steps"
-          ? "Provide clear numbered steps (<=8)."
-          : style === "comparison"
-          ? "Provide a short comparison table then a 2-sentence summary."
-          : "Provide a structured mini-report with short sections.";
-      const answerPrompt = `You are Nelieo adaptive answer AI. Style: ${style}. ${lengthDirective}\nQuery: ${originalQuery}\n\nSearch Context:\n${context}\n\nAnswer:`;
-      const resp = await axios.post(
-        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          contents: [{ role: "user", parts: [{ text: answerPrompt }] }],
-          generationConfig: { temperature: 0.5, maxOutputTokens: 400 },
-        },
-        { headers: { "Content-Type": "application/json" } }
-      );
-      const text = resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      const sources = results.map((r) => ({
-        title: r.title,
-        url: r.link,
-        snippet: r.snippet,
-      }));
-      let images = [];
-      try {
-        const imgRes = await fetch(
-          `https://serpapi.com/search.json?q=${encodeURIComponent(
-            originalQuery
-          )}&tbm=isch&api_key=${process.env.SERPAPI_API_KEY}`
-        );
-        const json = await imgRes.json();
-        images = json.images_results?.slice(0, 4).map((i) => i.thumbnail) || [];
-      } catch (e) {}
-      return res.json({
-        mode_used,
-        style,
-        answer: text.trim(),
-        sources,
-        images,
-      });
-    } catch (e) {
-      return res.status(500).json({ error: "Lightweight search failed" });
-    }
-  } catch (err) {
-    console.error("auto-answer error", err);
-    return res.status(500).json({ error: "Auto-answer failed" });
-  }
-});
-
 // Helper: normalize frontend history into chat messages for LLMs
 function normalizeHistoryToMessages(history) {
   if (!Array.isArray(history)) return [];
@@ -1731,10 +1539,7 @@ Output contract: return only the assistant's reply as plain text (no JSON, no ex
 `;
 
     const contentsForGemini = [
-      {
-        role: "user",
-        parts: [{ text: `SYSTEM INSTRUCTION:\n${voiceSystemPrompt}` }],
-      },
+      { role: "user", parts: [{ text: `SYSTEM INSTRUCTION:\n${voiceSystemPrompt}` }] },
       ...chatHistoryFormatted,
       { role: "user", parts: [{ text: prompt }] },
     ].filter(Boolean);
@@ -1912,10 +1717,7 @@ Give answer in the friendly way and talk like a smart , helpful and chill Gen Z 
 
     // Ensure model receives a system instruction first to define persona/contract
     const contentsForGemini = [
-      {
-        role: "user",
-        parts: [{ text: `SYSTEM INSTRUCTION:\n${systemPrompt}` }],
-      },
+      { role: "user", parts: [{ text: `SYSTEM INSTRUCTION:\n${systemPrompt}` }] },
       ...formattedHistory,
       { role: "user", parts: [{ text: promptWithStructure }] },
     ].filter(Boolean);
