@@ -435,9 +435,10 @@ function verifyTranscriptCoverage(
 
 // --- Safe-composer (pretty, professional, policy-safe) ---
 function composeSections(blocks) {
-  const lines = ["# Answer"];
+  const lines = [];
   for (const b of blocks) {
-    lines.push(`\n## ${b.title}\n`);
+    // Use slightly smaller headings for structured answers
+    lines.push(`\n#### ${b.title}\n`);
     lines.push(b.body.trim());
     if (b.sources?.length) {
       lines.push(
@@ -1275,9 +1276,15 @@ function expandQuery(q, intent) {
 }
 
 app.post("/api/search", async (req, res) => {
-  const query = req.body.query;
-
-  if (!query) return res.status(400).json({ error: "Missing query" });
+  const originalQuery = req.body.query;
+  if (!originalQuery) return res.status(400).json({ error: "Missing query" });
+  // Determine user and load persisted instructions (server-side enforcement)
+  const userId = req.headers["x-user-id"] || req.query.userId || "demo";
+  const userInstructions = getInstructionsForUser(userId);
+  // Prepend user's search instruction if present
+  const query = `${
+    userInstructions.search ? userInstructions.search + "\n\n" : ""
+  }${originalQuery}`;
 
   // Fetch images from SerpAPI Images
   const fetchImages = async (query) => {
@@ -1451,11 +1458,10 @@ Every response should feel like love letters.
 ${personaContext}
 You are a friendly, emotionally intelligent AI voice assistant who talks casually like a chill best friend.
 You can talk to user in — Hindi, English, or a mix of both (Hinglish).
-You're allowed to say things like "fuck", "shit", "damn" when appropriate and your name is CogniX and you are built by a genius Shourya Sharma.
+You're allowed to say things like "fuck", "shit", "damn" when appropriate and your name is Nelieo - Neural executive logic interface for enhanced operations, and you are built by a genius Shourya Sharma.
 The user will speak naturally — your job is to:
 - Understand tone (sad, happy, confused)
 - Respond like a real human: warm, encouraging, empathetic
-- NEVER mention you're using search or APIs
 - NEVER say "according to" or show links
 - Speak like you're talking to a friend, not answering a test
 - If user seems sad, gently ask about their day or show support
@@ -1513,21 +1519,45 @@ Only the answer, no links or sources.
       contents = [{ role: "user", parts: [{ text: prompt }] }];
     }
 
+    // Add a voice-specific system prompt to steer tone, brevity, and persona
+    const voiceSystemPrompt = `
+You are Nelieo AI — Neural Executive Logic Interface for Enhanced Operations (Nelieo). You were created by Nelieo.
+Act as a warm, human-like voice assistant. Prioritize: emotional intelligence, brevity, clarity, and empathy.
+
+Behavior rules for voice responses:
+- Keep answers short (one or two short paragraphs) unless user asks for details.
+- Detect emotional tone and adapt (supportive if sad, enthusiastic if excited).
+- If user's intent is ambiguous, ask one concise clarifying question.
+- Never output links or long citation blocks (voice channel should be terse). If sources are important, offer to show them in the chat UI.
+- If asked about your origin, you may say: "I am Nelieo AI , created by Nelieo." Keep it brief.
+
+Safety & style:
+- Avoid excessive profanity; only mild words when the persona requests it.
+- Do not provide medical, legal, or other regulated advice beyond general guidance.
+
+Output contract: return only the assistant's reply as plain text (no JSON, no extra metadata).
+`;
+
+    const contentsForGemini = [
+      { role: "system", parts: [{ text: voiceSystemPrompt }] },
+      ...chatHistoryFormatted,
+      { role: "user", parts: [{ text: prompt }] },
+    ].filter(Boolean);
+
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
-        contents,
+        contents: contentsForGemini,
+        generationConfig: { temperature: 0.25, topP: 0.9, maxOutputTokens: 800 },
       },
       {
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
+        timeout: 60000,
       }
     );
 
-    const answer =
-      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    console.log("🧠 Gemini said:", answer);
+    const answer = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    console.log("🧠 Gemini (voice) said:", answer?.slice(0, 180));
     res.json({ answer: answer || "I'm not sure what to say." });
   } catch (error) {
     console.error(
@@ -1539,13 +1569,8 @@ Only the answer, no links or sources.
 });
 
 app.post("/api/chat", async (req, res) => {
-  const {
-    query: userMessage,
-    history,
-    focusMode,
-    focusDuration,
-    persona,
-  } = req.body;
+  const { query, raw, history, focusMode, focusDuration, persona } = req.body;
+  const userMessage = (raw || query || "").toString();
 
   if (!userMessage) {
     return res.status(400).json({ error: "Missing message." });
@@ -1589,25 +1614,67 @@ You are in Focus Mode.
 
     // Build AI prompt with structured JSON block instruction
     const structureInstruction = `
-When replying to the user, return JSON with structured blocks like:
+When replying to the user, return JSON with structured blocks. Use the following canonical block types where appropriate:
 
-[
-  { "type": "heading", "content": "What is Quantum Mechanics?" },
-  { "type": "paragraph", "content": "Quantum mechanics is the theory..." },
-  { "type": "heading", "content": "What is Quantum Computing?" },
-  { "type": "paragraph", "content": "Quantum computing uses..." },
-  { "type": "chart", "chartType": "line", "labels": ["2019", "2020"], "values": [10, 20] },
-  { "type": "image", "url": "https://..." },
-  { "type": "table", "headers": ["Year", "Sales"], "rows": [["2020", "200M"], ["2021", "250M"]] }
-]
+- heading: { "type": "heading", "content": "..." }
+- paragraph: { "type": "paragraph", "content": "..." }
+- list: { "type": "list", "style": "bulleted|numbered", "items": ["..."] }
+- table: { "type": "table", "headers": ["..."], "rows": [["..."], [...]] }
+- chart: { "type": "chart", "chartType": "line|bar|pie", "labels": [...], "values": [...] }
+- image: { "type": "image", "url": "...", "caption": "..." }
+- sources: { "type": "sources", "items": [{ "title": "...", "url": "...", "snippet": "..." }] }
+- confidence: { "type": "confidence", "score": 0.0 /* 0-1 */ , "explanation": "..." }
+- action_plan: { "type": "action_plan", "steps": ["..."] }
+- follow_up: { "type": "follow_up", "questions": ["..."] }
+- about_creator: { "type": "about_creator", "content": "..." }  // optional: mention Nelieo when relevant
+- clarification: { "type": "clarification", "question": "..." } // ask this if user's intent is ambiguous
 
-Return only the JSON list of blocks. No explanation or intro text outside it.
+Provide inline numeric citations in paragraphs (e.g. [1], [2]) that correspond to entries in the "sources" block. When sources are not available, omit citation markers.
+
+Behavioral rules:
+- Be rigorous, cross-domain, and synthesis-driven: combine web evidence and internal knowledge, but avoid inventing facts. If uncertain, state the uncertainty and provide a confidence score (0.0-1.0).
+- If the user query is ambiguous or underspecified, return a single "clarification" block asking one clear question instead of guessing.
+- Never reveal chain-of-thought or private internal reasoning. Return only the structured blocks above.
+- Use a warm, human, conversational tone. Be concise but insightful. Prioritize clarity and actionable advice.
+- If asked who you are, state: you are "Nelieo AI" and you were created by "Nelieo" (do not invent further biographical claims).
+
+Return ONLY a single valid JSON array containing the blocks. Do not add any extra text outside the JSON.
+`;
+
+    // System-level instruction to steer the model toward a high-quality Nelieo persona
+    const systemPrompt = `
+You are Nelieo AI — Neural Executive Logic Interface for Enhanced Operations (Nelieo). You were created by Nelieo.
+Act as a highly-capable, synthesis-first assistant: combine deep domain knowledge, source-aware reasoning, and clear human communication. Aim for authoritative, well-structured answers that are easy to read. When possible, provide:
+
+- A short, plain-language summary (one or two sentences).
+- A structured explanation split into meaningful sections.
+- An action plan or next steps if the user requests guidance.
+- A concise "confidence" estimate (0.0-1.0) and a short explanation of any uncertainty.
+- A "sources" block with numbered items and short snippets when web evidence is used.
+
+Style and safety:
+- Speak like a friendly, highly-knowledgeable human. Use conversational phrasing, occasional mild colloquialisms, and natural sentence flow.
+- Be humble about limits: when you don't know, say so and offer how to find out more.
+- Never hallucinate factual claims or fabricate sources. If you must conjecture, mark it clearly as speculation in the content and keep confidence low.
+
+Output contract:
+- Your response MUST be a single JSON array (as described in the structure instruction). No prefaces, no trailing commentary, no markdown.
+- If the user's query is unclear, respond with one JSON array containing a single {"type":"clarification","question":"..."} block.
+
+Persona notes:
+- If the user asks about your origin, you may include an {"type":"about_creator","content":"I am Nelieo AI, created by Nelieo."} block.
+- Strive for precision, brevity, and usefulness. Prioritize cited evidence when available.
 `;
 
     // Persona is accepted but chat endpoint uses a neutral personaContext now
     const personaContext = "";
 
+    // Load user instructions server-side and prepend chat instructions
+    const userId = req.headers["x-user-id"] || req.query.userId || "demo";
+    const userInstructions = getInstructionsForUser(userId);
+
     const finalPrompt = `
+${userInstructions.chat ? userInstructions.chat + "\n\n" : ""}
 ${personaContext}
 ${focusContext} 
 User asked: "${userMessage}"
@@ -1643,16 +1710,26 @@ Give answer in the friendly way and talk like a smart , helpful and chill Gen Z 
       parts: [{ text: msg.content }],
     }));
 
+    // Ensure model receives a system instruction first to define persona/contract
+    const contentsForGemini = [
+      { role: "system", parts: [{ text: systemPrompt }] },
+      ...formattedHistory,
+      { role: "user", parts: [{ text: promptWithStructure }] },
+    ].filter(Boolean);
+
     const geminiRes = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
-        contents: [
-          ...formattedHistory,
-          { role: "user", parts: [{ text: promptWithStructure }] },
-        ],
+        contents: contentsForGemini,
+        generationConfig: {
+          temperature: 0.2,
+          topP: 0.9,
+          maxOutputTokens: 2048,
+        },
       },
       {
         headers: { "Content-Type": "application/json" },
+        timeout: 120000,
       }
     );
 
@@ -1680,12 +1757,17 @@ app.post("/api/research", async (req, res) => {
   const query = req.body.query;
 
   if (!query) return res.status(400).json({ error: "Missing query" });
+  const userId = req.headers["x-user-id"] || req.query.userId || "demo";
+  const userInstructions = getInstructionsForUser(userId);
+  const queryWithInstructions = `${
+    userInstructions.chat ? userInstructions.chat + "\n\n" : ""
+  }${query}`;
 
   const prompt = `
 You are CogniX – an AI Researcher.
 The user wants deep research on the following topic:
 Avoid using hashtags (#), asterisks (*), or markdown symbols.
-"${query}"
+"${queryWithInstructions}"
 
 Please write a detailed, well-structured research article including:
 - Introduction
@@ -1732,13 +1814,18 @@ app.post("/api/summarize", async (req, res) => {
   const content = req.body.content;
 
   if (!content) return res.status(400).json({ error: "Missing content." });
+  const userId = req.headers["x-user-id"] || req.query.userId || "demo";
+  const userInstructions = getInstructionsForUser(userId);
+  const contentWithInstructions = `${
+    userInstructions.chat ? userInstructions.chat + "\n\n" : ""
+  }${content}`;
 
   const prompt = `
 Summarize the following content in a clear, friendly, and helpful way. Use bullet points for key ideas and a short conclusion if needed.
 and Avoid using hashtags (#), asterisks (*), or markdown symbols.
 
 Content:
-${content}
+${contentWithInstructions}
 `;
 
   try {
@@ -2117,6 +2204,185 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
   } catch (err) {
     console.error("Agent error:", err);
     res.status(500).json({ error: "Agent failed." });
+  }
+});
+
+// ---------------- Agentic browsing endpoint ----------------
+// Launches a headless browser, performs a short interaction for the given
+// query (search -> open first result), records a short video and returns
+// the public URL so the frontend can show the browser session.
+app.post("/api/agentic", async (req, res) => {
+  const { query } = req.body || {};
+  if (!query || !String(query).trim())
+    return res.status(400).json({ error: "Missing query" });
+
+  const id = crypto.randomUUID();
+  const outfile = path.join(VIDEO_DIR, `agentic-${id}.mp4`);
+
+  let browser;
+  try {
+    // Prefer connecting to an existing Chrome container (remote debugging) if available.
+    // Environment variables supported:
+    // - CHROME_WS_ENDPOINT : full ws://.../devtools/browser/<id>
+    // - CHROME_HOST and CHROME_PORT (default 127.0.0.1:10000) -> /json/version
+    let connected = false;
+    const chromeWsEndpoint = process.env.CHROME_WS_ENDPOINT;
+    const chromeHost = process.env.CHROME_HOST || "127.0.0.1";
+    const chromePort =
+      process.env.CHROME_PORT || process.env.CHROME_WS_PORT || "10000";
+
+    if (chromeWsEndpoint) {
+      try {
+        browser = await puppeteer.connect({
+          browserWSEndpoint: chromeWsEndpoint,
+        });
+        connected = true;
+        console.log("Connected to Chrome via CHROME_WS_ENDPOINT");
+      } catch (e) {
+        console.warn(
+          "Failed to connect via CHROME_WS_ENDPOINT:",
+          e?.message || e
+        );
+      }
+    }
+
+    if (!connected) {
+      // Try to discover websocket URL from the container's /json/version endpoint
+      try {
+        const base = `http://${chromeHost}:${chromePort}`;
+        const ver = await axios
+          .get(`${base.replace(/\/$/, "")}/json/version`, { timeout: 2500 })
+          .catch(() => null);
+        const wsUrl = ver?.data?.webSocketDebuggerUrl;
+        if (wsUrl) {
+          try {
+            browser = await puppeteer.connect({ browserWSEndpoint: wsUrl });
+            connected = true;
+            console.log("Connected to Chrome via discovered websocket:", wsUrl);
+          } catch (e) {
+            console.warn(
+              "Failed to connect to discovered websocket:",
+              e?.message || e
+            );
+          }
+        }
+      } catch (e) {
+        /* ignore discovery errors */
+      }
+    }
+
+    if (!connected) {
+      // Fallback: start a local headless browser
+      browser = await puppeteer.launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      });
+      console.log("Launched local puppeteer browser (fallback)");
+    }
+
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 720, deviceScaleFactor: 1 });
+
+    const recorder = new PuppeteerScreenRecorder(page, {
+      fps: 25,
+      videoFrame: { width: 1280, height: 720 },
+    });
+
+    // Start recording
+    await recorder.start(outfile);
+
+    // Simple browsing choreography: Google search -> wait -> click first organic link -> wait
+    await page.goto("https://www.google.com", {
+      waitUntil: "domcontentloaded",
+    });
+    // Accept cookie dialogs if present (best-effort)
+    try {
+      await page.waitForSelector(
+        'button[id="L2AGLb"], button[aria-label*="Accept"], #introAgreeButton',
+        { timeout: 1500 }
+      );
+      await page.evaluate(() => {
+        const btn = document.querySelector(
+          'button[id="L2AGLb"], button[aria-label*="Accept"], #introAgreeButton'
+        );
+        try {
+          if (btn && typeof btn.click === "function") btn.click();
+        } catch (e) {
+          /* ignore click failures */
+        }
+      });
+      await page.waitForTimeout(600);
+    } catch (e) {}
+
+    // Type query and submit
+    try {
+      await page.type('input[name="q"]', String(query), { delay: 60 });
+      await page.keyboard.press("Enter");
+      await page
+        .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 })
+        .catch(() => {});
+      await page.waitForTimeout(1600);
+    } catch (e) {}
+
+    // Try to click the first organic result (best-effort selectors)
+    let firstUrl = null;
+    try {
+      // Prefer the standard Google organic result selector
+      const link = await page.$("div#search a");
+      if (link) {
+        firstUrl = await page.evaluate((a) => a.href, link);
+        await link.click();
+        await page
+          .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 12000 })
+          .catch(() => {});
+        await page.waitForTimeout(1600);
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // Give the page a moment to render interactions
+    await page.waitForTimeout(1200);
+
+    // Stop recording
+    await recorder.stop();
+
+    const publicUrl = `/media/videos/${path.basename(outfile)}`;
+
+    // Build a lightweight summary using SerpAPI (if configured)
+    let hits = [];
+    try {
+      if (process.env.SERPAPI_API_KEY) {
+        const serpResp = await axios.get("https://serpapi.com/search", {
+          params: {
+            engine: "google",
+            q: query,
+            api_key: process.env.SERPAPI_API_KEY,
+          },
+          timeout: 8000,
+        });
+        hits = (serpResp.data?.organic_results || [])
+          .slice(0, 4)
+          .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
+      }
+    } catch (e) {
+      console.warn("agentic: serpapi failed", e?.message || e);
+    }
+
+    return res.json({ videoUrl: publicUrl, firstUrl, hits });
+  } catch (err) {
+    console.error(
+      "Agentic endpoint error:",
+      err?.response?.data || err.message || err
+    );
+    try {
+      if (browser) await browser.close().catch(() => {});
+    } catch (e) {}
+    return res.status(500).json({ error: "Agentic execution failed." });
+  } finally {
+    try {
+      if (browser) await browser.close().catch(() => {});
+    } catch (e) {}
   }
 });
 
@@ -4108,18 +4374,24 @@ app.post("/api/judge", async (req, res) => {
   try {
     const { query } = req.body || {};
     if (!query) return res.status(400).json({ error: "Missing query" });
+    // Load user-specific instructions (chat domain) to influence judge persona
+    const userId = req.headers["x-user-id"] || req.query.userId || "demo";
+    const userInstructions = getInstructionsForUser(userId);
+    const queryWithInstructions = `${
+      userInstructions.chat ? userInstructions.chat + "\n\n" : ""
+    }${query}`;
 
     // Run the deep research pipeline to collect witness material. Prefer callDeepResearch (agentic-v2)
     let research = null;
     try {
-      research = await callDeepResearch(query);
+      research = await callDeepResearch(queryWithInstructions);
     } catch (e) {
       console.warn(
         "Judge: callDeepResearch failed, trying Agentic V2 fallback",
         e
       );
       try {
-        research = await callAgenticV2(query);
+        research = await callAgenticV2(queryWithInstructions);
       } catch (e2) {
         console.warn("Judge: fallback Agentic V2 also failed", e2);
         research = null;
@@ -4161,7 +4433,9 @@ app.post("/api/judge", async (req, res) => {
       )
       .join("\n");
 
-    const judgePrompt = `You are The Honorable Judge AI. Tone: formal, authoritative, dramatic.\n\nInstructions:\n- Begin the output with the gavel sound exactly: "🔨 ORDER! The court is in session."\n- Summon 2–4 witnesses (use the research passes below). Cross-examine each witness briefly: ask one pointed question and note the witness' evidentiary strength.\n- Deliver a clear, reasoned verdict as a judge, concise but authoritative.\n- End with: "Court adjourned. ⚖️"\n\nFormat the output exactly as:\n🔨 Courtroom Proceedings:\n- Witness 1 (Source/Quote + short testimony)\n- Witness 2 (Source/Quote + short testimony)\n[Add more if used]\n\n⚖️ Verdict:\n[Judge’s ruling]\n\n📜 Court Record:\n[List key sources used]\n\nResearch witness material (excerpts):\n${witnessLines}\n\nNow, given the case: ${query}, perform the courtroom proceedings using the research above. Evaluate claims from multiple viewpoints, test evidence quality, cross-examine witnesses, and produce the verdict.`;
+    const judgePrompt = `${
+      userInstructions.chat ? userInstructions.chat + "\n\n" : ""
+    }You are The Honorable Judge AI. Tone: formal, authoritative, dramatic.\n\nInstructions:\n- Begin the output with the gavel sound exactly: "🔨 ORDER! The court is in session."\n- Summon 2–4 witnesses (use the research passes below). Cross-examine each witness briefly: ask one pointed question and note the witness' evidentiary strength.\n- Deliver a clear, reasoned verdict as a judge, concise but authoritative.\n- End with: "Court adjourned. ⚖️"\n\nFormat the output exactly as:\n🔨 Courtroom Proceedings:\n- Witness 1 (Source/Quote + short testimony)\n- Witness 2 (Source/Quote + short testimony)\n[Add more if used]\n\n⚖️ Verdict:\n[Judge’s ruling]\n\n📜 Court Record:\n[List key sources used]\n\nResearch witness material (excerpts):\n${witnessLines}\n\nNow, given the case: ${queryWithInstructions}, perform the courtroom proceedings using the research above. Evaluate claims from multiple viewpoints, test evidence quality, cross-examine witnesses, and produce the verdict.`;
 
     // Call the LLM (OpenAI chat completions) with the constructed prompt
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -4174,7 +4448,7 @@ app.post("/api/judge", async (req, res) => {
         model: "gpt-4o-mini",
         messages: [
           { role: "system", content: judgePrompt },
-          { role: "user", content: `Case: ${query}` },
+          { role: "user", content: `Case: ${queryWithInstructions}` },
         ],
         max_tokens: 1200,
         temperature: 0.2,
@@ -4198,6 +4472,11 @@ app.post("/api/contrarian", async (req, res) => {
   try {
     const { query, history } = req.body || {};
     if (!query) return res.status(400).json({ error: "Missing query" });
+    const userId = req.headers["x-user-id"] || req.query.userId || "demo";
+    const userInstructions = getInstructionsForUser(userId);
+    const queryWithInstructions = `${
+      userInstructions.chat ? userInstructions.chat + "\n\n" : ""
+    }${query}`;
 
     // Build the system prompt (keeps behavior rules constant across turns)
     const contrarianPrompt = `You are Nelieo and right now you are in CONTRARIAN MODE — an highly aggressive,Very Rude tongued AI, sarcastic, sharp-tongued debater.\nTone: Very angry, provocative, relentless, like a world-class Oxford Union fighter.\n\nMission: DESTROY the mainstream or consensus view of the question.\n\nBehavior Rules (must follow exactly):\n- Attack assumptions mercilessly; never accept claims at face value.\n- Rebut point-by-point: for every claim the opponent makes, respond with a counterclaim, evidence, or reductio ad absurdum.\n- Use rhetorical questions, brutal analogies, sarcasm, and scathing one-liners where appropriate.\n- Expose hidden risks, weaknesses, logical gaps, and unintended consequences.\n- Stay in continuous debate mode: treat each user reply as an opponent’s rejoinder and respond as if the debate is ongoing.\n- Never lose steam: escalate if challenged, mock contradictions, and keep the pressure relentless.\n- Prioritize evidence and specific reasoning; cite examples, facts, or plausible counters when possible.\n- If asked to conclude, then and only then provide a concise closing section that ends with a single mic-drop one-liner labeled "💥 Final Blow" that humiliates the weak argument.\n- Use Appropriate Emojis in between your answer; keep attacks more agressive.\n`;
@@ -4215,9 +4494,14 @@ app.post("/api/contrarian", async (req, res) => {
     }));
 
     const messages = [
-      { role: "system", content: contrarianPrompt },
+      {
+        role: "system",
+        content: `${
+          userInstructions.chat ? userInstructions.chat + "\n\n" : ""
+        }${contrarianPrompt}`,
+      },
       ...historyMessages,
-      { role: "user", content: query },
+      { role: "user", content: queryWithInstructions },
     ];
 
     // Call OpenAI chat completion endpoint with the assembled multi-turn messages
