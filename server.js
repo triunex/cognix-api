@@ -1548,7 +1548,11 @@ Output contract: return only the assistant's reply as plain text (no JSON, no ex
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         contents: contentsForGemini,
-        generationConfig: { temperature: 0.25, topP: 0.9, maxOutputTokens: 800 },
+        generationConfig: {
+          temperature: 0.25,
+          topP: 0.9,
+          maxOutputTokens: 800,
+        },
       },
       {
         headers: { "Content-Type": "application/json" },
@@ -1556,7 +1560,8 @@ Output contract: return only the assistant's reply as plain text (no JSON, no ex
       }
     );
 
-    const answer = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    const answer =
+      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
     console.log("🧠 Gemini (voice) said:", answer?.slice(0, 180));
     res.json({ answer: answer || "I'm not sure what to say." });
   } catch (error) {
@@ -5091,6 +5096,30 @@ ${context}
             seen.add(url);
           }
         }
+
+        // Capture numbered source lists like: [1] Title — https://example.com
+        const numberedRe =
+          /^\s*(?:\[?(\d+)\]?\.|\[\s*(\d+)\s*\])\s*(?:\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|([^\n]+?)\s*(https?:\/\/\S+))/gim;
+        while ((m = numberedRe.exec(md))) {
+          const url = (m[4] || m[5] || "").trim();
+          const title = (m[3] || "").trim();
+          if (url && !seen.has(url)) {
+            sources.push({ title: title || url, url });
+            seen.add(url);
+          }
+        }
+
+        // Also detect bare URLs in the sources section
+        const bareUrlRe = /(https?:\/\/[^\s\)\]]{10,})/g;
+        while ((m = bareUrlRe.exec(md))) {
+          const url = m[1].trim();
+          if (!seen.has(url)) {
+            sources.push({ title: url, url });
+            seen.add(url);
+          }
+        }
+
+        // Fallback to provided top chunks' sources if none found
         if (sources.length === 0 && Array.isArray(fallbackTop)) {
           for (const t of fallbackTop) {
             const src = t.chunk.source;
