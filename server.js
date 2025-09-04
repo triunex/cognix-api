@@ -73,14 +73,29 @@ function getInstructionsForUser(userId = "demo") {
 // More explicit CORS handling to resolve preflight issues (add x-user-id header)
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  const allowedOrigins = ["http://localhost:8080", "http://localhost:5173"];
+  // Default allowed origins (local dev + current hosted frontend)
+  const allowedOrigins = [
+    "http://localhost:8080",
+    "http://localhost:5173",
+    "https://cognix-1fc5a.web.app",
+  ];
   // Allow a deploy-specific frontend origin if provided via env
   if (process.env.FRONTEND_ORIGIN) {
     allowedOrigins.push(process.env.FRONTEND_ORIGIN);
   }
-  if (origin && allowedOrigins.includes(origin)) {
+
+  // Allow-all flag (opt-in) for testing; set CORS_ALLOW_ALL=true in env to enable
+  const allowAll = String(process.env.CORS_ALLOW_ALL || "").toLowerCase() === "true";
+
+  if (allowAll) {
+    // Note: wildcard cannot be used with cookies/credentials; we disable credentials in this mode
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Credentials", "false");
+  } else if (origin && allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
   }
+
   res.setHeader(
     "Access-Control-Allow-Methods",
     "GET, POST, OPTIONS, PUT, PATCH, DELETE"
@@ -92,12 +107,22 @@ app.use((req, res, next) => {
       "Content-Type",
       "Authorization",
       "x-user-id",
-      "x-user-id", // ensure lowercase variant covered
+      "accept",
+      "origin",
     ].join(",")
   );
-  res.setHeader("Access-Control-Allow-Credentials", "true");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
+});
+
+// Ensure any leftover OPTIONS preflight returns success (catch-all)
+app.options("/*", (req, res) => {
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, PATCH, DELETE");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    ["X-Requested-With", "Content-Type", "Authorization", "x-user-id", "accept", "origin"].join(",")
+  );
+  return res.sendStatus(204);
 });
 
 // ✅ Core middlewares FIRST (so req.body is available to all routes)
