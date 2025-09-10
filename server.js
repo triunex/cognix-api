@@ -1313,7 +1313,7 @@ app.post("/api/search", async (req, res) => {
 
   // Fetch images from SerpAPI Images
   const fetchImages = async (query) => {
-    const serpApiKey = process.env.SERP_API_KEY;
+    const serpApiKey = process.env.SERPAPI_API_KEY;
     const res = await fetch(
       `https://serpapi.com/search.json?q=${encodeURIComponent(
         query
@@ -1324,6 +1324,85 @@ app.post("/api/search", async (req, res) => {
   };
 
   try {
+    // If an engine param was provided (vertical request), route accordingly and return only that vertical
+    const engineReq = req.query.engine || req.body.engine;
+    if (engineReq) {
+      try {
+        // Build SerpAPI params depending on requested vertical
+        const serpParams = {
+          engine: engineReq === "google_news" ? "google_news" : "google",
+          q: query,
+          api_key: process.env.SERPAPI_API_KEY,
+        };
+        if (engineReq === "google_images") serpParams.tbm = "isch";
+        if (engineReq === "google_videos") serpParams.tbm = "vid";
+        if (engineReq === "google_shopping") serpParams.tbm = "shop";
+        if (engineReq === "google_short_videos") {
+          serpParams.tbm = "vid";
+          serpParams.q = `${query} short video`;
+        }
+
+        const serpResp = await axios.get("https://serpapi.com/search", {
+          params: serpParams,
+          timeout: 12000,
+        });
+        const data = serpResp.data || {};
+
+        if (engineReq === "google_images") {
+          const imgs = (data.images_results || []).slice(0, 36);
+          // Map to flexible shape front-end expects
+          const out = imgs.map((i) => ({
+            thumbnail: i.thumbnail || i.link || i.original || null,
+            image: i.original || i.thumbnail || i.link || null,
+            title: i.title || i.alt || null,
+            source: i.source || null,
+          }));
+          return res.json(out);
+        }
+
+        if (engineReq === "google_news") {
+          const articles = data.news_results || data.articles || [];
+          return res.json(articles);
+        }
+
+        if (engineReq === "google_shopping") {
+          const shops = data.shopping_results || data.product_results || data.organic_results || [];
+          return res.json(shops);
+        }
+
+        if (engineReq === "google_videos" || engineReq === "google_short_videos") {
+          // Prefer YouTube Data API when a key is available for richer metadata
+          try {
+            if (process.env.YOUTUBE_API_KEY) {
+              const q = engineReq === "google_short_videos" ? `${query} short video` : query;
+              const you = await searchYouTube(q, 12);
+              const mappedYou = (you || []).map((v) => ({
+                title: v.title || null,
+                url: v.url || `https://www.youtube.com/watch?v=${v.id}`,
+                snippet: v.description || null,
+                id: v.id || null,
+              }));
+              return res.json(mappedYou);
+            }
+          } catch (e) {
+            console.warn("YouTube fallback failed:", e?.message || e);
+          }
+
+          const vids = data.video_results || data.organic_results || data.videos || [];
+          const mapped = (vids || []).map((v) => ({
+            title: v.title || v.name || v.snippet || null,
+            url: v.link || v.url || v.source || null,
+            snippet: v.snippet || v.description || null,
+            id: v.video_id || v.id || v.link || v.url || null,
+          }));
+          return res.json(mapped);
+        }
+      } catch (e) {
+        console.error("Vertical search error:", e?.response?.data || e.message || e);
+        return res.status(500).json([]);
+      }
+    }
+
     // 1. Get Web Search Results from SerpAPI
     const serpResponse = await axios.get("https://serpapi.com/search", {
       params: {
@@ -1382,12 +1461,100 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
     const fullAnswer = `${geminiResponse.data.candidates[0].content.parts[0].text}\n\nSources:\n${sources}`;
 
     // Fetch images for the query
-    const images = await fetchImages(query);
+    // Fetch verticals in parallel (images, videos, news, shopping, short videos)
+    const verticals = await Promise.allSettled([
+      (async () => {
+        try {
+          const r = await axios.get("https://serpapi.com/search", {
+            params: { engine: "google", q: query, tbm: "isch", api_key: process.env.SERPAPI_API_KEY },
+            timeout: 10000,
+          });
+          return r.data.images_results || [];
+        } catch (e) {
+          return [];
+        }
+      })(),
+      (async () => {
+        try {
+          // Use YouTube Data API when available for better video metadata
+          if (process.env.YOUTUBE_API_KEY) {
+            try {
+              const you = await searchYouTube(query, 8);
+              return you || [];
+            } catch (e) {
+              console.warn("YouTube search failed in verticals:", e?.message || e);
+              // fallthrough to SerpAPI below
+            }
+          }
 
-    // 4. Respond to frontend
+          const r = await axios.get("https://serpapi.com/search", {
+            params: { engine: "google", q: query, tbm: "vid", api_key: process.env.SERPAPI_API_KEY },
+            timeout: 10000,
+          });
+          return r.data.video_results || r.data.organic_results || [];
+        } catch (e) {
+          return [];
+        }
+      })(),
+      (async () => {
+        try {
+          const r = await axios.get("https://serpapi.com/search", {
+            params: { engine: "google_news", q: query, tbm: "nws", api_key: process.env.SERPAPI_API_KEY },
+            timeout: 10000,
+          });
+          return r.data.news_results || [];
+        } catch (e) {
+          return [];
+        }
+      })(),
+      (async () => {
+        try {
+          const r = await axios.get("https://serpapi.com/search", {
+            params: { engine: "google", q: query, tbm: "shop", api_key: process.env.SERPAPI_API_KEY },
+            timeout: 10000,
+          });
+          return r.data.shopping_results || r.data.organic_results || [];
+        } catch (e) {
+          return [];
+        }
+      })(),
+      (async () => {
+        try {
+          const qShort = `${query} short video`;
+          if (process.env.YOUTUBE_API_KEY) {
+            try {
+              const you = await searchYouTube(qShort, 8);
+              return you || [];
+            } catch (e) {
+              console.warn("YouTube short search failed in verticals:", e?.message || e);
+            }
+          }
+
+          const r = await axios.get("https://serpapi.com/search", {
+            params: { engine: "google", q: qShort, tbm: "vid", api_key: process.env.SERPAPI_API_KEY },
+            timeout: 10000,
+          });
+          return r.data.video_results || r.data.organic_results || [];
+        } catch (e) {
+          return [];
+        }
+      })(),
+    ]);
+
+    const images = (verticals[0] && verticals[0].status === "fulfilled" ? verticals[0].value : []) || [];
+    const videos = (verticals[1] && verticals[1].status === "fulfilled" ? verticals[1].value : []) || [];
+    const news = (verticals[2] && verticals[2].status === "fulfilled" ? verticals[2].value : []) || [];
+    const shopping = (verticals[3] && verticals[3].status === "fulfilled" ? verticals[3].value : []) || [];
+    const shortVideos = (verticals[4] && verticals[4].status === "fulfilled" ? verticals[4].value : []) || [];
+
+    // 4. Respond to frontend with answer + verticals
     res.json({
       answer: geminiResponse.data.candidates[0].content.parts[0].text,
-      images, // include in API response
+      images,
+      videos,
+      news,
+      shopping,
+      short_videos: shortVideos,
     });
   } catch (err) {
     console.error("❌ Error:", err.response?.data || err.message || err);
@@ -2234,185 +2401,6 @@ Do not include headings like "Sure!" or "Here is your report". Just start the se
   } catch (err) {
     console.error("Agent error:", err);
     res.status(500).json({ error: "Agent failed." });
-  }
-});
-
-// ---------------- Agentic browsing endpoint ----------------
-// Launches a headless browser, performs a short interaction for the given
-// query (search -> open first result), records a short video and returns
-// the public URL so the frontend can show the browser session.
-app.post("/api/agentic", async (req, res) => {
-  const { query } = req.body || {};
-  if (!query || !String(query).trim())
-    return res.status(400).json({ error: "Missing query" });
-
-  const id = crypto.randomUUID();
-  const outfile = path.join(VIDEO_DIR, `agentic-${id}.mp4`);
-
-  let browser;
-  try {
-    // Prefer connecting to an existing Chrome container (remote debugging) if available.
-    // Environment variables supported:
-    // - CHROME_WS_ENDPOINT : full ws://.../devtools/browser/<id>
-    // - CHROME_HOST and CHROME_PORT (default 127.0.0.1:10000) -> /json/version
-    let connected = false;
-    const chromeWsEndpoint = process.env.CHROME_WS_ENDPOINT;
-    const chromeHost = process.env.CHROME_HOST || "127.0.0.1";
-    const chromePort =
-      process.env.CHROME_PORT || process.env.CHROME_WS_PORT || "10000";
-
-    if (chromeWsEndpoint) {
-      try {
-        browser = await puppeteer.connect({
-          browserWSEndpoint: chromeWsEndpoint,
-        });
-        connected = true;
-        console.log("Connected to Chrome via CHROME_WS_ENDPOINT");
-      } catch (e) {
-        console.warn(
-          "Failed to connect via CHROME_WS_ENDPOINT:",
-          e?.message || e
-        );
-      }
-    }
-
-    if (!connected) {
-      // Try to discover websocket URL from the container's /json/version endpoint
-      try {
-        const base = `http://${chromeHost}:${chromePort}`;
-        const ver = await axios
-          .get(`${base.replace(/\/$/, "")}/json/version`, { timeout: 2500 })
-          .catch(() => null);
-        const wsUrl = ver?.data?.webSocketDebuggerUrl;
-        if (wsUrl) {
-          try {
-            browser = await puppeteer.connect({ browserWSEndpoint: wsUrl });
-            connected = true;
-            console.log("Connected to Chrome via discovered websocket:", wsUrl);
-          } catch (e) {
-            console.warn(
-              "Failed to connect to discovered websocket:",
-              e?.message || e
-            );
-          }
-        }
-      } catch (e) {
-        /* ignore discovery errors */
-      }
-    }
-
-    if (!connected) {
-      // Fallback: start a local headless browser
-      browser = await puppeteer.launch({
-        headless: true,
-        args: ["--no-sandbox", "--disable-setuid-sandbox"],
-      });
-      console.log("Launched local puppeteer browser (fallback)");
-    }
-
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 720, deviceScaleFactor: 1 });
-
-    const recorder = new PuppeteerScreenRecorder(page, {
-      fps: 25,
-      videoFrame: { width: 1280, height: 720 },
-    });
-
-    // Start recording
-    await recorder.start(outfile);
-
-    // Simple browsing choreography: Google search -> wait -> click first organic link -> wait
-    await page.goto("https://www.google.com", {
-      waitUntil: "domcontentloaded",
-    });
-    // Accept cookie dialogs if present (best-effort)
-    try {
-      await page.waitForSelector(
-        'button[id="L2AGLb"], button[aria-label*="Accept"], #introAgreeButton',
-        { timeout: 1500 }
-      );
-      await page.evaluate(() => {
-        const btn = document.querySelector(
-          'button[id="L2AGLb"], button[aria-label*="Accept"], #introAgreeButton'
-        );
-        try {
-          if (btn && typeof btn.click === "function") btn.click();
-        } catch (e) {
-          /* ignore click failures */
-        }
-      });
-      await page.waitForTimeout(600);
-    } catch (e) {}
-
-    // Type query and submit
-    try {
-      await page.type('input[name="q"]', String(query), { delay: 60 });
-      await page.keyboard.press("Enter");
-      await page
-        .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 })
-        .catch(() => {});
-      await page.waitForTimeout(1600);
-    } catch (e) {}
-
-    // Try to click the first organic result (best-effort selectors)
-    let firstUrl = null;
-    try {
-      // Prefer the standard Google organic result selector
-      const link = await page.$("div#search a");
-      if (link) {
-        firstUrl = await page.evaluate((a) => a.href, link);
-        await link.click();
-        await page
-          .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 12000 })
-          .catch(() => {});
-        await page.waitForTimeout(1600);
-      }
-    } catch (e) {
-      // ignore
-    }
-
-    // Give the page a moment to render interactions
-    await page.waitForTimeout(1200);
-
-    // Stop recording
-    await recorder.stop();
-
-    const publicUrl = `/media/videos/${path.basename(outfile)}`;
-
-    // Build a lightweight summary using SerpAPI (if configured)
-    let hits = [];
-    try {
-      if (process.env.SERPAPI_API_KEY) {
-        const serpResp = await axios.get("https://serpapi.com/search", {
-          params: {
-            engine: "google",
-            q: query,
-            api_key: process.env.SERPAPI_API_KEY,
-          },
-          timeout: 8000,
-        });
-        hits = (serpResp.data?.organic_results || [])
-          .slice(0, 4)
-          .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
-      }
-    } catch (e) {
-      console.warn("agentic: serpapi failed", e?.message || e);
-    }
-
-    return res.json({ videoUrl: publicUrl, firstUrl, hits });
-  } catch (err) {
-    console.error(
-      "Agentic endpoint error:",
-      err?.response?.data || err.message || err
-    );
-    try {
-      if (browser) await browser.close().catch(() => {});
-    } catch (e) {}
-    return res.status(500).json({ error: "Agentic execution failed." });
-  } finally {
-    try {
-      if (browser) await browser.close().catch(() => {});
-    } catch (e) {}
   }
 });
 
@@ -5931,15 +5919,101 @@ ${contextInf}
 
     const formatted_answer = composeSections(blocks);
     const sources = execs.flatMap((ex) => ex.run.sources).slice(0, 12);
-    const images = execs.flatMap((ex) => ex.run.images || []).slice(0, 8);
+    const imagesFromRuns = execs.flatMap((ex) => ex.run.images || []).slice(0, 8);
 
-    return res.json({
-      formatted_answer,
-      sources,
-      images,
-      plan: plans,
-      last_fetched: new Date().toISOString(),
-    });
+    // Fetch verticals in parallel to include images/videos/news/shopping/short_videos
+    try {
+      const vert = await Promise.allSettled([
+        (async () => {
+          try {
+            const r = await axios.get("https://serpapi.com/search", {
+              params: { engine: "google", q: query, tbm: "isch", api_key: process.env.SERPAPI_API_KEY },
+              timeout: 10000,
+            });
+            return r.data.images_results || [];
+          } catch (e) {
+            return [];
+          }
+        })(),
+        (async () => {
+          try {
+            const r = await axios.get("https://serpapi.com/search", {
+              params: { engine: "google", q: query, tbm: "vid", api_key: process.env.SERPAPI_API_KEY },
+              timeout: 10000,
+            });
+            return r.data.video_results || r.data.organic_results || [];
+          } catch (e) {
+            return [];
+          }
+        })(),
+        (async () => {
+          try {
+            const r = await axios.get("https://serpapi.com/search", {
+              params: { engine: "google_news", q: query, tbm: "nws", api_key: process.env.SERPAPI_API_KEY },
+              timeout: 10000,
+            });
+            return r.data.news_results || [];
+          } catch (e) {
+            return [];
+          }
+        })(),
+        (async () => {
+          try {
+            const r = await axios.get("https://serpapi.com/search", {
+              params: { engine: "google", q: query, tbm: "shop", api_key: process.env.SERPAPI_API_KEY },
+              timeout: 10000,
+            });
+            return r.data.shopping_results || r.data.organic_results || [];
+          } catch (e) {
+            return [];
+          }
+        })(),
+        (async () => {
+          try {
+            const r = await axios.get("https://serpapi.com/search", {
+              params: { engine: "google", q: `${query} short video`, tbm: "vid", api_key: process.env.SERPAPI_API_KEY },
+              timeout: 10000,
+            });
+            return r.data.video_results || r.data.organic_results || [];
+          } catch (e) {
+            return [];
+          }
+        })(),
+      ]);
+
+      const imgs = (vert[0] && vert[0].status === "fulfilled" ? vert[0].value : []) || [];
+      const vids = (vert[1] && vert[1].status === "fulfilled" ? vert[1].value : []) || [];
+      const newsArr = (vert[2] && vert[2].status === "fulfilled" ? vert[2].value : []) || [];
+      const shops = (vert[3] && vert[3].status === "fulfilled" ? vert[3].value : []) || [];
+      const shortV = (vert[4] && vert[4].status === "fulfilled" ? vert[4].value : []) || [];
+
+      const normImages = imgs.map((i) => i.original || i.thumbnail || i.link).filter(Boolean).slice(0, 36);
+      const normVideos = vids.map((v) => ({ title: v.title || v.name || v.snippet || null, url: v.link || v.url || v.source || null, snippet: v.snippet || v.description || null, id: v.video_id || v.id || v.link || v.url || null })).slice(0, 24);
+      const normNews = newsArr.slice(0, 24);
+      const normShopping = shops.slice(0, 24);
+      const normShort = shortV.map((v) => ({ title: v.title || v.name || v.snippet || null, url: v.link || v.url || v.source || null, snippet: v.snippet || v.description || null, id: v.video_id || v.id || v.link || v.url || null })).slice(0, 24);
+
+      return res.json({
+        formatted_answer,
+        sources,
+        images: imagesFromRuns.length ? imagesFromRuns : normImages,
+        videos: normVideos,
+        news: normNews,
+        shopping: normShopping,
+        short_videos: normShort,
+        plan: plans,
+        last_fetched: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.warn("Agentic vertical fetch failed:", e?.message || e);
+      return res.json({
+        formatted_answer,
+        sources,
+        images: imagesFromRuns,
+        plan: plans,
+        last_fetched: new Date().toISOString(),
+      });
+    }
   } catch (err) {
     console.error(
       "agentic-v2 error:",
