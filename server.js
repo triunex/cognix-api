@@ -531,6 +531,11 @@ function cosineSim(a, b) {
 async function getEmbeddingsGemini(texts = []) {
   // Google API limit: max 100 requests per batch; we batch sequentially.
   const MAX_BATCH = 100;
+  // If no GEMINI key, return zero-vectors to allow graceful degradation
+  if (!process.env.GEMINI_API_KEY) {
+    const dim = 768;
+    return texts.map(() => Array(dim).fill(0));
+  }
   const all = [];
   for (let i = 0; i < texts.length; i += MAX_BATCH) {
     const slice = texts.slice(i, i + MAX_BATCH);
@@ -559,7 +564,9 @@ async function getEmbeddingsGemini(texts = []) {
         "Gemini embeddings error (batch)",
         e.response?.data || e.message
       );
-      throw e;
+      // Graceful fallback: pad with zero-vectors for this slice
+      const dim = 768;
+      for (let k = 0; k < slice.length; k++) all.push(Array(dim).fill(0));
     }
   }
   return all;
@@ -1556,6 +1563,42 @@ ${context}
 
   // Call Gemini to synthesize (use your existing Gemini call pattern)
   try {
+    // If GEMINI key is missing, synthesize a lightweight fallback locally
+    if (!process.env.GEMINI_API_KEY) {
+      const bullets = topForPrompt
+        .slice(0, Math.min(8, topForPrompt.length))
+        .map((t) => {
+          const title = t.source?.title || t.source?.url || "Source";
+          const first = String(t.text || "").split(/\n+/)[0].slice(0, 160);
+          return `- ${title}: ${first}`;
+        })
+        .join("\n");
+      const raw = [
+        "Summary:",
+        `- Aggregated from ${topForPrompt.length} evidence snippets.`,
+        "",
+        "Key Findings:",
+        bullets || "- Not enough evidence collected.",
+      ].join("\n");
+      const sources = topForPrompt.slice(0, 15).map((t) => ({
+        title: t.source?.title || t.source?.url || "",
+        url: t.source?.url || null,
+      }));
+      const conf = Math.min(
+        0.95,
+        Math.max(0.2, topForPrompt.length / 48)
+      );
+      return {
+        formatted_answer: raw,
+        sourcesArr: sources,
+        meta: {
+          top_chunks: topForPrompt.length,
+          confidence: Number(conf.toFixed(2)),
+          evidence_count: topForPrompt.length,
+          note: "Fallback synthesis without GEMINI_API_KEY",
+        },
+      };
+    }
     const gemResp = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
@@ -1862,16 +1905,22 @@ app.post("/api/search", async (req, res) => {
       }
     }
 
-    // 1. Get Web Search Results from SerpAPI
-    const serpResponse = await axios.get("https://serpapi.com/search", {
-      params: {
-        engine: "google",
-        q: query,
-        api_key: process.env.SERPAPI_API_KEY,
-      },
-    });
-
-    const results = serpResponse.data.organic_results?.slice(0, 5) || [];
+    // 1. Get Web Search Results from SerpAPI (graceful if key missing)
+    let results = [];
+    try {
+      const serpResponse = await axios.get("https://serpapi.com/search", {
+        params: {
+          engine: "google",
+          q: query,
+          api_key: process.env.SERPAPI_API_KEY,
+        },
+        timeout: 12000,
+      });
+      results = serpResponse.data.organic_results?.slice(0, 5) || [];
+    } catch (e) {
+      console.warn("SerpAPI web search failed:", e?.response?.data || e.message);
+      results = [];
+    }
 
     const context = results
       .map(
@@ -1899,25 +1948,41 @@ Talk in very Friendly way.
 Avoid using hashtags (#), asterisks (*), or markdown symbols.
 `;
 
-    const geminiResponse = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [
+    let generatedAnswer = "";
+    if (process.env.GEMINI_API_KEY) {
+      try {
+        const geminiResponse = await axios.post(
+          `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
           {
-            role: "user",
-            parts: [{ text: prompt }],
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: prompt }],
+              },
+            ],
           },
-        ],
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
+          {
+            headers: {
+              "Content-Type": "application/json",
+            },
+            timeout: 20000,
+          }
+        );
+        generatedAnswer =
+          geminiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      } catch (e) {
+        console.warn("Gemini generation failed:", e?.response?.data || e.message);
+        generatedAnswer = "";
       }
-    );
-
-    const sources = results.map((r) => `- ${r.title}: ${r.link}`).join("\n");
-    const fullAnswer = `${geminiResponse.data.candidates[0].content.parts[0].text}\n\nSources:\n${sources}`;
+    }
+    if (!generatedAnswer) {
+      const titles = results.map((r, i) => `${i + 1}. ${r.title}`).join("\n");
+      generatedAnswer =
+        (results.length
+          ? `Here are top results I found.\n\n${titles}\n\nI can analyze these further if you enable the generative API.`
+          : `I couldn't reach search or the generative API. Please set SERPAPI_API_KEY and GEMINI_API_KEY on the server to enable full answers.`) ||
+        "No response.";
+    }
 
     // Fetch images for the query
     // Fetch verticals in parallel (images, videos, news, shopping, short videos)
@@ -2054,7 +2119,7 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
 
     // 4. Respond to frontend with answer + verticals
     res.json({
-      answer: geminiResponse.data.candidates[0].content.parts[0].text,
+      answer: generatedAnswer,
       images,
       videos,
       news,
@@ -2063,7 +2128,16 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
     });
   } catch (err) {
     console.error("❌ Error:", err.response?.data || err.message || err);
-    res.status(500).json({ error: "Failed to get answer" });
+    // Graceful 200 with empty content to avoid client-side failures
+    res.json({
+      answer:
+        "Search service encountered an error. Please try again or configure API keys.",
+      images: [],
+      videos: [],
+      news: [],
+      shopping: [],
+      short_videos: [],
+    });
   }
 });
 
