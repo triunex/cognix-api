@@ -515,18 +515,6 @@ function chunkText(text, maxLen = 1500) {
   return chunks.map((c) => ({ id: crypto.randomUUID(), text: c }));
 }
 
-function cosineSim(a, b) {
-  let dot = 0,
-    na = 0,
-    nb = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
-  }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
-}
-
 async function getEmbeddingsGemini(texts = []) {
   // Google API limit: max 100 requests per batch; we batch sequentially.
   const MAX_BATCH = 100;
