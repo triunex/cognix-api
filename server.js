@@ -16,6 +16,7 @@ import { chromium } from "playwright";
 import crypto from "crypto";
 import { EventEmitter } from "events";
 import { PuppeteerScreenRecorder } from "puppeteer-screen-recorder";
+import { planSubtasks } from "./api/planner.js";
 puppeteer.use(StealthPlugin());
 
 dotenv.config();
@@ -513,6 +514,18 @@ function chunkText(text, maxLen = 1500) {
   }
   if (cur.trim()) chunks.push(cur.trim());
   return chunks.map((c) => ({ id: crypto.randomUUID(), text: c }));
+}
+
+function cosineSim(a, b) {
+  let dot = 0,
+    na = 0,
+    nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
 }
 
 async function getEmbeddingsGemini(texts = []) {
@@ -1409,6 +1422,7 @@ async function fetchTopPages(webEntries, maxFetch = 36) {
 async function runSubTask(subTask, opts = {}) {
   const q = subTask.query || (subTask.title ? subTask.title : "");
   const maxWeb = opts.maxWeb || 80;
+  const keepChunks = opts.keepChunks || 48;
   const pages = [];
   try {
     const verts = await fetchMultiVerticals(q, maxWeb);
@@ -1429,6 +1443,18 @@ async function runSubTask(subTask, opts = {}) {
         );
       }
     }
+    // PDFs and images heuristics - treat links as stubs (will be expanded later)
+    const pdfLinks = (verts.web || [])
+      .filter((w) => /\.pdf(\b|$)/i.test(w.link || ""))
+      .slice(0, 6);
+    pdfLinks.forEach((p) =>
+      chunks.push({
+        id: uid(),
+        text: `${p.title}\n\n${p.snippet || ""}`,
+        source: { url: p.link, title: p.title },
+      })
+    );
+
     // include news / wiki / social as short chunks
     (verts.news || []).slice(0, 12).forEach((n) =>
       chunks.push({
@@ -1452,7 +1478,7 @@ async function runSubTask(subTask, opts = {}) {
       })
     );
     // rerank via embeddings and keep top N
-    const topChunks = await rerankByEmbedding(q, chunks, opts.keepChunks || 48);
+    const topChunks = await rerankByEmbedding(q, chunks, keepChunks);
     return {
       ok: true,
       topChunks,
@@ -1460,514 +1486,13 @@ async function runSubTask(subTask, opts = {}) {
         webCount: verts.web.length,
         youtube: verts.youtube.length,
         reddit: verts.reddit.length,
+        pdfs: pdfLinks.length,
       },
     };
   } catch (e) {
     console.warn("runSubTask failed:", e.message || e);
     return { ok: false, error: e.message || String(e) };
   }
-}
-
-/*******************************
- Agentic v3 — improved core helpers
-*******************************/
-
-// --- SMALL HELPERS ---
-function cosineSim(a, b) {
-  if (!a || !b || a.length !== b.length) return 0;
-  let dot = 0,
-    na = 0,
-    nb = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
-  }
-  if (na === 0 || nb === 0) return 0;
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
-}
-
-function extractEmailsFromText(text) {
-  if (!text) return [];
-  const re = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
-  const m = text.match(re);
-  return m ? Array.from(new Set(m)) : [];
-}
-
-async function safeGeminiCall(prompt, opts = {}) {
-  // small wrapper - use your existing gemini key pattern
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("Missing GEMINI_API_KEY");
-  const maxOutputTokens = opts.maxOutputTokens || 1600;
-  const temperature =
-    typeof opts.temperature === "number" ? opts.temperature : 0.2;
-  const body = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { temperature, maxOutputTokens },
-  };
-  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${key}`;
-  const resp = await axios.post(url, body, {
-    headers: { "Content-Type": "application/json" },
-    timeout: 45000,
-  });
-  return resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-}
-
-// --- 1) Better multi-intent splitter (LLM-first, fallback naive)
-async function enhancedSplitMultiIntent(text) {
-  // Fast heuristic split if short and obvious
-  try {
-    // If contains explicit separators ; then split
-    if (text.includes(";") || (text.match(/\band\b/gi) && text.length < 180)) {
-      const naive = text
-        .split(/;|\band\b|, then|\. then|\. and\b/gi)
-        .map((s) => s.trim())
-        .filter(Boolean);
-      if (naive.length > 1) return naive;
-    }
-
-    // Use LLM to extract intents as JSON array
-    const prompt = `
-You are a query parser. Input is a user prompt. Output a JSON array of concise sub-questions (english), preserving order.
-Input:
-"""${text}"""
-Output (JSON array of strings only):
-`;
-    const out = await safeGeminiCall(prompt, {
-      maxOutputTokens: 400,
-      temperature: 0.0,
-    });
-    const arrText = out.trim();
-    // Attempt to parse JSON; if not JSON, try to split by newlines/numbered list
-    let arr = [];
-    try {
-      arr = JSON.parse(arrText);
-    } catch (e) {
-      // fallback: split on new lines / numbered lines
-      arr = arrText
-        .split(/\r?\n/)
-        .map((l) => l.replace(/^\d+[\).\s-]*/, "").trim())
-        .filter(Boolean);
-    }
-    if (arr.length === 0) return [text];
-    return arr;
-  } catch (e) {
-    // fallback naive
-    return text
-      .split(/;|\band\b|, then|then/gi)
-      .map((s) => s.trim())
-      .filter(Boolean);
-  }
-}
-
-// --- 2) Enhanced multi-vertical fetch with contact-aware variants
-async function fetchMultiVerticalsEnhanced(query, maxWeb = 120) {
-  const serpKey = process.env.SERPAPI_API_KEY;
-  const out = {
-    web: [],
-    news: [],
-    youtube: [],
-    reddit: [],
-    wiki: [],
-    twitter: [],
-  };
-  if (!serpKey) return out;
-
-  const qlist = [
-    query,
-    `${query} filetype:pdf`,
-    `${query} site:arxiv.org`,
-    `${query} site:linkedin.com OR site:crunchbase.com`,
-    `${query} "contact" OR "press" OR "email"`,
-    `${query} "contact us" "email"`,
-    `${query} site:gov OR site:edu OR site:org`,
-  ];
-
-  // also if query contains "vc" or "venture" add "investor contact" variants
-  if (/vc|venture|investor|fund|funds|venture capital/i.test(query)) {
-    qlist.push(`${query} "email" OR "contact" OR "partners@*"`);
-    qlist.push(`${query} site:angel.co OR site:crunchbase.com "email"`);
-  }
-
-  const serpPromises = qlist.map((q) =>
-    axios
-      .get("https://serpapi.com/search", {
-        params: { engine: "google", q, api_key: serpKey, num: 10 },
-        timeout: 12000,
-      })
-      .then((r) =>
-        (r.data?.organic_results || []).map((o) => ({
-          title: o.title,
-          link: o.link,
-          snippet: o.snippet,
-        }))
-      )
-      .catch(() => [])
-  );
-
-  const serpSets = await Promise.all(serpPromises);
-  const merged = [].concat(...serpSets);
-  const seen = new Set();
-  for (const r of merged) {
-    if (!r || !r.link) continue;
-    const u = r.link.split("#")[0].split("?")[0];
-    if (seen.has(u)) continue;
-    seen.add(u);
-    out.web.push({ title: r.title, link: r.link, snippet: r.snippet });
-    if (out.web.length >= maxWeb) break;
-  }
-
-  // best-effort social pulls (these use your existing helpers; if missing they return empty)
-  try {
-    out.youtube = await searchYouTube(query, 12);
-  } catch (e) {
-    /*ignore*/
-  }
-  try {
-    out.reddit = await searchReddit(query, 12);
-  } catch (e) {
-    /*ignore*/
-  }
-  try {
-    out.wiki = await searchWikipedia(query);
-  } catch (e) {
-    /*ignore*/
-  }
-  try {
-    out.twitter = (await searchTwitterRecent)
-      ? await searchTwitterRecent(query, 12)
-      : [];
-  } catch (e) {
-    /*ignore*/
-  }
-
-  console.info(
-    `v3 fetchMultiVerticalsEnhanced: web=${out.web.length}, youtube=${
-      out.youtube?.length || 0
-    }, reddit=${out.reddit?.length || 0}`
-  );
-  return out;
-}
-
-// --- 3) Fetch pages robustly with retries
-async function fetchTopPagesRobust(webEntries, maxFetch = 48) {
-  const toFetch = webEntries.slice(0, maxFetch);
-  const results = [];
-  // simple concurrency
-  const concurrency = 8;
-  let i = 0;
-  const workers = new Array(concurrency).fill(0).map(async () => {
-    while (i < toFetch.length) {
-      const idx = i++;
-      const e = toFetch[idx];
-      try {
-        const p = await fetchPageTextFast(e.link); // use your existing fast fetch
-        if (p && p.text && p.text.length > 100) {
-          results.push({
-            url: e.link,
-            title: e.title || p.title || "",
-            text: p.text,
-          });
-        }
-      } catch (err) {
-        /* skip */
-      }
-    }
-  });
-  await Promise.all(workers);
-  console.info("v3 fetched pages:", results.length);
-  return results;
-}
-
-// --- 4) Strong reranker: embeddings + optional LLM fallback
-async function rerankByEmbeddingEnhanced(query, chunks, keep = 60) {
-  try {
-    if (!chunks || chunks.length === 0) return [];
-    // batch texts for embeddings: use first 1600 chars of each chunk
-    const texts = chunks.map((c) => (c.text || "").slice(0, 1800));
-    // get embeddings in batch (reuse getEmbeddingsGemini if available)
-    const allEmbeddings = await getEmbeddingsGemini([query, ...texts]); // expects an array return
-    const qEmb = allEmbeddings[0];
-    const cEmbs = allEmbeddings.slice(1);
-
-    const scored = cEmbs.map((e, idx) => ({ idx, score: cosineSim(e, qEmb) }));
-    scored.sort((a, b) => b.score - a.score);
-    const kept = scored
-      .slice(0, Math.min(keep, scored.length))
-      .map((s) => ({ ...chunks[s.idx], score: s.score }));
-    // Optional: if the top scores are low (<0.04) or results appear noisy, run a mini LLM re-rank for top 30
-    const avgTop = kept.length
-      ? kept.reduce((a, b) => a + b.score, 0) / kept.length
-      : 0;
-    if (avgTop < 0.04 && kept.length > 0) {
-      // LLM re-rank fallback (cheap — only top 24)
-      const topTexts = kept
-        .slice(0, 24)
-        .map(
-          (c, i) =>
-            `[${i + 1}] ${
-              c.source?.url || c.source?.title || ""
-            }\n${c.text.slice(0, 800)}\n`
-        );
-      const rrPrompt = `You are a super-smart research re-ranker. Query: "${query}". Given the following snippets (numbered), rank them by relevance (most relevant first) and return an array of indices starting with the most relevant.\n\n${topTexts.join(
-        "\n"
-      )}\n\nReturn JSON array like: [2,5,1,...]`;
-      try {
-        const rrOut = await safeGeminiCall(rrPrompt, {
-          temperature: 0.0,
-          maxOutputTokens: 400,
-        });
-        const idxOrder = JSON.parse(rrOut.replace(/[^\[\]0-9,]/g, "")); // crude parse
-        if (Array.isArray(idxOrder) && idxOrder.length) {
-          const newOrder = idxOrder.map((i) => kept[i]).filter(Boolean);
-          return newOrder;
-        }
-      } catch (e) {
-        /* ignore and keep embedding order */
-      }
-    }
-    return kept;
-  } catch (e) {
-    console.warn("rerankByEmbeddingEnhanced failed", e.message || e);
-    return chunks.slice(0, Math.min(keep, chunks.length));
-  }
-}
-
-// --- 5) ContactFinder agent (specialized)
-async function contactFinderForQuery(query, webEntries) {
-  // Strategy:
-  // 1) Look for emails in the top pages by fetching them
-  // 2) If none, run site-specific serp queries for 'contact' and 'email'
-  const contacts = new Set();
-  try {
-    // attempt email extraction from first 12 pages (already fetched pages)
-    const pages = await fetchTopPagesRobust(webEntries.slice(0, 24), 24);
-    for (const p of pages) {
-      const emails = extractEmailsFromText(p.text || "");
-      for (const e of emails) contacts.add(e);
-      // also search for mailto:
-      const m = (p.text || "").match(/mailto:([^\s"'<>]+)/i);
-      if (m && m[1]) contacts.add(m[1].replace(/["'<>]/g, ""));
-    }
-    if (contacts.size > 0) {
-      return Array.from(contacts);
-    }
-    // fallback: run serp contact-specific queries
-    const serpKey = process.env.SERPAPI_API_KEY;
-    if (!serpKey) return [];
-    const contactQueries = [
-      `${query} "contact" "email"`,
-      `${query} "press" "contact" "email"`,
-      `${query} "team" "email"`,
-      `${query} site:crunchbase.com "contact" OR "email"`,
-      `${query} site:linkedin.com/company "contact"`,
-      `${query} "partners@*"`,
-    ];
-    for (const cq of contactQueries) {
-      try {
-        const r = await axios.get("https://serpapi.com/search", {
-          params: { engine: "google", q: cq, api_key: serpKey, num: 10 },
-          timeout: 10000,
-        });
-        const or = r.data?.organic_results || [];
-        for (const o of or) {
-          try {
-            const p = await fetchPageTextFast(o.link);
-            if (!p) continue;
-            extractEmailsFromText(p.text || "").forEach((e) => contacts.add(e));
-          } catch (e) {}
-        }
-        if (contacts.size > 0) break;
-      } catch (e) {}
-    }
-    return Array.from(contacts);
-  } catch (e) {
-    console.warn("contactFinderForQuery failed", e.message || e);
-    return [];
-  }
-}
-
-// --- 6) runSubTask (enhanced)
-/*
-  subTask = { id, query }
-  opts = { maxWeb, keepChunks }
-*/
-async function runSubTaskEnhanced(subTask, opts = {}) {
-  const q = subTask.query || "";
-  const maxWeb = opts.maxWeb || 120;
-  try {
-    // fetch expanded verticals
-    const verts = await fetchMultiVerticalsEnhanced(q, maxWeb);
-    // fetch page bodies (robust)
-    const fetched = await fetchTopPagesRobust(
-      verts.web,
-      Math.min(72, Math.floor(maxWeb * 0.6))
-    );
-    // build chunks
-    let chunks = [];
-    for (const p of fetched) {
-      const pieces = chunkText(p.text || "", 1800); // reuse chunkText if present
-      pieces.forEach((c) =>
-        chunks.push({
-          id: uid(),
-          text: c.text,
-          source: { url: p.url || p.url, title: p.title || "" },
-        })
-      );
-    }
-    // include social & wiki short snippets
-    (verts.news || [])
-      .slice(0, 12)
-      .forEach((n) =>
-        chunks.push({
-          id: uid(),
-          text: `${n.title}\n\n${n.snippet || ""}`,
-          source: { url: n.link, title: n.title },
-        })
-      );
-    (verts.wiki || [])
-      .slice(0, 6)
-      .forEach((w) =>
-        chunks.push({
-          id: uid(),
-          text: `${w.title}\n\n${w.snippet || ""}`,
-          source: { url: w.url, title: w.title },
-        })
-      );
-    // rerank using enhanced reranker
-    const topChunks = await rerankByEmbeddingEnhanced(
-      q,
-      chunks,
-      opts.keepChunks || 72
-    );
-
-    // contact agent: if user asked for contact/email or contact-like verbs found, run contact finder
-    let contacts = [];
-    if (/(contact|email|phone|reach|linkedin|linkedin profile)/i.test(q)) {
-      contacts = await contactFinderForQuery(q, verts.web);
-    }
-
-    return {
-      ok: true,
-      topChunks,
-      meta: {
-        webCount: verts.web.length,
-        youtube: verts.youtube?.length || 0,
-        reddit: verts.reddit?.length || 0,
-        contact_count: contacts.length,
-      },
-      contacts,
-    };
-  } catch (e) {
-    console.warn("runSubTaskEnhanced error:", e.message || e);
-    return { ok: false, error: String(e) };
-  }
-}
-
-// --- 7) Synthesize with explicit contact instruction and structured JSON
-async function synthesizeAgenticAnswerEnhanced(
-  query,
-  subResponses,
-  style = "detailed"
-) {
-  // collect top chunks across subtasks
-  const all = [];
-  for (const r of subResponses) {
-    if (r && r.topChunks) all.push(...r.topChunks.slice(0, 36));
-  }
-  // simple dedupe
-  const seen = new Set();
-  const uniq = [];
-  for (const c of all) {
-    const k = (c.source?.url || "") + "|" + (c.text || "").slice(0, 200);
-    if (!seen.has(k)) {
-      seen.add(k);
-      uniq.push(c);
-    }
-  }
-  const topForPrompt = uniq.slice(0, Math.min(80, uniq.length));
-  // build context in compact way
-  const context = topForPrompt
-    .map(
-      (t, i) =>
-        `[${i + 1}] ${
-          t.source?.title || t.source?.url || "source"
-        }\n${t.text.slice(0, 1500)}\n---\n`
-    )
-    .join("\n");
-
-  const styleInstruction =
-    style === "phd"
-      ? "Write like a PhD literature review: cautious, cite evidence, mini-conclusions."
-      : "Write a concise executive synthesis with action steps and a confidence score (0.0-1.0).";
-
-  const prompt = `
-You are Nelieo Agentic Research Engine. Use the CONTEXT below to produce:
-1) A 2-3 sentence summary
-2) Key Findings (3-6 bullets)
-3) Evidence list (numbered) with short snippet and URL
-4) Actionable Recommendations (3 items)
-5) Contacts: list any emails or contact channels discovered (as array)
-6) Confidence score between 0.0 and 1.0 and why
-
-Output STRUCTURE: 
-First part: human readable answer (as text). Then include JSON block NELIEO_META = { "sources": [{"title":"...", "url":"..."}], "contacts": ["email1", "email2"], "top_excerpt_count": number, "confidence_score": 0.0-1.0 }.
-
-INSTRUCTIONS:
-- Ground all claims in the provided CONTEXT.
-- If conflicting evidence exists, note it explicitly.
-- If user asked for contact info, list emails found in JSON 'contacts' and show where they were found in Evidence.
-- Keep the output clear and include inline references like [1], [2] that map to the Evidence list.
-
-STYLE:
-${styleInstruction}
-
-USER QUESTION:
-${query}
-
-CONTEXT:
-${context}
-`.trim();
-
-  const textOut = await safeGeminiCall(prompt, {
-    maxOutputTokens: 2000,
-    temperature: 0.08,
-  });
-
-  // attempt to parse JSON tail if present
-  const jsonMatch =
-    textOut.match(/NELIEO_META\s*=\s*(\{[\s\S]*\})/m) ||
-    textOut.match(/NELIEO_META\s*([\s\S]*)$/m);
-  let meta = {
-    sources: topForPrompt
-      .slice(0, 15)
-      .map((t) => ({
-        title: t.source?.title || t.source?.url || "",
-        url: t.source?.url || "",
-      })),
-    top_excerpt_count: topForPrompt.length,
-    confidence_score: 0.5,
-  };
-  try {
-    if (jsonMatch) {
-      const raw = jsonMatch[1] || jsonMatch[0];
-      const parsed = JSON.parse(
-        raw.replace(/\n/g, " ").replace(/,(\s*})/g, "$1")
-      );
-      meta = { ...meta, ...parsed };
-    } else {
-      // heuristics for confidence (how many subResponses ok)
-      const okCount = subResponses.filter((s) => s && s.ok).length;
-      meta.confidence_score = Math.min(
-        0.99,
-        0.2 + (okCount / Math.max(1, subResponses.length)) * 0.7
-      );
-    }
-  } catch (e) {
-    /* ignore parse errors */
-  }
-
-  return { formatted_answer: textOut, sourcesArr: meta.sources, meta };
 }
 
 // High-level synthesis: combine subtask outputs and ask LLM to synthesize structured answer
@@ -2009,22 +1534,23 @@ async function synthesizeAgenticAnswer(
       : "Write a concise executive synthesis with action steps and confidence score.";
 
   const prompt = `
-You are Nelieo Agentic Research Engine. Produce a structured answer for the user's question:
+You are Nelieo Agentic Research Engine. Produce a structured, evidence-backed answer for the user's question.
 
 USER QUESTION:
 ${query}
 
 INSTRUCTIONS:
-- First, produce a 2-3 sentence plain-language summary.
-- Then your whole answer and decide the sections for the answer on your own , Decide the lenght of the answer also on your own, Confidence (0.0-1.0) and short explanation.
-- Use the provided context (excerpts) to ground claims and include inline citations like [1], [2] that correspond to the Evidence list.
-- If contradictory evidence exists, mention contradictions explicitly.
-- Keep the output as plain text and include a JSON object at the end named __NELIEO_META__ with fields: sources (array of {title,url}), top_excerpt_count, and confidence_score.
+- Start with a 2–3 sentence plain-language summary.
+- Then write the full answer with clear sections you choose (headings, lists, tables where helpful). Decide length based on the topic and mode.
+- Always ground claims in CONTEXT excerpts and include inline citations like [1], [2] mapping to the Evidence list.
+- Cross-source reasoning: compare and contrast viewpoints. If Sequoia says X and Khosla says Y, explain why they differ. Highlight contradictions and uncertainties.
+- Dynamic depth: If the mode is quick, be concise but precise; if deep, be comprehensive and include timelines, simple charts as ASCII tables, and credibility notes.
+- Keep output as plain text. At the end, include a JSON object named __NELIEO_META__ with fields: sources (array of {title,url}), top_excerpt_count, confidence_score.
 
 STYLE:
 ${styleInstruction}
 
-CONTEXT:
+CONTEXT (Evidence Excerpts):
 ${context}
 `.trim();
 
@@ -2061,6 +1587,7 @@ ${context}
       meta: {
         top_chunks: topForPrompt.length,
         confidence: Number(conf.toFixed(2)),
+        evidence_count: topForPrompt.length,
       },
     };
   } catch (e) {
@@ -2076,35 +1603,89 @@ ${context}
   }
 }
 
-// Enhanced Agentic v3 endpoint using improved functions
+// Simple in-memory session memory (per user)
+const sessionMemory = new Map(); // key: userId, value: { history: [{q,a,ts}], lastTopics: [] }
+
+function remember(userId, q, a) {
+  const rec = sessionMemory.get(userId) || { history: [], lastTopics: [] };
+  rec.history.push({ q, a, ts: Date.now() });
+  if (rec.history.length > 20) rec.history.shift();
+  // naive topic extraction: first 6 words of q
+  const topic = String(q).split(/\s+/).slice(0, 6).join(" ");
+  rec.lastTopics = Array.from(new Set([topic, ...rec.lastTopics])).slice(0, 12);
+  sessionMemory.set(userId, rec);
+  return rec;
+}
+
+function recall(userId) {
+  return sessionMemory.get(userId) || { history: [], lastTopics: [] };
+}
+
+// Main endpoint: /api/agentic-v3
 app.post("/api/agentic-v3", async (req, res) => {
-  const { query, maxWeb = 120, parallel = 4 } = req.body || {};
+  const {
+    query,
+    maxWeb: maxWebIn = 80,
+    parallel: parallelIn = 3,
+    mode = "deep",
+  } = req.body || {};
   if (!query) return res.status(400).json({ error: "Missing query" });
   try {
-    const subtasksArr = await enhancedSplitMultiIntent(query);
-    const tasks = subtasksArr.map((t) => ({ id: uid(), query: t }));
-    // spawn subtasks in parallel (bounded)
+    // Depth control: quick vs deep
+    const isQuick = String(mode).toLowerCase() === "quick";
+    const maxWeb = isQuick ? Math.min(30, maxWebIn) : Math.max(80, maxWebIn);
+    const parallel = isQuick
+      ? Math.min(3, parallelIn || 2)
+      : Math.min(8, parallelIn || 4);
+
+    // 1) Plan multi-intent subtasks with vertical hints
+    const tasks = planSubtasks(query, {
+      mode: isQuick ? "quick" : "deep",
+      max: 6,
+    });
+
+    // 2) Run each subtask in parallel (bounded concurrency)
     const runners = tasks.map(
-      (t) => async () => await runSubTaskEnhanced(t, { maxWeb, keepChunks: 72 })
+      (t) => async () =>
+        await runSubTask(t, { maxWeb, keepChunks: isQuick ? 24 : 64 })
     );
-    // use same pmap concurrency helper (if present) otherwise simple Promise.all with chunking
-    const results = await pmap(runners, (fn) => fn(), Math.min(6, parallel));
-    const synthesis = await synthesizeAgenticAnswerEnhanced(
+    const results = await pmap(runners, (fn) => fn(), parallel);
+
+    // 3) synthesize across subtasks
+    const synthesis = await synthesizeAgenticAnswer(
       query,
       results,
-      "detailed"
+      isQuick ? "executive" : "detailed"
     );
-    // gather contacts from subtasks
-    const contacts = (results || []).flatMap((r) =>
-      r && r.contacts ? r.contacts : []
-    );
+
+    // Research map (explainable reasoning)
+    const researchMap = {
+      query,
+      mode: isQuick ? "quick" : "deep",
+      steps: tasks.map((t, i) => ({
+        subquery: t.query,
+        verticals: t.verticals,
+        ok: results[i]?.ok || false,
+        keptChunks: results[i]?.topChunks?.length || 0,
+        meta: results[i]?.meta || {},
+      })),
+    };
+
+    // remember session
+    const userId = req.headers["x-user-id"] || "demo";
+    remember(userId, query, synthesis.formatted_answer);
+
+    // 4) return consistent shape with meta
     res.json({
       answer: synthesis.formatted_answer,
       formatted_answer: synthesis.formatted_answer,
       sources: synthesis.sourcesArr,
       images: [],
-      contacts: Array.from(new Set(contacts)),
-      meta: synthesis.meta,
+      meta: {
+        ...synthesis.meta,
+        research_map: researchMap,
+        memory: recall(userId),
+      },
       subtasks: tasks.map((t, i) => ({
         task: t.query,
         ok: results[i]?.ok || false,
@@ -2112,8 +1693,13 @@ app.post("/api/agentic-v3", async (req, res) => {
       })),
     });
   } catch (err) {
-    console.error("Agentic v3 error (enhanced):", err);
-    res.status(500).json({ error: "Agentic v3 failed", detail: String(err) });
+    console.error(
+      "Agentic v3 error:",
+      err.response?.data || err.message || err
+    );
+    res
+      .status(500)
+      .json({ error: "Agentic v3 failed", detail: err.message || String(err) });
   }
 });
 
