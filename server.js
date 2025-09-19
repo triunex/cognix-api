@@ -85,7 +85,8 @@ app.use((req, res, next) => {
   }
 
   // Allow-all flag (opt-in) for testing; set CORS_ALLOW_ALL=true in env to enable
-  const allowAll = String(process.env.CORS_ALLOW_ALL || "").toLowerCase() === "true";
+  const allowAll =
+    String(process.env.CORS_ALLOW_ALL || "").toLowerCase() === "true";
 
   if (allowAll) {
     // Note: wildcard cannot be used with cookies/credentials; we disable credentials in this mode
@@ -117,10 +118,20 @@ app.use((req, res, next) => {
 
 // Ensure any leftover OPTIONS preflight returns success (catch-all)
 app.options("/*", (req, res) => {
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, PATCH, DELETE");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, OPTIONS, PUT, PATCH, DELETE"
+  );
   res.setHeader(
     "Access-Control-Allow-Headers",
-    ["X-Requested-With", "Content-Type", "Authorization", "x-user-id", "accept", "origin"].join(",")
+    [
+      "X-Requested-With",
+      "Content-Type",
+      "Authorization",
+      "x-user-id",
+      "accept",
+      "origin",
+    ].join(",")
   );
   return res.sendStatus(204);
 });
@@ -1259,6 +1270,252 @@ async function fetchPageTextFast(url) {
   }
 }
 
+// ---------------- Agentic v3 (next-gen) ----------------
+// Paste this AFTER your agentic-v2 / deepresearch handlers
+
+// Utility: spawn N promises with concurrency limit
+async function pmap(items, fn, concurrency = 6) {
+  const res = [];
+  let i = 0;
+  const workers = new Array(concurrency).fill(0).map(async () => {
+    while (i < items.length) {
+      const idx = i++;
+      try {
+        res[idx] = await fn(items[idx], idx);
+      } catch (e) {
+        res[idx] = null;
+      }
+    }
+  });
+  await Promise.all(workers);
+  return res;
+}
+
+// Small reranker using embeddings (Gemini embeddings helper already in file)
+async function rerankByEmbedding(query, chunks, keep = 40) {
+  try {
+    const texts = [query, ...chunks.map((c) => c.text.slice(0, 2000))];
+    const embs = await getEmbeddingsGemini(texts);
+    const qEmb = embs[0];
+    const cEmbs = embs.slice(1);
+    const scored = cEmbs
+      .map((e, i) => ({ i, score: cosineSim(e, qEmb) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, Math.min(keep, cEmbs.length))
+      .map((s) => ({ ...chunks[s.i], score: s.score }));
+    return scored;
+  } catch (e) {
+    console.warn("rerankByEmbedding failed:", e.message || e);
+    return chunks.slice(0, keep);
+  }
+}
+
+// Expand search across multiple verticals (deep retrieval)
+async function fetchMultiVerticals(query, maxWeb = 80) {
+  const serpKey = process.env.SERPAPI_API_KEY;
+  const results = { web: [], news: [], youtube: [], reddit: [], wiki: [], twitter: [] };
+
+  const qVariants = [
+    query,
+    `${query} site:arxiv.org`,
+    `${query} filetype:pdf`,
+    `${query} site:youtube.com`,
+    `${query} "${query}"`,
+  ];
+
+  // fetch big organic list from SerpAPI in parallel variants
+  const serpPromises = qVariants.map((q) =>
+    axios
+      .get("https://serpapi.com/search", { params: { engine: "google", q, api_key: serpKey }, timeout: 10000 })
+      .then((r) => (r.data?.organic_results || []).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet })))
+      .catch(() => [])
+  );
+
+  const serpSets = await Promise.all(serpPromises);
+  const webRaw = [].concat(...serpSets).filter(Boolean);
+  // unique by url
+  const seen = new Set();
+  for (const r of webRaw) {
+    if (!r.link) continue;
+    const u = r.link.split("#")[0].split("?")[0];
+    if (!seen.has(u)) {
+      results.web.push({ title: r.title, link: r.link, snippet: r.snippet });
+      seen.add(u);
+      if (results.web.length >= maxWeb) break;
+    }
+  }
+
+  // quick social & specialized collectors (best-effort)
+  results.youtube = await (async () => {
+    try {
+      return (await searchYouTube(query, 12)) || [];
+    } catch { return []; }
+  })();
+
+  results.reddit = await (async () => {
+    try {
+      return (await searchReddit(query, 12)) || [];
+    } catch { return []; }
+  })();
+
+  results.wiki = await (async () => {
+    try {
+      return (await searchWikipedia(query)) || [];
+    } catch { return []; }
+  })();
+
+  results.twitter = await (async () => {
+    try {
+      return (await searchTwitterRecent(query, 12)) || [];
+    } catch { return []; }
+  })();
+
+  return results;
+}
+
+// Fetch pages fast (bounded)
+async function fetchTopPages(webEntries, maxFetch = 36) {
+  const toFetch = webEntries.slice(0, maxFetch);
+  return await pmap(toFetch, async (e) => {
+    try {
+      const p = await fetchPageTextFast(e.link);
+      if (!p) return null;
+      p.url = e.link;
+      p.title = p.title || e.title || "";
+      return p;
+    } catch (err) {
+      return null;
+    }
+  }, 8).then((arr) => arr.filter(Boolean));
+}
+
+// Subtask worker: given a sub-intent, produce chunks
+async function runSubTask(subTask, opts = {}) {
+  const q = subTask.query || (subTask.title ? subTask.title : "");
+  const maxWeb = opts.maxWeb || 80;
+  const pages = [];
+  try {
+    const verts = await fetchMultiVerticals(q, maxWeb);
+    const fetched = await fetchTopPages(verts.web, Math.min(36, Math.max(12, Math.floor(maxWeb/2))));
+    // prepare chunks array (text snippets)
+    const chunks = [];
+    for (const p of fetched) {
+      if (p.text && p.text.length > 200) {
+        chunkText(p.text, 1800).forEach((c) => chunks.push({ id: c.id, text: c.text, source: { url: p.url, title: p.title } }));
+      }
+    }
+    // include news / wiki / social as short chunks
+    (verts.news || []).slice(0, 12).forEach(n => chunks.push({ id: uid(), text: `${n.title}\n\n${n.snippet || ''}`, source: { url: n.link, title: n.title } }));
+    (verts.wiki || []).slice(0, 8).forEach(w => chunks.push({ id: uid(), text: `${w.title}\n\n${w.snippet || ''}`, source: { url: w.url, title: w.title } }));
+    (verts.reddit || []).slice(0, 8).forEach(r => chunks.push({ id: uid(), text: `${r.title}\n\n${r.text || ''}`, source: { url: r.url, title: r.title } }));
+    // rerank via embeddings and keep top N
+    const topChunks = await rerankByEmbedding(q, chunks, opts.keepChunks || 48);
+    return { ok: true, topChunks, meta: { webCount: verts.web.length, youtube: verts.youtube.length, reddit: verts.reddit.length } };
+  } catch (e) {
+    console.warn("runSubTask failed:", e.message || e);
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
+// High-level synthesis: combine subtask outputs and ask LLM to synthesize structured answer
+async function synthesizeAgenticAnswer(query, subResponses, style = "detailed") {
+  // Build context from top chunks across subtasks
+  const allChunks = [];
+  for (const r of subResponses) {
+    if (r && r.topChunks) allChunks.push(...r.topChunks.slice(0, 24));
+  }
+  // dedupe by source url+excerpt
+  const seen = new Set();
+  const uniqueChunks = [];
+  for (const c of allChunks) {
+    const key = (c.source?.url || "") + "|" + (c.text || "").slice(0,200);
+    if (!seen.has(key)) {
+      seen.add(key);
+      uniqueChunks.push(c);
+    }
+  }
+  const keepN = Math.min(48, uniqueChunks.length);
+  const topForPrompt = uniqueChunks.slice(0, keepN);
+
+  const context = topForPrompt.map((t,i)=>`Source ${i+1}: ${t.source?.title || t.source?.url || 'Web'}\nExcerpt:\n${t.text.slice(0,1800)}\n---\n`).join("\n");
+
+  const styleInstruction = style === "phd"
+    ? "Write like a PhD literature review: cautious, cite evidence, mini-conclusions."
+    : "Write a concise executive synthesis with action steps and confidence score.";
+
+  const prompt = `
+You are Nelieo Agentic Research Engine. Produce a structured answer for the user's question:
+
+USER QUESTION:
+${query}
+
+INSTRUCTIONS:
+- First, produce a 2-3 sentence plain-language summary.
+- Then your whole answer and decide the sections for the answer on your own , Decide the lenght of the answer also on your own, Confidence (0.0-1.0) and short explanation.
+- Use the provided context (excerpts) to ground claims and include inline citations like [1], [2] that correspond to the Evidence list.
+- If contradictory evidence exists, mention contradictions explicitly.
+- Keep the output as plain text and include a JSON object at the end named __NELIEO_META__ with fields: sources (array of {title,url}), top_excerpt_count, and confidence_score.
+
+STYLE:
+${styleInstruction}
+
+CONTEXT:
+${context}
+`.trim();
+
+  // Call Gemini to synthesize (use your existing Gemini call pattern)
+  try {
+    const gemResp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 1400 },
+      },
+      { headers: { "Content-Type": "application/json" }, timeout: 35000 }
+    );
+    const raw = gemResp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    // Extract sources from context used
+    const sources = topForPrompt.slice(0, 15).map(t => ({ title: t.source?.title || (t.source?.url||''), url: t.source?.url || null }));
+    // heuristic confidence: average of subResponses ok and chunk sizes
+    const conf = Math.min(0.99, Math.max(0.1, (subResponses.filter(s=>s.ok).length / Math.max(1, subResponses.length)) * 0.9 + (topForPrompt.length/48)*0.1 ));
+    return { formatted_answer: raw, sourcesArr: sources, meta: { top_chunks: topForPrompt.length, confidence: Number(conf.toFixed(2)) } };
+  } catch (e) {
+    console.error("synthesizeAgenticAnswer failed:", e.response?.data || e.message || e);
+    return { formatted_answer: "Agentic v3 synthesis failed.", sourcesArr: [], meta: { error: e.message } };
+  }
+}
+
+// Main endpoint: /api/agentic-v3
+app.post("/api/agentic-v3", async (req, res) => {
+  const { query, maxWeb = 80, parallel = 3 } = req.body || {};
+  if (!query) return res.status(400).json({ error: "Missing query" });
+  try {
+    // 1) split multi-intent into subTasks (reusing your splitMultiIntent/makePlan)
+    const pieces = splitMultiIntent(query);
+    const tasks = pieces.map(p => ({ id: uid(), kind: 'generic', query: p }));
+
+    // 2) run each subtask in parallel (bounded concurrency)
+    const runners = tasks.map(t => async () => await runSubTask(t, { maxWeb, keepChunks: 48 }));
+    const results = await pmap(runners, (fn) => fn(), Math.min(6, parallel || 3));
+
+    // 3) synthesize across subtasks
+    const synthesis = await synthesizeAgenticAnswer(query, results, "detailed");
+
+    // 4) return consistent shape
+    res.json({
+      answer: synthesis.formatted_answer,
+      formatted_answer: synthesis.formatted_answer,
+      sources: synthesis.sourcesArr,
+      images: [],
+      meta: synthesis.meta,
+      subtasks: tasks.map((t,i)=>({ task: t.query, ok: results[i]?.ok || false, meta: results[i]?.meta || {} }))
+    });
+  } catch (err) {
+    console.error("Agentic v3 error:", err.response?.data || err.message || err);
+    res.status(500).json({ error: "Agentic v3 failed", detail: err.message || String(err) });
+  }
+});
+
 function checkConfidence(newResults, query) {
   if (!newResults || newResults.length === 0) return 0;
   // Simple heuristic: fraction of results with query in title/snippet
@@ -1366,15 +1623,25 @@ app.post("/api/search", async (req, res) => {
         }
 
         if (engineReq === "google_shopping") {
-          const shops = data.shopping_results || data.product_results || data.organic_results || [];
+          const shops =
+            data.shopping_results ||
+            data.product_results ||
+            data.organic_results ||
+            [];
           return res.json(shops);
         }
 
-        if (engineReq === "google_videos" || engineReq === "google_short_videos") {
+        if (
+          engineReq === "google_videos" ||
+          engineReq === "google_short_videos"
+        ) {
           // Prefer YouTube Data API when a key is available for richer metadata
           try {
             if (process.env.YOUTUBE_API_KEY) {
-              const q = engineReq === "google_short_videos" ? `${query} short video` : query;
+              const q =
+                engineReq === "google_short_videos"
+                  ? `${query} short video`
+                  : query;
               const you = await searchYouTube(q, 12);
               const mappedYou = (you || []).map((v) => ({
                 title: v.title || null,
@@ -1388,7 +1655,8 @@ app.post("/api/search", async (req, res) => {
             console.warn("YouTube fallback failed:", e?.message || e);
           }
 
-          const vids = data.video_results || data.organic_results || data.videos || [];
+          const vids =
+            data.video_results || data.organic_results || data.videos || [];
           const mapped = (vids || []).map((v) => ({
             title: v.title || v.name || v.snippet || null,
             url: v.link || v.url || v.source || null,
@@ -1398,7 +1666,10 @@ app.post("/api/search", async (req, res) => {
           return res.json(mapped);
         }
       } catch (e) {
-        console.error("Vertical search error:", e?.response?.data || e.message || e);
+        console.error(
+          "Vertical search error:",
+          e?.response?.data || e.message || e
+        );
         return res.status(500).json([]);
       }
     }
@@ -1466,7 +1737,12 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
       (async () => {
         try {
           const r = await axios.get("https://serpapi.com/search", {
-            params: { engine: "google", q: query, tbm: "isch", api_key: process.env.SERPAPI_API_KEY },
+            params: {
+              engine: "google",
+              q: query,
+              tbm: "isch",
+              api_key: process.env.SERPAPI_API_KEY,
+            },
             timeout: 10000,
           });
           return r.data.images_results || [];
@@ -1482,13 +1758,21 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
               const you = await searchYouTube(query, 8);
               return you || [];
             } catch (e) {
-              console.warn("YouTube search failed in verticals:", e?.message || e);
+              console.warn(
+                "YouTube search failed in verticals:",
+                e?.message || e
+              );
               // fallthrough to SerpAPI below
             }
           }
 
           const r = await axios.get("https://serpapi.com/search", {
-            params: { engine: "google", q: query, tbm: "vid", api_key: process.env.SERPAPI_API_KEY },
+            params: {
+              engine: "google",
+              q: query,
+              tbm: "vid",
+              api_key: process.env.SERPAPI_API_KEY,
+            },
             timeout: 10000,
           });
           return r.data.video_results || r.data.organic_results || [];
@@ -1499,7 +1783,12 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
       (async () => {
         try {
           const r = await axios.get("https://serpapi.com/search", {
-            params: { engine: "google_news", q: query, tbm: "nws", api_key: process.env.SERPAPI_API_KEY },
+            params: {
+              engine: "google_news",
+              q: query,
+              tbm: "nws",
+              api_key: process.env.SERPAPI_API_KEY,
+            },
             timeout: 10000,
           });
           return r.data.news_results || [];
@@ -1510,7 +1799,12 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
       (async () => {
         try {
           const r = await axios.get("https://serpapi.com/search", {
-            params: { engine: "google", q: query, tbm: "shop", api_key: process.env.SERPAPI_API_KEY },
+            params: {
+              engine: "google",
+              q: query,
+              tbm: "shop",
+              api_key: process.env.SERPAPI_API_KEY,
+            },
             timeout: 10000,
           });
           return r.data.shopping_results || r.data.organic_results || [];
@@ -1526,12 +1820,20 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
               const you = await searchYouTube(qShort, 8);
               return you || [];
             } catch (e) {
-              console.warn("YouTube short search failed in verticals:", e?.message || e);
+              console.warn(
+                "YouTube short search failed in verticals:",
+                e?.message || e
+              );
             }
           }
 
           const r = await axios.get("https://serpapi.com/search", {
-            params: { engine: "google", q: qShort, tbm: "vid", api_key: process.env.SERPAPI_API_KEY },
+            params: {
+              engine: "google",
+              q: qShort,
+              tbm: "vid",
+              api_key: process.env.SERPAPI_API_KEY,
+            },
             timeout: 10000,
           });
           return r.data.video_results || r.data.organic_results || [];
@@ -1541,11 +1843,26 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
       })(),
     ]);
 
-    const images = (verticals[0] && verticals[0].status === "fulfilled" ? verticals[0].value : []) || [];
-    const videos = (verticals[1] && verticals[1].status === "fulfilled" ? verticals[1].value : []) || [];
-    const news = (verticals[2] && verticals[2].status === "fulfilled" ? verticals[2].value : []) || [];
-    const shopping = (verticals[3] && verticals[3].status === "fulfilled" ? verticals[3].value : []) || [];
-    const shortVideos = (verticals[4] && verticals[4].status === "fulfilled" ? verticals[4].value : []) || [];
+    const images =
+      (verticals[0] && verticals[0].status === "fulfilled"
+        ? verticals[0].value
+        : []) || [];
+    const videos =
+      (verticals[1] && verticals[1].status === "fulfilled"
+        ? verticals[1].value
+        : []) || [];
+    const news =
+      (verticals[2] && verticals[2].status === "fulfilled"
+        ? verticals[2].value
+        : []) || [];
+    const shopping =
+      (verticals[3] && verticals[3].status === "fulfilled"
+        ? verticals[3].value
+        : []) || [];
+    const shortVideos =
+      (verticals[4] && verticals[4].status === "fulfilled"
+        ? verticals[4].value
+        : []) || [];
 
     // 4. Respond to frontend with answer + verticals
     res.json({
@@ -1731,7 +2048,10 @@ Output contract: return only the assistant's reply as plain text (no JSON, no ex
 `;
 
     const contentsForGemini = [
-      { role: "user", parts: [{ text: `SYSTEM INSTRUCTION:\n${voiceSystemPrompt}` }] },
+      {
+        role: "user",
+        parts: [{ text: `SYSTEM INSTRUCTION:\n${voiceSystemPrompt}` }],
+      },
       ...chatHistoryFormatted,
       { role: "user", parts: [{ text: prompt }] },
     ].filter(Boolean);
@@ -1909,7 +2229,10 @@ Give answer in the friendly way and talk like a smart , helpful and chill Gen Z 
 
     // Ensure model receives a system instruction first to define persona/contract
     const contentsForGemini = [
-      { role: "user", parts: [{ text: `SYSTEM INSTRUCTION:\n${systemPrompt}` }] },
+      {
+        role: "user",
+        parts: [{ text: `SYSTEM INSTRUCTION:\n${systemPrompt}` }],
+      },
       ...formattedHistory,
       { role: "user", parts: [{ text: promptWithStructure }] },
     ].filter(Boolean);
@@ -2043,6 +2366,37 @@ ${contentWithInstructions}
     res.json({ result: answer });
   } catch (error) {
     console.error("Summarizer error:", error.response?.data || error.message);
+    res.status(500).json({ error: "Summarization failed." });
+  }
+});
+
+// Compatibility route expected by frontend (returns both summary & result)
+app.post("/api/summarize-article", async (req, res) => {
+  const content = req.body.content;
+  if (!content) return res.status(400).json({ error: "Missing content." });
+  const userId = req.headers["x-user-id"] || req.query.userId || "demo";
+  const userInstructions = getInstructionsForUser(userId);
+  const contentWithInstructions = `${
+    userInstructions.chat ? userInstructions.chat + "\n\n" : ""
+  }${content}`;
+
+  const prompt = `Summarize the following content in a clear, friendly, and helpful way. Use bullet points for key ideas and a short conclusion if needed.\nAvoid using hashtags (#), asterisks (*), or markdown symbols.\n\nContent:\n${contentWithInstructions}`;
+
+  try {
+    const geminiResponse = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      { contents: [{ role: "user", parts: [{ text: prompt }] }] },
+      { headers: { "Content-Type": "application/json" } }
+    );
+    const answer =
+      geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    // Return both fields for backward / forward compatibility
+    res.json({ summary: answer, result: answer });
+  } catch (error) {
+    console.error(
+      "Summarize-article error:",
+      error.response?.data || error.message
+    );
     res.status(500).json({ error: "Summarization failed." });
   }
 });
@@ -5919,7 +6273,9 @@ ${contextInf}
 
     const formatted_answer = composeSections(blocks);
     const sources = execs.flatMap((ex) => ex.run.sources).slice(0, 12);
-    const imagesFromRuns = execs.flatMap((ex) => ex.run.images || []).slice(0, 8);
+    const imagesFromRuns = execs
+      .flatMap((ex) => ex.run.images || [])
+      .slice(0, 8);
 
     // Fetch verticals in parallel to include images/videos/news/shopping/short_videos
     try {
@@ -5927,7 +6283,12 @@ ${contextInf}
         (async () => {
           try {
             const r = await axios.get("https://serpapi.com/search", {
-              params: { engine: "google", q: query, tbm: "isch", api_key: process.env.SERPAPI_API_KEY },
+              params: {
+                engine: "google",
+                q: query,
+                tbm: "isch",
+                api_key: process.env.SERPAPI_API_KEY,
+              },
               timeout: 10000,
             });
             return r.data.images_results || [];
@@ -5938,7 +6299,12 @@ ${contextInf}
         (async () => {
           try {
             const r = await axios.get("https://serpapi.com/search", {
-              params: { engine: "google", q: query, tbm: "vid", api_key: process.env.SERPAPI_API_KEY },
+              params: {
+                engine: "google",
+                q: query,
+                tbm: "vid",
+                api_key: process.env.SERPAPI_API_KEY,
+              },
               timeout: 10000,
             });
             return r.data.video_results || r.data.organic_results || [];
@@ -5949,7 +6315,12 @@ ${contextInf}
         (async () => {
           try {
             const r = await axios.get("https://serpapi.com/search", {
-              params: { engine: "google_news", q: query, tbm: "nws", api_key: process.env.SERPAPI_API_KEY },
+              params: {
+                engine: "google_news",
+                q: query,
+                tbm: "nws",
+                api_key: process.env.SERPAPI_API_KEY,
+              },
               timeout: 10000,
             });
             return r.data.news_results || [];
@@ -5960,7 +6331,12 @@ ${contextInf}
         (async () => {
           try {
             const r = await axios.get("https://serpapi.com/search", {
-              params: { engine: "google", q: query, tbm: "shop", api_key: process.env.SERPAPI_API_KEY },
+              params: {
+                engine: "google",
+                q: query,
+                tbm: "shop",
+                api_key: process.env.SERPAPI_API_KEY,
+              },
               timeout: 10000,
             });
             return r.data.shopping_results || r.data.organic_results || [];
@@ -5971,7 +6347,12 @@ ${contextInf}
         (async () => {
           try {
             const r = await axios.get("https://serpapi.com/search", {
-              params: { engine: "google", q: `${query} short video`, tbm: "vid", api_key: process.env.SERPAPI_API_KEY },
+              params: {
+                engine: "google",
+                q: `${query} short video`,
+                tbm: "vid",
+                api_key: process.env.SERPAPI_API_KEY,
+              },
               timeout: 10000,
             });
             return r.data.video_results || r.data.organic_results || [];
@@ -5981,17 +6362,39 @@ ${contextInf}
         })(),
       ]);
 
-      const imgs = (vert[0] && vert[0].status === "fulfilled" ? vert[0].value : []) || [];
-      const vids = (vert[1] && vert[1].status === "fulfilled" ? vert[1].value : []) || [];
-      const newsArr = (vert[2] && vert[2].status === "fulfilled" ? vert[2].value : []) || [];
-      const shops = (vert[3] && vert[3].status === "fulfilled" ? vert[3].value : []) || [];
-      const shortV = (vert[4] && vert[4].status === "fulfilled" ? vert[4].value : []) || [];
+      const imgs =
+        (vert[0] && vert[0].status === "fulfilled" ? vert[0].value : []) || [];
+      const vids =
+        (vert[1] && vert[1].status === "fulfilled" ? vert[1].value : []) || [];
+      const newsArr =
+        (vert[2] && vert[2].status === "fulfilled" ? vert[2].value : []) || [];
+      const shops =
+        (vert[3] && vert[3].status === "fulfilled" ? vert[3].value : []) || [];
+      const shortV =
+        (vert[4] && vert[4].status === "fulfilled" ? vert[4].value : []) || [];
 
-      const normImages = imgs.map((i) => i.original || i.thumbnail || i.link).filter(Boolean).slice(0, 36);
-      const normVideos = vids.map((v) => ({ title: v.title || v.name || v.snippet || null, url: v.link || v.url || v.source || null, snippet: v.snippet || v.description || null, id: v.video_id || v.id || v.link || v.url || null })).slice(0, 24);
+      const normImages = imgs
+        .map((i) => i.original || i.thumbnail || i.link)
+        .filter(Boolean)
+        .slice(0, 36);
+      const normVideos = vids
+        .map((v) => ({
+          title: v.title || v.name || v.snippet || null,
+          url: v.link || v.url || v.source || null,
+          snippet: v.snippet || v.description || null,
+          id: v.video_id || v.id || v.link || v.url || null,
+        }))
+        .slice(0, 24);
       const normNews = newsArr.slice(0, 24);
       const normShopping = shops.slice(0, 24);
-      const normShort = shortV.map((v) => ({ title: v.title || v.name || v.snippet || null, url: v.link || v.url || v.source || null, snippet: v.snippet || v.description || null, id: v.video_id || v.id || v.link || v.url || null })).slice(0, 24);
+      const normShort = shortV
+        .map((v) => ({
+          title: v.title || v.name || v.snippet || null,
+          url: v.link || v.url || v.source || null,
+          snippet: v.snippet || v.description || null,
+          id: v.video_id || v.id || v.link || v.url || null,
+        }))
+        .slice(0, 24);
 
       return res.json({
         formatted_answer,
