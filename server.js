@@ -16,7 +16,6 @@ import { chromium } from "playwright";
 import crypto from "crypto";
 import { EventEmitter } from "events";
 import { PuppeteerScreenRecorder } from "puppeteer-screen-recorder";
-import { planSubtasks } from "./api/planner.js";
 puppeteer.use(StealthPlugin());
 
 dotenv.config();
@@ -531,11 +530,6 @@ function cosineSim(a, b) {
 async function getEmbeddingsGemini(texts = []) {
   // Google API limit: max 100 requests per batch; we batch sequentially.
   const MAX_BATCH = 100;
-  // If no GEMINI key, return zero-vectors to allow graceful degradation
-  if (!process.env.GEMINI_API_KEY) {
-    const dim = 768;
-    return texts.map(() => Array(dim).fill(0));
-  }
   const all = [];
   for (let i = 0; i < texts.length; i += MAX_BATCH) {
     const slice = texts.slice(i, i + MAX_BATCH);
@@ -564,9 +558,7 @@ async function getEmbeddingsGemini(texts = []) {
         "Gemini embeddings error (batch)",
         e.response?.data || e.message
       );
-      // Graceful fallback: pad with zero-vectors for this slice
-      const dim = 768;
-      for (let k = 0; k < slice.length; k++) all.push(Array(dim).fill(0));
+      throw e;
     }
   }
   return all;
@@ -1278,474 +1270,6 @@ async function fetchPageTextFast(url) {
   }
 }
 
-// ---------------- Agentic v3 (next-gen) ----------------
-// Paste this AFTER your agentic-v2 / deepresearch handlers
-
-// Utility: spawn N promises with concurrency limit
-async function pmap(items, fn, concurrency = 6) {
-  const res = [];
-  let i = 0;
-  const workers = new Array(concurrency).fill(0).map(async () => {
-    while (i < items.length) {
-      const idx = i++;
-      try {
-        res[idx] = await fn(items[idx], idx);
-      } catch (e) {
-        res[idx] = null;
-      }
-    }
-  });
-  await Promise.all(workers);
-  return res;
-}
-
-// Small reranker using embeddings (Gemini embeddings helper already in file)
-async function rerankByEmbedding(query, chunks, keep = 40) {
-  try {
-    const texts = [query, ...chunks.map((c) => c.text.slice(0, 2000))];
-    const embs = await getEmbeddingsGemini(texts);
-    const qEmb = embs[0];
-    const cEmbs = embs.slice(1);
-    const scored = cEmbs
-      .map((e, i) => ({ i, score: cosineSim(e, qEmb) }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, Math.min(keep, cEmbs.length))
-      .map((s) => ({ ...chunks[s.i], score: s.score }));
-    return scored;
-  } catch (e) {
-    console.warn("rerankByEmbedding failed:", e.message || e);
-    return chunks.slice(0, keep);
-  }
-}
-
-// Expand search across multiple verticals (deep retrieval)
-async function fetchMultiVerticals(query, maxWeb = 80) {
-  const serpKey = process.env.SERPAPI_API_KEY;
-  const results = {
-    web: [],
-    news: [],
-    youtube: [],
-    reddit: [],
-    wiki: [],
-    twitter: [],
-  };
-
-  const qVariants = [
-    query,
-    `${query} site:arxiv.org`,
-    `${query} filetype:pdf`,
-    `${query} site:youtube.com`,
-    `${query} "${query}"`,
-  ];
-
-  // fetch big organic list from SerpAPI in parallel variants
-  const serpPromises = qVariants.map((q) =>
-    axios
-      .get("https://serpapi.com/search", {
-        params: { engine: "google", q, api_key: serpKey },
-        timeout: 10000,
-      })
-      .then((r) =>
-        (r.data?.organic_results || []).map((o) => ({
-          title: o.title,
-          link: o.link,
-          snippet: o.snippet,
-        }))
-      )
-      .catch(() => [])
-  );
-
-  const serpSets = await Promise.all(serpPromises);
-  const webRaw = [].concat(...serpSets).filter(Boolean);
-  // unique by url
-  const seen = new Set();
-  for (const r of webRaw) {
-    if (!r.link) continue;
-    const u = r.link.split("#")[0].split("?")[0];
-    if (!seen.has(u)) {
-      results.web.push({ title: r.title, link: r.link, snippet: r.snippet });
-      seen.add(u);
-      if (results.web.length >= maxWeb) break;
-    }
-  }
-
-  // quick social & specialized collectors (best-effort)
-  results.youtube = await (async () => {
-    try {
-      return (await searchYouTube(query, 12)) || [];
-    } catch {
-      return [];
-    }
-  })();
-
-  results.reddit = await (async () => {
-    try {
-      return (await searchReddit(query, 12)) || [];
-    } catch {
-      return [];
-    }
-  })();
-
-  results.wiki = await (async () => {
-    try {
-      return (await searchWikipedia(query)) || [];
-    } catch {
-      return [];
-    }
-  })();
-
-  results.twitter = await (async () => {
-    try {
-      return (await searchTwitterRecent(query, 12)) || [];
-    } catch {
-      return [];
-    }
-  })();
-
-  return results;
-}
-
-// Fetch pages fast (bounded)
-async function fetchTopPages(webEntries, maxFetch = 36) {
-  const toFetch = webEntries.slice(0, maxFetch);
-  return await pmap(
-    toFetch,
-    async (e) => {
-      try {
-        const p = await fetchPageTextFast(e.link);
-        if (!p) return null;
-        p.url = e.link;
-        p.title = p.title || e.title || "";
-        return p;
-      } catch (err) {
-        return null;
-      }
-    },
-    8
-  ).then((arr) => arr.filter(Boolean));
-}
-
-// Subtask worker: given a sub-intent, produce chunks
-async function runSubTask(subTask, opts = {}) {
-  const q = subTask.query || (subTask.title ? subTask.title : "");
-  const maxWeb = opts.maxWeb || 80;
-  const keepChunks = opts.keepChunks || 48;
-  const pages = [];
-  try {
-    const verts = await fetchMultiVerticals(q, maxWeb);
-    const fetched = await fetchTopPages(
-      verts.web,
-      Math.min(36, Math.max(12, Math.floor(maxWeb / 2)))
-    );
-    // prepare chunks array (text snippets)
-    const chunks = [];
-    for (const p of fetched) {
-      if (p.text && p.text.length > 200) {
-        chunkText(p.text, 1800).forEach((c) =>
-          chunks.push({
-            id: c.id,
-            text: c.text,
-            source: { url: p.url, title: p.title },
-          })
-        );
-      }
-    }
-    // PDFs and images heuristics - treat links as stubs (will be expanded later)
-    const pdfLinks = (verts.web || [])
-      .filter((w) => /\.pdf(\b|$)/i.test(w.link || ""))
-      .slice(0, 6);
-    pdfLinks.forEach((p) =>
-      chunks.push({
-        id: uid(),
-        text: `${p.title}\n\n${p.snippet || ""}`,
-        source: { url: p.link, title: p.title },
-      })
-    );
-
-    // include news / wiki / social as short chunks
-    (verts.news || []).slice(0, 12).forEach((n) =>
-      chunks.push({
-        id: uid(),
-        text: `${n.title}\n\n${n.snippet || ""}`,
-        source: { url: n.link, title: n.title },
-      })
-    );
-    (verts.wiki || []).slice(0, 8).forEach((w) =>
-      chunks.push({
-        id: uid(),
-        text: `${w.title}\n\n${w.snippet || ""}`,
-        source: { url: w.url, title: w.title },
-      })
-    );
-    (verts.reddit || []).slice(0, 8).forEach((r) =>
-      chunks.push({
-        id: uid(),
-        text: `${r.title}\n\n${r.text || ""}`,
-        source: { url: r.url, title: r.title },
-      })
-    );
-    // rerank via embeddings and keep top N
-    const topChunks = await rerankByEmbedding(q, chunks, keepChunks);
-    return {
-      ok: true,
-      topChunks,
-      meta: {
-        webCount: verts.web.length,
-        youtube: verts.youtube.length,
-        reddit: verts.reddit.length,
-        pdfs: pdfLinks.length,
-      },
-    };
-  } catch (e) {
-    console.warn("runSubTask failed:", e.message || e);
-    return { ok: false, error: e.message || String(e) };
-  }
-}
-
-// High-level synthesis: combine subtask outputs and ask LLM to synthesize structured answer
-async function synthesizeAgenticAnswer(
-  query,
-  subResponses,
-  style = "detailed"
-) {
-  // Build context from top chunks across subtasks
-  const allChunks = [];
-  for (const r of subResponses) {
-    if (r && r.topChunks) allChunks.push(...r.topChunks.slice(0, 24));
-  }
-  // dedupe by source url+excerpt
-  const seen = new Set();
-  const uniqueChunks = [];
-  for (const c of allChunks) {
-    const key = (c.source?.url || "") + "|" + (c.text || "").slice(0, 200);
-    if (!seen.has(key)) {
-      seen.add(key);
-      uniqueChunks.push(c);
-    }
-  }
-  const keepN = Math.min(48, uniqueChunks.length);
-  const topForPrompt = uniqueChunks.slice(0, keepN);
-
-  const context = topForPrompt
-    .map(
-      (t, i) =>
-        `Source ${i + 1}: ${
-          t.source?.title || t.source?.url || "Web"
-        }\nExcerpt:\n${t.text.slice(0, 1800)}\n---\n`
-    )
-    .join("\n");
-
-  const styleInstruction =
-    style === "phd"
-      ? "Write like a PhD literature review: cautious, cite evidence, mini-conclusions."
-      : "Write a concise executive synthesis with action steps and confidence score.";
-
-  const prompt = `
-You are Nelieo Agentic Research Engine. Produce a structured, evidence-backed answer for the user's question.
-
-USER QUESTION:
-${query}
-
-INSTRUCTIONS:
-- Start with a 2–3 sentence plain-language summary.
-- Then write the full answer with clear sections you choose (headings, lists, tables where helpful). Decide length based on the topic and mode.
-- Always ground claims in CONTEXT excerpts and include inline citations like [1], [2] mapping to the Evidence list.
-- Cross-source reasoning: compare and contrast viewpoints. If Sequoia says X and Khosla says Y, explain why they differ. Highlight contradictions and uncertainties.
-- Dynamic depth: If the mode is quick, be concise but precise; if deep, be comprehensive and include timelines, simple charts as ASCII tables, and credibility notes.
-- Keep output as plain text. At the end, include a JSON object named __NELIEO_META__ with fields: sources (array of {title,url}), top_excerpt_count, confidence_score.
-
-STYLE:
-${styleInstruction}
-
-CONTEXT (Evidence Excerpts):
-${context}
-`.trim();
-
-  // Call Gemini to synthesize (use your existing Gemini call pattern)
-  try {
-    // If GEMINI key is missing, synthesize a lightweight fallback locally
-    if (!process.env.GEMINI_API_KEY) {
-      const bullets = topForPrompt
-        .slice(0, Math.min(8, topForPrompt.length))
-        .map((t) => {
-          const title = t.source?.title || t.source?.url || "Source";
-          const first = String(t.text || "").split(/\n+/)[0].slice(0, 160);
-          return `- ${title}: ${first}`;
-        })
-        .join("\n");
-      const raw = [
-        "Summary:",
-        `- Aggregated from ${topForPrompt.length} evidence snippets.`,
-        "",
-        "Key Findings:",
-        bullets || "- Not enough evidence collected.",
-      ].join("\n");
-      const sources = topForPrompt.slice(0, 15).map((t) => ({
-        title: t.source?.title || t.source?.url || "",
-        url: t.source?.url || null,
-      }));
-      const conf = Math.min(
-        0.95,
-        Math.max(0.2, topForPrompt.length / 48)
-      );
-      return {
-        formatted_answer: raw,
-        sourcesArr: sources,
-        meta: {
-          top_chunks: topForPrompt.length,
-          confidence: Number(conf.toFixed(2)),
-          evidence_count: topForPrompt.length,
-          note: "Fallback synthesis without GEMINI_API_KEY",
-        },
-      };
-    }
-    const gemResp = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 1400 },
-      },
-      { headers: { "Content-Type": "application/json" }, timeout: 35000 }
-    );
-    const raw = gemResp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    // Extract sources from context used
-    const sources = topForPrompt.slice(0, 15).map((t) => ({
-      title: t.source?.title || t.source?.url || "",
-      url: t.source?.url || null,
-    }));
-    // heuristic confidence: average of subResponses ok and chunk sizes
-    const conf = Math.min(
-      0.99,
-      Math.max(
-        0.1,
-        (subResponses.filter((s) => s.ok).length /
-          Math.max(1, subResponses.length)) *
-          0.9 +
-          (topForPrompt.length / 48) * 0.1
-      )
-    );
-    return {
-      formatted_answer: raw,
-      sourcesArr: sources,
-      meta: {
-        top_chunks: topForPrompt.length,
-        confidence: Number(conf.toFixed(2)),
-        evidence_count: topForPrompt.length,
-      },
-    };
-  } catch (e) {
-    console.error(
-      "synthesizeAgenticAnswer failed:",
-      e.response?.data || e.message || e
-    );
-    return {
-      formatted_answer: "Agentic v3 synthesis failed.",
-      sourcesArr: [],
-      meta: { error: e.message },
-    };
-  }
-}
-
-// Simple in-memory session memory (per user)
-const sessionMemory = new Map(); // key: userId, value: { history: [{q,a,ts}], lastTopics: [] }
-
-function remember(userId, q, a) {
-  const rec = sessionMemory.get(userId) || { history: [], lastTopics: [] };
-  rec.history.push({ q, a, ts: Date.now() });
-  if (rec.history.length > 20) rec.history.shift();
-  // naive topic extraction: first 6 words of q
-  const topic = String(q).split(/\s+/).slice(0, 6).join(" ");
-  rec.lastTopics = Array.from(new Set([topic, ...rec.lastTopics])).slice(0, 12);
-  sessionMemory.set(userId, rec);
-  return rec;
-}
-
-function recall(userId) {
-  return sessionMemory.get(userId) || { history: [], lastTopics: [] };
-}
-
-// Main endpoint: /api/agentic-v3
-app.post("/api/agentic-v3", async (req, res) => {
-  const {
-    query,
-    maxWeb: maxWebIn = 80,
-    parallel: parallelIn = 3,
-    mode = "deep",
-  } = req.body || {};
-  if (!query) return res.status(400).json({ error: "Missing query" });
-  try {
-    // Depth control: quick vs deep
-    const isQuick = String(mode).toLowerCase() === "quick";
-    const maxWeb = isQuick ? Math.min(30, maxWebIn) : Math.max(80, maxWebIn);
-    const parallel = isQuick
-      ? Math.min(3, parallelIn || 2)
-      : Math.min(8, parallelIn || 4);
-
-    // 1) Plan multi-intent subtasks with vertical hints
-    const tasks = planSubtasks(query, {
-      mode: isQuick ? "quick" : "deep",
-      max: 6,
-    });
-
-    // 2) Run each subtask in parallel (bounded concurrency)
-    const runners = tasks.map(
-      (t) => async () =>
-        await runSubTask(t, { maxWeb, keepChunks: isQuick ? 24 : 64 })
-    );
-    const results = await pmap(runners, (fn) => fn(), parallel);
-
-    // 3) synthesize across subtasks
-    const synthesis = await synthesizeAgenticAnswer(
-      query,
-      results,
-      isQuick ? "executive" : "detailed"
-    );
-
-    // Research map (explainable reasoning)
-    const researchMap = {
-      query,
-      mode: isQuick ? "quick" : "deep",
-      steps: tasks.map((t, i) => ({
-        subquery: t.query,
-        verticals: t.verticals,
-        ok: results[i]?.ok || false,
-        keptChunks: results[i]?.topChunks?.length || 0,
-        meta: results[i]?.meta || {},
-      })),
-    };
-
-    // remember session
-    const userId = req.headers["x-user-id"] || "demo";
-    remember(userId, query, synthesis.formatted_answer);
-
-    // 4) return consistent shape with meta
-    res.json({
-      answer: synthesis.formatted_answer,
-      formatted_answer: synthesis.formatted_answer,
-      sources: synthesis.sourcesArr,
-      images: [],
-      meta: {
-        ...synthesis.meta,
-        research_map: researchMap,
-        memory: recall(userId),
-      },
-      subtasks: tasks.map((t, i) => ({
-        task: t.query,
-        ok: results[i]?.ok || false,
-        meta: results[i]?.meta || {},
-      })),
-    });
-  } catch (err) {
-    console.error(
-      "Agentic v3 error:",
-      err.response?.data || err.message || err
-    );
-    res
-      .status(500)
-      .json({ error: "Agentic v3 failed", detail: err.message || String(err) });
-  }
-});
-
 function checkConfidence(newResults, query) {
   if (!newResults || newResults.length === 0) return 0;
   // Simple heuristic: fraction of results with query in title/snippet
@@ -1900,27 +1424,20 @@ app.post("/api/search", async (req, res) => {
           "Vertical search error:",
           e?.response?.data || e.message || e
         );
-        // Return an empty list with 200 to avoid client-side 500s for vertical fetches
-        return res.json([]);
+        return res.status(500).json([]);
       }
     }
 
-    // 1. Get Web Search Results from SerpAPI (graceful if key missing)
-    let results = [];
-    try {
-      const serpResponse = await axios.get("https://serpapi.com/search", {
-        params: {
-          engine: "google",
-          q: query,
-          api_key: process.env.SERPAPI_API_KEY,
-        },
-        timeout: 12000,
-      });
-      results = serpResponse.data.organic_results?.slice(0, 5) || [];
-    } catch (e) {
-      console.warn("SerpAPI web search failed:", e?.response?.data || e.message);
-      results = [];
-    }
+    // 1. Get Web Search Results from SerpAPI
+    const serpResponse = await axios.get("https://serpapi.com/search", {
+      params: {
+        engine: "google",
+        q: query,
+        api_key: process.env.SERPAPI_API_KEY,
+      },
+    });
+
+    const results = serpResponse.data.organic_results?.slice(0, 5) || [];
 
     const context = results
       .map(
@@ -1948,41 +1465,25 @@ Talk in very Friendly way.
 Avoid using hashtags (#), asterisks (*), or markdown symbols.
 `;
 
-    let generatedAnswer = "";
-    if (process.env.GEMINI_API_KEY) {
-      try {
-        const geminiResponse = await axios.post(
-          `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    const geminiResponse = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        contents: [
           {
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: prompt }],
-              },
-            ],
+            role: "user",
+            parts: [{ text: prompt }],
           },
-          {
-            headers: {
-              "Content-Type": "application/json",
-            },
-            timeout: 20000,
-          }
-        );
-        generatedAnswer =
-          geminiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      } catch (e) {
-        console.warn("Gemini generation failed:", e?.response?.data || e.message);
-        generatedAnswer = "";
+        ],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
       }
-    }
-    if (!generatedAnswer) {
-      const titles = results.map((r, i) => `${i + 1}. ${r.title}`).join("\n");
-      generatedAnswer =
-        (results.length
-          ? `Here are top results I found.\n\n${titles}\n\nI can analyze these further if you enable the generative API.`
-          : `I couldn't reach search or the generative API. Please set SERPAPI_API_KEY and GEMINI_API_KEY on the server to enable full answers.`) ||
-        "No response.";
-    }
+    );
+
+    const sources = results.map((r) => `- ${r.title}: ${r.link}`).join("\n");
+    const fullAnswer = `${geminiResponse.data.candidates[0].content.parts[0].text}\n\nSources:\n${sources}`;
 
     // Fetch images for the query
     // Fetch verticals in parallel (images, videos, news, shopping, short videos)
@@ -2119,7 +1620,7 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
 
     // 4. Respond to frontend with answer + verticals
     res.json({
-      answer: generatedAnswer,
+      answer: geminiResponse.data.candidates[0].content.parts[0].text,
       images,
       videos,
       news,
@@ -2128,16 +1629,7 @@ Avoid using hashtags (#), asterisks (*), or markdown symbols.
     });
   } catch (err) {
     console.error("❌ Error:", err.response?.data || err.message || err);
-    // Graceful 200 with empty content to avoid client-side failures
-    res.json({
-      answer:
-        "Search service encountered an error. Please try again or configure API keys.",
-      images: [],
-      videos: [],
-      news: [],
-      shopping: [],
-      short_videos: [],
-    });
+    res.status(500).json({ error: "Failed to get answer" });
   }
 });
 
