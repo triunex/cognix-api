@@ -17,6 +17,7 @@ import crypto from "crypto";
 import { EventEmitter } from "events";
 import { PuppeteerScreenRecorder } from "puppeteer-screen-recorder";
 puppeteer.use(StealthPlugin());
+import Redis from "ioredis";
 
 dotenv.config();
 
@@ -253,6 +254,110 @@ async function makeDemoVideoFromSpec(spec) {
   return { videoUrl: publicUrl };
 }
 // ------------- Agentic v2 helpers -------------
+// Simple TTL + size-capped cache
+class SimpleCache {
+  constructor(limit = 500, ttlMs = 300000) {
+    this.limit = limit;
+    this.ttl = ttlMs;
+    this.map = new Map();
+  }
+  get(k) {
+    const v = this.map.get(k);
+    if (!v) return undefined;
+    if (Date.now() - v.t > this.ttl) {
+      this.map.delete(k);
+      return undefined;
+    }
+    return v.v;
+  }
+  set(k, v) {
+    if (this.map.size >= this.limit) {
+      const first = this.map.keys().next().value;
+      if (first !== undefined) this.map.delete(first);
+    }
+    this.map.set(k, { v, t: Date.now() });
+  }
+}
+
+const serpCache = new SimpleCache(400, 5 * 60 * 1000);
+const pageCache = new SimpleCache(400, 10 * 60 * 1000);
+const embedCache = new SimpleCache(3000, 60 * 60 * 1000);
+
+// Optional Redis persistent cache (fallback to in-memory if unavailable)
+let redis = null;
+try {
+  const url = process.env.REDIS_URL || process.env.REDIS_CONNECTION_STRING;
+  if (url) {
+    redis = new Redis(url, { lazyConnect: true, maxRetriesPerRequest: 2 });
+    await redis.connect().catch(() => {});
+  } else if (process.env.REDIS_HOST) {
+    redis = new Redis({
+      host: process.env.REDIS_HOST,
+      port: Number(process.env.REDIS_PORT || 6379),
+      username: process.env.REDIS_USERNAME,
+      password: process.env.REDIS_PASSWORD,
+      lazyConnect: true,
+      maxRetriesPerRequest: 2,
+    });
+    await redis.connect().catch(() => {});
+  }
+} catch {}
+
+async function persistentGet(key) {
+  if (!redis) return null;
+  try {
+    const v = await redis.get(key);
+    return v ? JSON.parse(v) : null;
+  } catch {
+    return null;
+  }
+}
+async function persistentSet(key, value, ttlSec) {
+  if (!redis) return false;
+  try {
+    const s = JSON.stringify(value);
+    if (ttlSec) await redis.setex(key, ttlSec, s);
+    else await redis.set(key, s);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isComplexQuery(q = "") {
+  const s = (q || "").toLowerCase();
+  const long = s.split(/\s+/).length >= 10;
+  const has = (re) => re.test(s);
+  return (
+    long ||
+    has(
+      /news|latest|timeline|history|compare|versus|vs\b|analysis|deep|research|transcript|explain|why|how/
+    ) ||
+    has(/market size|global|report|whitepaper|pdf/)
+  );
+}
+
+async function searchSerpCached(engine, q, params = {}, timeoutMs = 6000) {
+  const apiKey = process.env.SERPAPI_API_KEY;
+  if (!apiKey) return null;
+  const key = `${engine}|${q}|${JSON.stringify(params)}`;
+  const rkey = `serp:${key}`;
+  const persisted = await persistentGet(rkey);
+  if (persisted) return persisted;
+  const cached = serpCache.get(key);
+  if (cached) return cached;
+  try {
+    const resp = await axios.get("https://serpapi.com/search", {
+      params: { engine, q, api_key: apiKey, ...params },
+      timeout: timeoutMs,
+    });
+    serpCache.set(key, resp.data);
+    persistentSet(rkey, resp.data, 300).catch(() => {});
+    return resp.data;
+  } catch (e) {
+    return null;
+  }
+}
 async function fetchPageText(url) {
   try {
     const resp = await axios.get(url, {
@@ -277,6 +382,437 @@ async function fetchPageText(url) {
 }
 
 // ---------- Agentic helpers (ADD THIS) ----------
+// LLM-based multi-intent planner (always-on with graceful fallback)
+async function planSubqueriesLLM(userQuery = "") {
+  const out = { subqueries: [] };
+  const q = String(userQuery || "").trim();
+  if (!q) return out;
+
+  // If no Gemini API key, fallback to single subquery (no-op)
+  if (!process.env.GEMINI_API_KEY) {
+    out.subqueries = [
+      { query: q, rationale: "No LLM key; single-pass fallback", priority: 1 },
+    ];
+    return out;
+  }
+
+  const prompt = `You are a precise query planner. Split the user's query into 1–6 focused subqueries that together fully cover the intent. Return JSON ONLY with this schema:
+{
+  "subqueries": [
+    { "query": "<searchable subquery>", "rationale": "<why include>", "priority": <1..5> }
+  ]
+}
+
+Rules:
+- Keep each subquery specific and disjoint where possible.
+- Include at least 1 subquery even if the query is simple.
+- Do not include extra text outside JSON.
+User query: """${q}"""`;
+
+  try {
+    const resp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      { contents: [{ role: "user", parts: [{ text: prompt }] }] },
+      { headers: { "Content-Type": "application/json" }, timeout: 12000 }
+    );
+    const raw = resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const s = raw.indexOf("{");
+    const e = raw.lastIndexOf("}");
+    if (s >= 0 && e > s) {
+      try {
+        const parsed = JSON.parse(raw.slice(s, e + 1));
+        if (Array.isArray(parsed?.subqueries) && parsed.subqueries.length) {
+          out.subqueries = parsed.subqueries
+            .slice(0, 6)
+            .map((sq, i) => ({
+              query: String(sq?.query || "").trim() || q,
+              rationale: String(sq?.rationale || "").trim(),
+              priority: Number.isFinite(sq?.priority)
+                ? sq.priority
+                : Math.min(5, i + 1),
+            }))
+            .filter((sq) => sq.query);
+        }
+      } catch {}
+    }
+  } catch (e) {
+    // ignore and fallback
+  }
+
+  if (!out.subqueries.length)
+    out.subqueries = [{ query: q, rationale: "Planner fallback", priority: 1 }];
+  return out;
+}
+
+// Cross-encoder reranker via Cohere (optional)
+async function rerankWithCohere(query, items = [], topN = 15) {
+  if (!process.env.COHERE_API_KEY) return null; // gracefully skip
+  try {
+    const docs = items.map((it) => String(it.text || "").slice(0, 2000));
+    if (!docs.length) return null;
+    const resp = await axios.post(
+      "https://api.cohere.ai/v1/rerank",
+      {
+        model: "rerank-2.5",
+        query,
+        top_n: Math.min(topN, docs.length),
+        documents: docs,
+        return_documents: false,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.COHERE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 12000,
+      }
+    );
+    const results = resp?.data?.results || [];
+    // Each result has index pointing to input items
+    return results
+      .map((r) => ({ index: r.index, score: r.relevance_score }))
+      .filter((r) => Number.isInteger(r.index));
+  } catch (e) {
+    console.warn("Cohere rerank failed:", e?.response?.data || e?.message || e);
+    return null;
+  }
+}
+
+function splitIntoSentences(text = "") {
+  const raw = String(text || "")
+    .split(/(?<=[\.!?])\s+|[\r\n]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const out = [];
+  for (const s of raw) {
+    if (s.length >= 40 && s.replace(/\W/g, "").length >= 20) out.push(s);
+  }
+  return out;
+}
+
+function normSentence(s = "") {
+  return s
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[\-–—•·\*\[\]\(\)"'`]/g, "")
+    .trim();
+}
+
+async function buildFusedContext(userQuery = "", top = [], opts = {}) {
+  const maxBullets = opts.maxBullets ?? 40;
+  const bucket = new Map();
+  const order = [];
+  const labelMap = [];
+  for (let idx = 0; idx < top.length; idx++) {
+    const t = top[idx];
+    const s = t?.chunk?.source || {};
+    const label =
+      s.type === "web"
+        ? `${s.title || "Web"} — ${s.url}`
+        : s.type === "news"
+        ? `${s.title || "News"} — ${s.url}`
+        : s.type === "reddit"
+        ? `Reddit (${s.subreddit || ""}) — ${s.url}`
+        : s.type === "twitter"
+        ? `Twitter (${s.id})`
+        : s.type === "youtube"
+        ? `YouTube — ${s.url}`
+        : s.type === "wiki"
+        ? `Wikipedia — ${s.url}`
+        : s.type === "arxiv"
+        ? `arXiv — ${s.url}`
+        : s.url || "Source";
+    labelMap.push(`S${idx + 1}: ${label}`);
+    const sentences = splitIntoSentences(t?.chunk?.text || "");
+    let take = 0;
+    for (const sent of sentences) {
+      if (order.length >= maxBullets) break;
+      const key = normSentence(sent);
+      if (!key) continue;
+      let rec = bucket.get(key);
+      if (!rec) {
+        rec = { text: sent, sources: new Set([idx + 1]) };
+        bucket.set(key, rec);
+        order.push(rec);
+      } else {
+        rec.sources.add(idx + 1);
+      }
+      take++;
+      if (take >= 3) break; // cap per chunk to ensure diversity
+    }
+  }
+
+  const bullets = order.slice(0, maxBullets).map((r) => {
+    const cites = Array.from(r.sources)
+      .sort((a, b) => a - b)
+      .map((n) => `S${n}`)
+      .join(", ");
+    return `- ${r.text} [${cites}]`;
+  });
+
+  let contradictions = "";
+  if (process.env.GEMINI_API_KEY && bullets.length) {
+    const prompt = `Given the following factual bullets with citations, list up to 6 contradictions or disagreements between sources. If none, reply "None".\n\n${bullets
+      .slice(0, 50)
+      .join("\n")}\n\nBe concise.`;
+    try {
+      const resp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        { contents: [{ role: "user", parts: [{ text: prompt }] }] },
+        { headers: { "Content-Type": "application/json" }, timeout: 8000 }
+      );
+      contradictions =
+        resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+    } catch {}
+  }
+
+  const fusedText = [
+    "FUSED FACTS:",
+    bullets.join("\n"),
+    "",
+    "CONTRADICTIONS:",
+    contradictions && !/^none\b/i.test(contradictions)
+      ? contradictions
+      : "None",
+  ].join("\n");
+
+  const sourceMap = ["SOURCES MAP:", ...labelMap].join("\n");
+  return { fusedText, sourceMap };
+}
+
+// ---------------- Model Router (multi-model orchestration) ----------------
+function isCreativeQuery(q = "") {
+  const s = q.toLowerCase();
+  return /\b(story|poem|lyrics|advert|ad copy|marketing|tagline|slogan|script|dialogue|tweet|caption|instagram|creative|brand voice|funny|joke|pitch|copy)\b/.test(
+    s
+  );
+}
+
+function routerConfig() {
+  const def = {
+    simple: process.env.LLM_SIMPLE || "gemini:gemini-1.5-flash",
+    deep: process.env.LLM_DEEP || "openai:gpt-4o-mini",
+    creative: process.env.LLM_CREATIVE || "gemini:gemini-1.5-pro",
+  };
+  const parse = (v) => {
+    const [prov, ...rest] = String(v || "").split(":");
+    let model = rest.join(":") || "";
+    if (prov === "gemini") {
+      if (model === "flash") model = "gemini-1.5-flash";
+      if (model === "pro") model = "gemini-1.5-pro";
+      if (!model) model = "gemini-1.5-flash";
+    }
+    return { provider: prov, model };
+  };
+  return {
+    simple: parse(def.simple),
+    deep: parse(def.deep),
+    creative: parse(def.creative),
+  };
+}
+
+async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
+  try {
+    if (provider === "gemini") {
+      const url = `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(
+        model
+      )}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+      const resp = await axios.post(
+        url,
+        {
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.5,
+            topP: 0.9,
+            maxOutputTokens: maxTokens,
+          },
+        },
+        { headers: { "Content-Type": "application/json" }, timeout: 28000 }
+      );
+      return (
+        resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ""
+      );
+    }
+    if (provider === "openai" && process.env.OPENAI_API_KEY) {
+      const resp = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          model: model || "gpt-4o-mini",
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.5,
+          top_p: 0.9,
+          max_tokens: maxTokens,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          timeout: 30000,
+        }
+      );
+      return resp?.data?.choices?.[0]?.message?.content?.trim() || "";
+    }
+    if (provider === "anthropic" && process.env.ANTHROPIC_API_KEY) {
+      const resp = await axios.post(
+        "https://api.anthropic.com/v1/messages",
+        {
+          model: model || "claude-3-5-sonnet-20240620",
+          max_tokens: maxTokens,
+          messages: [{ role: "user", content: prompt }],
+        },
+        {
+          headers: {
+            "x-api-key": process.env.ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+          },
+          timeout: 30000,
+        }
+      );
+      const parts = resp?.data?.content || [];
+      const txt = parts
+        .map((p) => p.text || "")
+        .join("")
+        .trim();
+      return txt;
+    }
+    if (provider === "mistral" && process.env.MISTRAL_API_KEY) {
+      const resp = await axios.post(
+        "https://api.mistral.ai/v1/chat/completions",
+        {
+          model: model || "mixtral-8x7b-instruct",
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.6,
+          max_tokens: maxTokens,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.MISTRAL_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          timeout: 30000,
+        }
+      );
+      return resp?.data?.choices?.[0]?.message?.content?.trim() || "";
+    }
+  } catch (e) {
+    console.warn(
+      "callLLM failed:",
+      provider,
+      model,
+      e?.response?.data || e?.message || e
+    );
+  }
+  // Fallback to Gemini Flash if available
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+      const resp = await axios.post(
+        url,
+        {
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: maxTokens },
+        },
+        { headers: { "Content-Type": "application/json" }, timeout: 28000 }
+      );
+      return (
+        resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ""
+      );
+    } catch {}
+  }
+  return "";
+}
+
+function pickModelForTask(query = "", { taskType } = {}) {
+  const cfg = routerConfig();
+  const type = taskType || (isCreativeQuery(query) ? "creative" : "simple");
+  return cfg[type] || cfg.simple;
+}
+
+// ---------------- Verification Agent ----------------
+async function verifyAnswerLLM({
+  query,
+  answer,
+  fusedText = "",
+  sourceMap = "",
+  sources = [],
+}) {
+  const result = {
+    contradictions: [],
+    missing_citations: [],
+    confidence: 0.6,
+    needs_retry: false,
+    refinements: [],
+  };
+
+  const links = (sources || [])
+    .map((s) => `- ${s.title || s.url} — ${s.url}`)
+    .join("\n");
+  const prompt = `You are a strict verification agent. Given QUERY, ANSWER, FACTS (bullets with [S#]), SOURCES MAP, and SOURCE LINKS, do three things and return JSON ONLY:\n{
+  "contradictions": ["..."],
+  "missing_citations": [{"snippet":"...","suggestion":"..."}],
+  "confidence": 0.0-1.0,
+  "needs_retry": true|false,
+  "refinements": ["<better subquery>"]
+}\nRules:\n- contradictions: claim mismatches vs FACTS or internal inconsistencies.\n- missing_citations: areas where claims lack support; suggest where to cite (which S# or suggest a query).\n- confidence: lower if ANSWER goes beyond FACTS or has many missing citations.\n- needs_retry: true if confidence < 0.55 or critical contradictions found.\n- refinements: at most 2 short subqueries if needs_retry=true.\n\nQUERY:\n${query}\n\nFACTS:\n${fusedText}\n\nSOURCES MAP:\n${sourceMap}\n\nSOURCE LINKS:\n${links}\n\nANSWER:\n${answer}`;
+
+  try {
+    if (process.env.GEMINI_API_KEY) {
+      const resp = await axios.post(
+        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        { contents: [{ role: "user", parts: [{ text: prompt }] }] },
+        { headers: { "Content-Type": "application/json" }, timeout: 15000 }
+      );
+      const raw = resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const s = raw.indexOf("{");
+      const e = raw.lastIndexOf("}");
+      if (s >= 0 && e > s) {
+        const parsed = JSON.parse(raw.slice(s, e + 1));
+        result.contradictions = Array.isArray(parsed?.contradictions)
+          ? parsed.contradictions.slice(0, 8)
+          : [];
+        result.missing_citations = Array.isArray(parsed?.missing_citations)
+          ? parsed.missing_citations.slice(0, 8)
+          : [];
+        const c = Number(parsed?.confidence);
+        result.confidence = Number.isFinite(c)
+          ? Math.max(0, Math.min(1, c))
+          : result.confidence;
+        result.needs_retry = !!parsed?.needs_retry;
+        result.refinements = Array.isArray(parsed?.refinements)
+          ? parsed.refinements
+              .slice(0, 2)
+              .map((x) => String(x || "").trim())
+              .filter(Boolean)
+          : [];
+      }
+    }
+  } catch (e) {
+    // ignore model errors
+  }
+
+  // Heuristic fallback adjustments
+  const srcCount = Array.isArray(sources) ? sources.length : 0;
+  if (srcCount <= 1) result.confidence = Math.min(result.confidence, 0.5);
+  const linkCount = (answer.match(/\]\(https?:\/\//g) || []).length;
+  if (linkCount < Math.max(1, Math.floor(answer.split(/\n+/).length / 4))) {
+    result.missing_citations.push({
+      snippet: "Overall",
+      suggestion: "Add 2–3 citations inline for key claims",
+    });
+    result.confidence = Math.min(result.confidence, 0.58);
+  }
+  if (result.confidence < 0.55 && result.refinements.length === 0) {
+    result.needs_retry = true;
+    result.refinements = [
+      `${query} site:wikipedia.org OR site:reuters.com`,
+      `${query} filetype:pdf report methodology`,
+    ];
+  }
+  return result;
+}
+
 /**
  * @typedef {Object} SubTask
  * @property {string} id
@@ -528,31 +1064,50 @@ function cosineSim(a, b) {
 }
 
 async function getEmbeddingsGemini(texts = []) {
-  // Google API limit: max 100 requests per batch; we batch sequentially.
+  // Batch with caching to minimize API calls
   const MAX_BATCH = 100;
   const all = [];
   for (let i = 0; i < texts.length; i += MAX_BATCH) {
     const slice = texts.slice(i, i + MAX_BATCH);
+    // Try cache hits first
+    const cached = slice
+      .map((t) => embedCache.get(t))
+      .map((v) => (Array.isArray(v) ? v : null));
+    const need = [];
+    const idxMap = [];
+    for (let j = 0; j < slice.length; j++) {
+      if (cached[j]) continue;
+      need.push(slice[j]);
+      idxMap.push(j);
+    }
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key=${process.env.GEMINI_API_KEY}`;
-      const body = {
-        requests: slice.map((t) => ({
-          model: "models/text-embedding-004",
-          content: { parts: [{ text: t }] },
-        })),
-      };
-      const resp = await axios.post(url, body, {
-        headers: { "Content-Type": "application/json" },
-      });
-      const embeddings = (resp.data?.embeddings || []).map((e) => e.values);
-      // Defensive: ensure alignment (if API returns fewer, pad zeros)
-      if (embeddings.length !== slice.length) {
-        const dim = embeddings[0]?.length || 768;
-        while (embeddings.length < slice.length) {
-          embeddings.push(Array(dim).fill(0));
-        }
+      let embeddings = [];
+      if (need.length && process.env.GEMINI_API_KEY) {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key=${process.env.GEMINI_API_KEY}`;
+        const body = {
+          requests: need.map((t) => ({
+            model: "models/text-embedding-004",
+            content: { parts: [{ text: t }] },
+          })),
+        };
+        const resp = await axios.post(url, body, {
+          headers: { "Content-Type": "application/json" },
+        });
+        embeddings = (resp.data?.embeddings || []).map((e) => e.values);
       }
-      all.push(...embeddings);
+      // Reconstruct full slice from cache + fresh
+      const out = new Array(slice.length);
+      const dim = embeddings[0]?.length || 768;
+      for (let j = 0; j < slice.length; j++) {
+        if (cached[j]) out[j] = cached[j];
+      }
+      for (let k = 0; k < need.length; k++) {
+        const pos = idxMap[k];
+        const vec = embeddings[k] || Array(dim).fill(0);
+        out[pos] = vec;
+        embedCache.set(slice[pos], vec);
+      }
+      all.push(...out);
     } catch (e) {
       console.error(
         "Gemini embeddings error (batch)",
@@ -1254,17 +1809,25 @@ async function searchInstagramPublic(query, maxResults = 4) {
 // Faster page fetch for time-limited scraping
 async function fetchPageTextFast(url) {
   try {
+    const rkey = `page:${url}`;
+    const persisted = await persistentGet(rkey);
+    if (persisted) return persisted;
+    const c = pageCache.get(url);
+    if (c) return c;
     const resp = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
-      timeout: 4000,
+      timeout: 3000,
     });
     const parsed = unfluff(resp.data || "");
-    return {
+    const out = {
       url,
       title: parsed.title || "",
       text: (parsed.text || "").trim(),
       author: parsed.author || "",
     };
+    pageCache.set(url, out);
+    persistentSet(rkey, out, 600).catch(() => {});
+    return out;
   } catch (e) {
     return null;
   }
@@ -4948,12 +5511,27 @@ export default function App(){
 
 // ------------- Agentic v2 endpoint -------------
 app.post("/api/agentic-v2", async (req, res) => {
-  const { query, maxWeb = 8, topChunks = 10 } = req.body || {};
+  const {
+    query,
+    maxWeb = 50,
+    topChunks = 15,
+    fast = false,
+    verify = true,
+  } = req.body || {};
   if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
     // helpers: unified single-run that wraps existing logic (see runUnifiedOnce below)
-    async function runUnifiedOnce(userQuery, opts = { maxWeb, topChunks }) {
+    // NEW: Always-on planner to split into subqueries
+    const planLLM = await planSubqueriesLLM(query).catch(() => ({
+      subqueries: [],
+    }));
+    const subqueries = (planLLM?.subqueries || []).filter((s) => s?.query);
+
+    async function runUnifiedOnce(
+      userQuery,
+      opts = { maxWeb, topChunks, fast, verify }
+    ) {
       // === begin: your existing core (lightly parameterized) ===
       let attempts = 0;
       let confidence = 0;
@@ -4964,21 +5542,12 @@ app.post("/api/agentic-v2", async (req, res) => {
       let youtube = [];
       let wiki = [];
 
+      const complex = isComplexQuery(userQuery);
       while (attempts < 3 && confidence < 0.85) {
         const [serpResp, tw, rd, yt, wp] = await Promise.all([
           (async () => {
-            try {
-              return await axios.get("https://serpapi.com/search", {
-                params: {
-                  engine: "google",
-                  q: userQuery,
-                  api_key: process.env.SERPAPI_API_KEY,
-                },
-                timeout: 8000,
-              });
-            } catch (e) {
-              return { data: { organic_results: [] } };
-            }
+            const data = await searchSerpCached("google", userQuery, {}, 6000);
+            return { data: data || { organic_results: [] } };
           })(),
           searchTwitterRecent(userQuery, 6),
           searchReddit(userQuery, 6),
@@ -4988,14 +5557,12 @@ app.post("/api/agentic-v2", async (req, res) => {
 
         const organic = (serpResp?.data?.organic_results || []).slice(
           0,
-          opts.maxWeb ?? 8
+          opts.maxWeb ?? 50
         );
         allSerpOrganic = allSerpOrganic.concat(organic);
 
         if (organic.length < 5 || !strongEntityMatch(userQuery, organic)) {
           const extra = await runExtraSearches(userQuery, [
-            "google_news",
-            "youtube",
             "bing",
             "duckduckgo",
           ]);
@@ -5006,8 +5573,13 @@ app.post("/api/agentic-v2", async (req, res) => {
               );
         }
 
+        const budget = opts.fast
+          ? Math.min(12, opts.maxWeb ?? 50)
+          : complex
+          ? opts.maxWeb ?? 50
+          : Math.min(20, opts.maxWeb ?? 50);
         const topLinks = allSerpOrganic
-          .slice(0, opts.maxWeb ?? 8)
+          .slice(0, budget)
           .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
         const pageFetchPromises = topLinks.map((l) =>
           fetchPageTextFast(l.link)
@@ -5094,10 +5666,33 @@ app.post("/api/agentic-v2", async (req, res) => {
         score: cosineSim(emb, qEmb),
       }));
       sims.sort((a, b) => b.score - a.score);
-      const pick = Math.min(opts.topChunks ?? 10, sims.length);
-      const top = sims
-        .slice(0, pick)
-        .map((s) => ({ chunk: chunks[s.i], score: s.score }));
+
+      // Candidate pool from embedding recall (take wider pool, e.g., 40)
+      const pool = sims
+        .slice(0, Math.min(opts.fast ? 24 : 40, sims.length))
+        .map((s) => ({
+          i: s.i,
+          score: s.score,
+          item: chunks[s.i],
+        }));
+
+      // Optional cross-encoder rerank for precision
+      let finalIdxs = null;
+      const co = await rerankWithCohere(
+        userQuery,
+        pool.map((p) => p.item),
+        opts.topChunks ?? 15
+      );
+      if (Array.isArray(co) && co.length) {
+        finalIdxs = co.map((r) => pool[r.index].i);
+      }
+
+      const pickK = Math.min(opts.topChunks ?? 15, sims.length);
+      const top = (
+        finalIdxs
+          ? finalIdxs.slice(0, pickK).map((idx) => ({ i: idx }))
+          : sims.slice(0, pickK)
+      ).map((s) => ({ chunk: chunks[s.i], score: 0 }));
 
       const contextParts = top.map((t, idx) => {
         const s = t.chunk.source;
@@ -5117,7 +5712,11 @@ app.post("/api/agentic-v2", async (req, res) => {
           idx + 1
         }: ${sourceLabel}\nExcerpt:\n${t.chunk.text.slice(0, 1200)}\n---\n`;
       });
-      const context = contextParts.join("\n");
+      // Build fused context with dedup + optional contradictions
+      const fusion = await buildFusedContext(userQuery, top, {
+        maxBullets: opts.fast ? 25 : 40,
+      });
+      const context = [fusion.fusedText, "", fusion.sourceMap].join("\n\n");
 
       const systemPrompt = `You are Nelieo AI — a world's first proactive, agentic search assistant that turns multi-source context into clear, professional, human-friendly answers.
 
@@ -5188,21 +5787,21 @@ CONTEXT:
 ${context}
 `.trim();
 
-      const geminiResp = await axios.post(
-        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          contents: [{ role: "user", parts: [{ text: finalPrompt }] }],
-          generationConfig: {
-            temperature: 0.5,
-            topP: 0.9,
-            maxOutputTokens: 1200,
-          },
-        },
-        { headers: { "Content-Type": "application/json" } }
-      );
-      const rawText =
-        geminiResp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      const answer = rawText.trim();
+      const deepNeeded =
+        chunks.length > 24 ||
+        /news|deep|analysis|compare|timeline|history|explain|why|how/i.test(
+          userQuery
+        );
+      const modelChoice = pickModelForTask(userQuery, {
+        taskType: deepNeeded ? "deep" : "simple",
+      });
+      const answer =
+        (await callLLM({
+          provider: modelChoice.provider,
+          model: modelChoice.model,
+          prompt: finalPrompt,
+          maxTokens: 1200,
+        })) || "";
 
       function extractSourcesFromMarkdown(md = "", fallbackTop = []) {
         const sources = [];
@@ -5273,12 +5872,69 @@ ${context}
       const sourcesArr = extractSourcesFromMarkdown(answer, top);
       const imagesArr = extractImages(answer);
 
+      // Auto-verify and optional one-shot retry
+      const verification = opts.verify
+        ? await verifyAnswerLLM({
+            query: userQuery,
+            answer,
+            fusedText: fusion.fusedText,
+            sourceMap: fusion.sourceMap,
+            sources: sourcesArr,
+          })
+        : {
+            contradictions: [],
+            missing_citations: [],
+            confidence: 0.7,
+            needs_retry: false,
+            refinements: [],
+          };
+      let finalAnswer = answer;
+      let finalSources = sourcesArr;
+      if (
+        opts.verify &&
+        verification.needs_retry &&
+        verification.refinements?.length
+      ) {
+        try {
+          // Run one refinement subquery and regenerate
+          const refineQ = verification.refinements[0];
+          const rerun = await runUnifiedOnce(refineQ, {
+            maxWeb: Math.max(20, opts.maxWeb || 50),
+            topChunks: Math.max(15, opts.topChunks || 15),
+            fast: opts.fast,
+            verify: false,
+          });
+          // Merge top chunks (simple concat) and rebuild fused context
+          const mergedTop = [...top, ...(rerun.rawTop || []).slice(0, 10)];
+          const fusion2 = await buildFusedContext(userQuery, mergedTop, {
+            maxBullets: 50,
+          });
+          const regeneratedPrompt = finalPrompt.replace(
+            /CONTEXT:[\s\S]*$/,
+            `CONTEXT:\n${fusion2.fusedText}\n\n${fusion2.sourceMap}`
+          );
+          const answer2 =
+            (await callLLM({
+              provider: modelChoice.provider,
+              model: modelChoice.model,
+              prompt: regeneratedPrompt,
+              maxTokens: 1200,
+            })) || finalAnswer;
+          const newSources = extractSourcesFromMarkdown(answer2, mergedTop);
+          if (answer2 && newSources?.length) {
+            finalAnswer = answer2;
+            finalSources = newSources;
+          }
+        } catch {}
+      }
+
       return {
-        formatted_answer: answer,
-        sources: sourcesArr,
+        formatted_answer: finalAnswer,
+        sources: finalSources,
         images: imagesArr,
         chunks,
         rawTop: top,
+        verification,
       };
     }
 
@@ -5446,21 +6102,16 @@ ${context}
             tasks.push(
               (async () => {
                 try {
-                  const resp = await withTimeout(
-                    axios.get("https://serpapi.com/search", {
-                      params: {
-                        engine: "google",
-                        q: qNow,
-                        api_key: process.env.SERPAPI_API_KEY,
-                      },
-                      timeout: Math.min(9000, timeLeft()),
-                    }),
-                    Math.min(10000, timeLeft())
+                  const data = await withTimeout(
+                    searchSerpCached(
+                      "google",
+                      qNow,
+                      {},
+                      Math.min(8000, timeLeft())
+                    ),
+                    Math.min(9000, timeLeft())
                   );
-                  const org = (resp?.data?.organic_results || []).slice(
-                    0,
-                    maxWeb
-                  );
+                  const org = (data?.organic_results || []).slice(0, maxWeb);
                   pushUnique(serpOrganic, org, (r) => normalizeUrl(r.link));
                 } catch {}
               })()
@@ -5791,7 +6442,136 @@ ${context}
       }
     });
 
-    // --- Infinity / multi-hop mode ---
+    // --- Multi-run planner mode (always-on). If "infinity" present, keep its flow; otherwise use LLM subqueries. ---
+    if ((req.body && req.body.infinity) || subqueries.length > 1) {
+      if (req.body && req.body.infinity) {
+        // existing infinity behavior preserved below
+      } else {
+        // Execute planner subqueries in parallel
+        const runs = await Promise.all(
+          subqueries.map((sq) =>
+            runUnifiedOnce(sq.query, { maxWeb, topChunks }).catch(() => null)
+          )
+        );
+        const valid = runs.filter(Boolean);
+
+        if (!valid.length) {
+          return res.json({
+            formatted_answer: "I couldn't fetch enough content for this query.",
+            sources: [],
+            images: [],
+            plan: { subqueries },
+            last_fetched: new Date().toISOString(),
+          });
+        }
+
+        // Compose response: concatenate sections via composeSections
+        const blocks = valid.map((r, i) => ({
+          title: `Result — ${subqueries[i]?.query || query}`,
+          body: r.formatted_answer,
+          sources: r.sources || [],
+        }));
+        const formatted_answer = composeSections(blocks);
+        const sources = valid.flatMap((r) => r.sources || []).slice(0, 12);
+        const imagesFromRuns = valid.flatMap((r) => r.images || []).slice(0, 8);
+
+        // Fetch verticals same as below
+        try {
+          const vert = await Promise.allSettled([
+            (async () => {
+              try {
+                const r = await axios.get("https://serpapi.com/search", {
+                  params: {
+                    engine: "google",
+                    q: query,
+                    tbm: "isch",
+                    api_key: process.env.SERPAPI_API_KEY,
+                  },
+                  timeout: 10000,
+                });
+                return r.data.images_results || [];
+              } catch (e) {
+                return [];
+              }
+            })(),
+            (async () => {
+              try {
+                const r = await axios.get("https://serpapi.com/search", {
+                  params: {
+                    engine: "google",
+                    q: query,
+                    tbm: "vid",
+                    api_key: process.env.SERPAPI_API_KEY,
+                  },
+                  timeout: 10000,
+                });
+                return r.data.video_results || r.data.organic_results || [];
+              } catch (e) {
+                return [];
+              }
+            })(),
+            (async () => {
+              try {
+                const r = await axios.get("https://serpapi.com/search", {
+                  params: {
+                    engine: "google_news",
+                    q: query,
+                    tbm: "nws",
+                    api_key: process.env.SERPAPI_API_KEY,
+                  },
+                  timeout: 10000,
+                });
+                return r.data.news_results || [];
+              } catch (e) {
+                return [];
+              }
+            })(),
+          ]);
+
+          const imgs =
+            (vert[0] && vert[0].status === "fulfilled" ? vert[0].value : []) ||
+            [];
+          const vids =
+            (vert[1] && vert[1].status === "fulfilled" ? vert[1].value : []) ||
+            [];
+          const newsArr =
+            (vert[2] && vert[2].status === "fulfilled" ? vert[2].value : []) ||
+            [];
+
+          const normImages = imgs
+            .map((i) => i.original || i.thumbnail || i.link)
+            .filter(Boolean)
+            .slice(0, 36);
+          const normVideos = vids
+            .map((v) => ({
+              title: v.title || v.name || v.snippet || null,
+              url: v.link || v.url || v.source || null,
+              snippet: v.snippet || v.description || null,
+              id: v.video_id || v.id || v.link || v.url || null,
+            }))
+            .slice(0, 24);
+          const normNews = newsArr.slice(0, 24);
+
+          return res.json({
+            formatted_answer,
+            sources,
+            images: imagesFromRuns.length ? imagesFromRuns : normImages,
+            videos: normVideos,
+            news: normNews,
+            plan: { subqueries },
+            last_fetched: new Date().toISOString(),
+          });
+        } catch (e) {
+          return res.json({
+            formatted_answer,
+            sources,
+            images: imagesFromRuns,
+            plan: { subqueries },
+            last_fetched: new Date().toISOString(),
+          });
+        }
+      }
+    }
     if (req.body && req.body.infinity) {
       // classify and expand
       const intent = classifyIntent(query);
@@ -5836,10 +6616,23 @@ ${context}
         score: cosineSim(emb, qEmb),
       }));
       sims2.sort((a, b) => b.score - a.score);
+      const pool2 = sims2
+        .slice(0, Math.min(50, sims2.length))
+        .map((s) => ({ i: s.i, item: mergedChunks[s.i] }));
+      let finalIdxs2 = null;
+      const co2 = await rerankWithCohere(
+        query,
+        pool2.map((p) => p.item),
+        topChunks
+      );
+      if (Array.isArray(co2) && co2.length)
+        finalIdxs2 = co2.map((r) => pool2[r.index].i);
       const pick = Math.min(topChunks, sims2.length);
-      const topChunksPicked = sims2
-        .slice(0, pick)
-        .map((s) => ({ chunk: mergedChunks[s.i], score: s.score }));
+      const topChunksPicked = (
+        finalIdxs2
+          ? finalIdxs2.slice(0, pick).map((i) => ({ i }))
+          : sims2.slice(0, pick)
+      ).map((s) => ({ chunk: mergedChunks[s.i], score: 0 }));
 
       const contextPartsInf = topChunksPicked.map((t, idx) => {
         const s = t.chunk.source || {};
@@ -5856,7 +6649,12 @@ ${context}
           1200
         )}\n---\n`;
       });
-      const contextInf = contextPartsInf.join("\n");
+      const fusionInf = await buildFusedContext(query, topChunksPicked, {
+        maxBullets: 50,
+      });
+      const contextInf = [fusionInf.fusedText, "", fusionInf.sourceMap].join(
+        "\n\n"
+      );
 
       const finalPromptInf = `
 You are Nelieo AI, the most advanced research assistant.
@@ -5882,21 +6680,13 @@ CONTEXT:
 ${contextInf}
 `;
 
-      const geminiRespInf = await axios.post(
-        `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          contents: [{ role: "user", parts: [{ text: finalPromptInf }] }],
-          generationConfig: {
-            temperature: 0.7,
-            topP: 0.9,
-            maxOutputTokens: 1500,
-          },
-        },
-        { headers: { "Content-Type": "application/json" } }
-      );
-
-      const rawTextInf =
-        geminiRespInf.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const modelChoiceInf = pickModelForTask(query, { taskType: "deep" });
+      const rawTextInf = await callLLM({
+        provider: modelChoiceInf.provider,
+        model: modelChoiceInf.model,
+        prompt: finalPromptInf,
+        maxTokens: 1500,
+      });
 
       function extractSourcesFromMarkdownLocal(md = "") {
         const sources = [];
@@ -5928,10 +6718,19 @@ ${contextInf}
         return out.slice(0, 8);
       }
 
+      const sourcesInf = extractSourcesFromMarkdownLocal(rawTextInf);
+      const verificationInf = await verifyAnswerLLM({
+        query,
+        answer: rawTextInf,
+        fusedText: fusionInf.fusedText,
+        sourceMap: fusionInf.sourceMap,
+        sources: sourcesInf,
+      });
       return res.json({
         formatted_answer: rawTextInf.trim(),
-        sources: extractSourcesFromMarkdownLocal(rawTextInf),
+        sources: sourcesInf,
         images: extractImagesLocal(rawTextInf),
+        verification: verificationInf,
         last_fetched: new Date().toISOString(),
       });
     }
@@ -6030,6 +6829,16 @@ ${contextInf}
     const imagesFromRuns = execs
       .flatMap((ex) => ex.run.images || [])
       .slice(0, 8);
+    
+    // Collect verification data from executions
+    const verifications = execs.map((ex) => ex.run.verification).filter(Boolean);
+    const verification = verifications.length > 0 ? verifications[0] : {
+      contradictions: [],
+      missing_citations: [],
+      confidence: 0.7,
+      needs_retry: false,
+      refinements: []
+    };
 
     // Fetch verticals in parallel to include images/videos/news/shopping/short_videos
     try {
@@ -6159,6 +6968,7 @@ ${contextInf}
         shopping: normShopping,
         short_videos: normShort,
         plan: plans,
+        verification,
         last_fetched: new Date().toISOString(),
       });
     } catch (e) {
@@ -6168,6 +6978,7 @@ ${contextInf}
         sources,
         images: imagesFromRuns,
         plan: plans,
+        verification,
         last_fetched: new Date().toISOString(),
       });
     }
@@ -6177,6 +6988,130 @@ ${contextInf}
       err.response?.data || err.message || err
     );
     res.status(500).json({ error: "Agentic pipeline failed." });
+  }
+});
+
+// --- SSE streaming for agentic-v2 ---
+app.get("/api/agentic-v2/stream", async (req, res) => {
+  const query = String(req.query.query || "").trim();
+  const fast = String(req.query.fast || "false").toLowerCase() === "true";
+  const verify = String(req.query.verify || "true").toLowerCase() !== "false";
+  const maxWeb = Number(req.query.maxWeb || 50) || 50;
+  const topChunks = Number(req.query.topChunks || 15) || 15;
+  if (!query) return res.status(400).end();
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+  const ping = setInterval(() => {
+    try {
+      res.write(`event: ping\n`);
+      res.write(`data: {}\n\n`);
+    } catch {}
+  }, 15000);
+  const close = () => clearInterval(ping);
+  req.on("close", close);
+
+  const send = (type, payload) => {
+    try {
+      res.write(`event: ${type}\n`);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    } catch {}
+  };
+
+  try {
+    const planLLM = await planSubqueriesLLM(query).catch(() => ({
+      subqueries: [],
+    }));
+    const subqueries = (planLLM?.subqueries || []).filter((s) => s?.query);
+    send("plan", { subqueries });
+
+    // Early retrieval + fused preview per subquery (lightweight, cached)
+    const subs = subqueries.length ? subqueries : [{ query }];
+    for (const sq of subs) {
+      try {
+        const data = await searchSerpCached("google", sq.query, {}, 6000);
+        const org = (data?.organic_results || []).slice(0, fast ? 4 : 8);
+        send("retrieval", {
+          query: sq.query,
+          results: org.map((r) => ({
+            title: r.title,
+            url: r.link,
+            snippet: r.snippet,
+          })),
+        });
+        const toGrab = org.slice(0, Math.min(3, org.length));
+        const fetched = await Promise.allSettled(
+          toGrab.map((r) => fetchPageTextFast(r.link))
+        );
+        const top = fetched
+          .filter((x) => x.status === "fulfilled" && x.value && x.value.text)
+          .map((x) => x.value)
+          .map((p) => ({
+            chunk: {
+              id: crypto.randomUUID(),
+              text: String(p.text || "").slice(0, 1600),
+              source: { type: "web", url: p.url, title: p.title },
+            },
+            score: 0,
+          }));
+        if (top.length) {
+          const fusion = await buildFusedContext(sq.query, top, {
+            maxBullets: fast ? 16 : 24,
+          });
+          send("fused", {
+            fusedText: fusion.fusedText.slice(0, 1800),
+            sourceMap: fusion.sourceMap,
+          });
+        }
+      } catch {}
+    }
+
+    // Compute final answer via internal sync endpoint
+    const base = process.env.SELF_BASE_URL || "http://localhost:10000";
+    const finalResp = await axios
+      .post(
+        `${base}/api/agentic-v2`,
+        { query, fast, verify, maxWeb, topChunks },
+        { headers: { "Content-Type": "application/json" } }
+      )
+      .catch((e) => ({
+        data: { formatted_answer: "", sources: [], plan: { subqueries } },
+      }));
+    const payload = finalResp?.data || { formatted_answer: "" };
+    send("final", payload);
+    res.end();
+  } catch (e) {
+    send("error", { error: e?.message || String(e) });
+    res.end();
+  }
+});
+
+// Speculative prefetch to warm caches
+app.post("/api/agentic-v2/prefetch", async (req, res) => {
+  try {
+    const { query, maxTimeMs = 2500 } = req.body || {};
+    if (!query)
+      return res.status(400).json({ ok: false, error: "Missing query" });
+    const sub = await planSubqueriesLLM(query).catch(() => ({
+      subqueries: [{ query }],
+    }));
+    const subs = (sub?.subqueries || [{ query }]).slice(0, 2);
+    const deadline = Date.now() + Math.max(1000, Math.min(6000, maxTimeMs));
+    await Promise.allSettled(
+      subs.map(async (sq) => {
+        const s = await searchSerpCached("google", sq.query, {}, 4000);
+        const org = (s?.organic_results || []).slice(0, 8);
+        for (const r of org) {
+          if (Date.now() > deadline) break;
+          await fetchPageTextFast(r.link).catch(() => null);
+        }
+      })
+    );
+    return res.json({ ok: true, warmed: subs.map((s) => s.query) });
+  } catch (e) {
+    return res.status(500).json({ ok: false });
   }
 });
 
