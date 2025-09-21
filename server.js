@@ -1121,12 +1121,18 @@ function verifyTranscriptCoverage(
 
 // --- Safe-composer (pretty, professional, policy-safe) ---
 function composeSections(blocks) {
+  if (!Array.isArray(blocks) || blocks.length === 0) return "";
+  if (blocks.length === 1) {
+    return String(blocks[0].body || "").trim();
+  }
   const lines = [];
   for (const b of blocks) {
-    // Use slightly smaller headings for structured answers
-    lines.push(`\n#### ${b.title}\n`);
-    lines.push(b.body.trim());
-    if (b.sources?.length) {
+    const body = String(b.body || "").trim();
+    const title = String(b.title || "").replace(/^Result\s*—\s*/i, "");
+    lines.push(`\n#### ${title}\n`);
+    lines.push(body);
+    const hasSourcesInBody = /(^|\n)#{1,6}\s*Sources\b/i.test(body);
+    if (!hasSourcesInBody && b.sources?.length) {
       lines.push(
         `\n**Sources:** ` +
           b.sources
@@ -5671,7 +5677,16 @@ app.post("/api/agentic-v2", async (req, res) => {
     const planLLM = await planSubqueriesLLM(query).catch(() => ({
       subqueries: [],
     }));
-    const subqueries = (planLLM?.subqueries || []).filter((s) => s?.query);
+    const subqueriesRaw = (planLLM?.subqueries || []).filter((s) => s?.query);
+    const seenSQ = new Set();
+    const subqueries = [];
+    for (const sq of subqueriesRaw) {
+      const key = sq.query.trim().toLowerCase();
+      if (seenSQ.has(key)) continue;
+      seenSQ.add(key);
+      subqueries.push(sq);
+      if (subqueries.length >= 6) break;
+    }
     console.log(`Planning took ${Date.now() - planStart}ms`);
 
     // Parallel execution with limited concurrency in fast mode
@@ -6741,7 +6756,7 @@ ${context}
 
         // Compose response: concatenate sections via composeSections
         const blocks = valid.map((r, i) => ({
-          title: `Result — ${subqueries[i]?.query || query}`,
+          title: `${subqueries[i]?.query || query}`,
           body: r.formatted_answer,
           sources: r.sources || [],
         }));
@@ -7091,7 +7106,7 @@ ${contextInf}
           ? ex.run.formatted_answer
           : ex.run.formatted_answer +
             `\n\n*Note:* I filtered by place/date; not enough verified local items were fast to fetch. Use Arsenal → Deep Research to dig deeper.`;
-        blocks.push({ title, body, sources: ex.run.sources });
+  blocks.push({ title, body, sources: ex.run.sources });
       } else if (t.kind === "transcript") {
         const title = `${t.title} — Transcript (${t.year || ""})`;
         const addNote = !ex.verified.ok
@@ -7104,14 +7119,34 @@ ${contextInf}
         });
       } else {
         blocks.push({
-          title: `Result — ${t.query}`,
+          title: `${t.query}`,
           body: ex.run.formatted_answer,
           sources: ex.run.sources,
         });
       }
     }
 
-    const formatted_answer = composeSections(blocks);
+    let formatted_answer = composeSections(blocks);
+    if (!formatted_answer || formatted_answer.trim().length === 0) {
+      // Fallback: synthesize minimal answer from fused facts
+      const lines = [];
+      for (const ex of execs) {
+        const srcs = (ex.run.sources || []).slice(0, 5);
+        const heading = ex.task?.query || ex.task?.title || "Result";
+        lines.push(`\n#### ${heading}\n`);
+        const snippet = (ex.run.rawTop?.[0]?.chunk?.text || "").slice(0, 500);
+        lines.push(snippet || "No answer generated; see sources below.");
+        if (srcs.length) {
+          lines.push(
+            `\n**Sources:** ` +
+              srcs
+                .map((s) => `[${s.title || new URL(s.url).hostname}](${s.url})`)
+                .join(" · ")
+          );
+        }
+      }
+      formatted_answer = lines.join("\n");
+    }
     const sources = execs.flatMap((ex) => ex.run.sources).slice(0, 15);
     const imagesFromRuns = execs
       .flatMap((ex) => ex.run.images || [])
