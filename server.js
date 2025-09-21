@@ -324,6 +324,14 @@ async function persistentSet(key, value, ttlSec) {
   }
 }
 
+function hashKey(input = "") {
+  try {
+    return crypto.createHash("sha1").update(String(input)).digest("hex");
+  } catch {
+    return String(input).slice(0, 128);
+  }
+}
+
 function isComplexQuery(q = "") {
   const s = (q || "").toLowerCase();
   const long = s.split(/\s+/).length >= 10;
@@ -453,8 +461,7 @@ async function rerankWithCohere(query, items = [], topN = 15) {
     const resp = await axios.post(
       "https://api.cohere.ai/v1/rerank",
       {
-        model:
-          process.env.COHERE_RERANK_MODEL || "rerank-english-v3.0",
+        model: process.env.COHERE_RERANK_MODEL || "rerank-english-v3.0",
         query,
         top_n: Math.min(topN, docs.length),
         documents: docs,
@@ -482,16 +489,23 @@ async function rerankWithCohere(query, items = [], topN = 15) {
 // Lightweight contact info extraction
 function extractContactsFromText(text = "") {
   const emails = Array.from(
-    new Set((text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).map((e) => e.toLowerCase()))
+    new Set(
+      (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).map((e) =>
+        e.toLowerCase()
+      )
+    )
   ).slice(0, 10);
   const phones = Array.from(
     new Set(
-      (text.match(/\+?\d[\d\s().-]{6,}\d/g) || []).map((p) => p.replace(/\s+/g, " ").trim())
+      (text.match(/\+?\d[\d\s().-]{6,}\d/g) || []).map((p) =>
+        p.replace(/\s+/g, " ").trim()
+      )
     )
   ).slice(0, 10);
   const socials = [];
   const li = text.match(/https?:\/\/([\w.-]*linkedin\.com\/[^\s)"']+)/gi) || [];
-  const tw = text.match(/https?:\/\/([\w.-]*twitter\.com|x\.com)\/[^\s)"']+/gi) || [];
+  const tw =
+    text.match(/https?:\/\/([\w.-]*twitter\.com|x\.com)\/[^\s)"']+/gi) || [];
   const gh = text.match(/https?:\/\/github\.com\/[^\s)"']+/gi) || [];
   socials.push(...li, ...tw, ...gh);
   return { emails, phones, socials: Array.from(new Set(socials)).slice(0, 10) };
@@ -511,7 +525,9 @@ async function fetchLikelyContactPages(baseUrl) {
       candidates.map((cu) =>
         axios
           .get(cu, {
-            headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            },
             timeout: 1000,
             maxRedirects: 2,
           })
@@ -769,6 +785,57 @@ async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
     } catch {}
   }
   return "";
+}
+
+// OpenAI streaming (SSE) helper for token-by-token output
+async function streamOpenAIChat({ model = "gpt-4o-mini", prompt, onDelta }) {
+  if (!process.env.OPENAI_API_KEY) return null;
+  const axiosOpts = {
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    responseType: "stream",
+    timeout: 30000,
+  };
+  const body = {
+    model,
+    stream: true,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.5,
+    top_p: 0.9,
+    max_tokens: 600,
+  };
+  const resp = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    body,
+    axiosOpts
+  );
+  return new Promise((resolve, reject) => {
+    let acc = "";
+    resp.data.on("data", (chunk) => {
+      const lines = chunk.toString().split(/\r?\n/);
+      for (const line of lines) {
+        const m = line.match(/^data:\s*(.*)$/);
+        if (!m) continue;
+        const data = m[1];
+        if (data === "[DONE]") {
+          resolve(acc);
+          return;
+        }
+        try {
+          const obj = JSON.parse(data);
+          const delta = obj.choices?.[0]?.delta?.content || "";
+          if (delta) {
+            acc += delta;
+            onDelta?.(delta, acc);
+          }
+        } catch {}
+      }
+    });
+    resp.data.on("end", () => resolve(acc));
+    resp.data.on("error", reject);
+  });
 }
 
 function pickModelForTask(query = "", { taskType } = {}) {
@@ -1122,10 +1189,21 @@ async function getEmbeddingsGemini(texts = []) {
       .map((v) => (Array.isArray(v) ? v : null));
     const need = [];
     const idxMap = [];
+    const persistedIdxMap = [];
+    const persistedVals = new Array(slice.length).fill(null);
     for (let j = 0; j < slice.length; j++) {
       if (cached[j]) continue;
+      // try persistent cache
+      const key = `embed:${hashKey(slice[j])}`;
+      // eslint-disable-next-line no-await-in-loop
+      const pv = await persistentGet(key);
+      if (pv && Array.isArray(pv) && pv.length) {
+        persistedVals[j] = pv;
+        continue;
+      }
       need.push(slice[j]);
       idxMap.push(j);
+      persistedIdxMap.push(key);
     }
     try {
       let embeddings = [];
@@ -1148,11 +1226,17 @@ async function getEmbeddingsGemini(texts = []) {
       for (let j = 0; j < slice.length; j++) {
         if (cached[j]) out[j] = cached[j];
       }
+      for (let j = 0; j < slice.length; j++) {
+        if (persistedVals[j]) out[j] = persistedVals[j];
+      }
       for (let k = 0; k < need.length; k++) {
         const pos = idxMap[k];
         const vec = embeddings[k] || Array(dim).fill(0);
         out[pos] = vec;
         embedCache.set(slice[pos], vec);
+        // 24h persistent cache
+        // eslint-disable-next-line no-await-in-loop
+        persistentSet(persistedIdxMap[k], vec, 24 * 60 * 60).catch(() => {});
       }
       all.push(...out);
     } catch (e) {
@@ -1861,8 +1945,9 @@ async function fetchPageTextFast(url, timeoutMs = null) {
     if (persisted) return persisted;
     const c = pageCache.get(url);
     if (c) return c;
-    
-    const timeout = timeoutMs || Number(process.env.FAST_FETCH_TIMEOUT_MS || 2500);
+
+    const timeout =
+      timeoutMs || Number(process.env.FAST_FETCH_TIMEOUT_MS || 2500);
     const resp = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
       timeout,
@@ -1877,7 +1962,7 @@ async function fetchPageTextFast(url, timeoutMs = null) {
       author: parsed.author || "",
     };
     pageCache.set(url, out);
-    persistentSet(rkey, out, 600).catch(() => {});
+    persistentSet(rkey, out, 24 * 60 * 60).catch(() => {});
     return out;
   } catch (e) {
     return null;
@@ -5572,6 +5657,14 @@ app.post("/api/agentic-v2", async (req, res) => {
   if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
+    // Query-level 24h cache: skip recomputation for identical inputs
+    const cacheKey = `agenticv2:${hashKey(
+      JSON.stringify({ q: query, maxWeb, topChunks, fast, verify })
+    )}`;
+    const cachedResp = await persistentGet(cacheKey);
+    if (cachedResp && cachedResp.formatted_answer) {
+      return res.json({ ...cachedResp, cached: true });
+    }
     // helpers: unified single-run that wraps existing logic (see runUnifiedOnce below)
     // NEW: Always-on planner to split into subqueries
     const planStart = Date.now();
@@ -5584,7 +5677,7 @@ app.post("/api/agentic-v2", async (req, res) => {
     // Parallel execution with limited concurrency in fast mode
     const maxConcurrent = fast ? 2 : 4;
     const subqueriesToRun = subqueries.slice(0, maxConcurrent);
-    
+
     console.log(`Running ${subqueriesToRun.length} subqueries in parallel`);
     const execStart = Date.now();
 
@@ -5621,7 +5714,10 @@ app.post("/api/agentic-v2", async (req, res) => {
         );
         allSerpOrganic = allSerpOrganic.concat(organic);
 
-        if (!opts.fast && (organic.length < 5 || !strongEntityMatch(userQuery, organic))) {
+        if (
+          !opts.fast &&
+          (organic.length < 5 || !strongEntityMatch(userQuery, organic))
+        ) {
           const extra = await runExtraSearches(userQuery, [
             "bing",
             "duckduckgo",
@@ -5634,20 +5730,48 @@ app.post("/api/agentic-v2", async (req, res) => {
         }
 
         const budget = opts.fast
-          ? Math.min(6, opts.maxWeb ?? 50)
+          ? Math.min(12, opts.maxWeb ?? 50)
           : complex
-          ? opts.maxWeb ?? 50
+          ? Math.min(40, opts.maxWeb ?? 50)
           : Math.min(20, opts.maxWeb ?? 50);
-        const topLinks = allSerpOrganic
+        const candidateLinks = allSerpOrganic
           .slice(0, budget)
           .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
-        
+
+        // Snippet-first rerank: use Cohere on snippets/titles before any scraping
+        let fetchSet = candidateLinks;
+        try {
+          const items = candidateLinks.map((c) => ({
+            text: `${c.title}\n${c.snippet || ""}`,
+          }));
+          const rr = await rerankWithCohere(
+            userQuery,
+            items,
+            Math.min(opts.fast ? 6 : 12, items.length)
+          );
+          if (Array.isArray(rr) && rr.length) {
+            const topIdx = rr.map((r) => r.index);
+            fetchSet = topIdx.map((i) => candidateLinks[i]);
+          } else {
+            fetchSet = candidateLinks.slice(
+              0,
+              Math.min(opts.fast ? 6 : 12, candidateLinks.length)
+            );
+          }
+        } catch {
+          fetchSet = candidateLinks.slice(
+            0,
+            Math.min(opts.fast ? 6 : 12, candidateLinks.length)
+          );
+        }
+
         // Parallel page fetching with aggressive timeout in fast mode
         const fetchTimeout = opts.fast ? 1500 : 3000;
-        const pageFetchPromises = topLinks.map((l) =>
+        const pageFetchPromises = fetchSet.map((l) =>
           fetchPageTextFast(l.link, fetchTimeout)
         );
-        pages = (await Promise.all(pageFetchPromises)).filter(Boolean);        tweets = tw || [];
+        pages = (await Promise.all(pageFetchPromises)).filter(Boolean);
+        tweets = tw || [];
         reddit = rd || [];
         youtube = yt || [];
         wiki = wp || [];
@@ -5721,7 +5845,7 @@ app.post("/api/agentic-v2", async (req, res) => {
         userQuery,
         ...chunks.map((c) => c.text.substring(0, 2000)),
       ];
-  const allEmbeddings = await getEmbeddingsGemini(allTexts);
+      const allEmbeddings = await getEmbeddingsGemini(allTexts);
       const qEmb = allEmbeddings[0];
       const chunkEmbeddings = allEmbeddings.slice(1);
 
@@ -5918,7 +6042,7 @@ ${context}
             }
           }
         }
-  return sources.slice(0, 15);
+        return sources.slice(0, 15);
       }
       function extractImages(md = "") {
         const out = [];
@@ -5937,7 +6061,11 @@ ${context}
 
       // If user asks for contacts, try extracting from fetched pages and likely contact endpoints
       let contacts = { emails: [], phones: [], socials: [] };
-      if (/\b(contact|email|phone|reach|connect|investor relations|ir)\b/i.test(userQuery)) {
+      if (
+        /\b(contact|email|phone|reach|connect|investor relations|ir)\b/i.test(
+          userQuery
+        )
+      ) {
         try {
           // extract from fetched pages
           for (const p of pages || []) {
@@ -5952,17 +6080,29 @@ ${context}
           const topWeb = (top || [])
             .map((t) => t?.chunk?.source?.url)
             .filter((u) => /^https?:\/\//.test(u));
-          const roots = Array.from(new Set(topWeb.map((u) => {
-            try { return new URL(u).origin; } catch { return null; }
-          }).filter(Boolean))).slice(0, 3);
+          const roots = Array.from(
+            new Set(
+              topWeb
+                .map((u) => {
+                  try {
+                    return new URL(u).origin;
+                  } catch {
+                    return null;
+                  }
+                })
+                .filter(Boolean)
+            )
+          ).slice(0, 3);
           const quick = await Promise.allSettled(
             roots.map((r) => fetchLikelyContactPages(r))
           );
           for (const result of quick) {
-            if (result.status === 'fulfilled') {
+            if (result.status === "fulfilled") {
               for (const group of result.value.flat()) {
                 const parsed = unfluff(group.html || "");
-                const c = extractContactsFromText((parsed.text || "") + "\n" + (parsed.title || ""));
+                const c = extractContactsFromText(
+                  (parsed.text || "") + "\n" + (parsed.title || "")
+                );
                 contacts.emails.push(...c.emails);
                 contacts.phones.push(...c.phones);
                 contacts.socials.push(...c.socials);
@@ -5997,17 +6137,22 @@ ${context}
       let finalAnswer = answer;
       let finalSources = sourcesArr;
       // If contacts were found and user asked for them, append a compact section
-      const wantsContacts = /\b(contact|email|phone|reach|connect|investor relations|\bIR\b)\b/i.test(
-        userQuery
-      );
+      const wantsContacts =
+        /\b(contact|email|phone|reach|connect|investor relations|\bIR\b)\b/i.test(
+          userQuery
+        );
       if (
         wantsContacts &&
         contacts &&
-        (contacts.emails?.length || contacts.phones?.length || contacts.socials?.length)
+        (contacts.emails?.length ||
+          contacts.phones?.length ||
+          contacts.socials?.length)
       ) {
         const emails = (contacts.emails || []).map((e) => `- ${e}`).join("\n");
         const phones = (contacts.phones || []).map((p) => `- ${p}`).join("\n");
-        const socials = (contacts.socials || []).map((s) => `- ${s}`).join("\n");
+        const socials = (contacts.socials || [])
+          .map((s) => `- ${s}`)
+          .join("\n");
         const contactSection = [
           "\n\n### Contacts",
           emails ? `**Emails:**\n${emails}` : "",
@@ -6601,7 +6746,7 @@ ${context}
           sources: r.sources || [],
         }));
         const formatted_answer = composeSections(blocks);
-  const sources = valid.flatMap((r) => r.sources || []).slice(0, 15);
+        const sources = valid.flatMap((r) => r.sources || []).slice(0, 15);
         const imagesFromRuns = valid.flatMap((r) => r.images || []).slice(0, 8);
 
         // Fetch verticals same as below
@@ -6681,7 +6826,7 @@ ${context}
             .slice(0, 24);
           const normNews = newsArr.slice(0, 24);
 
-          return res.json({
+          const payload = {
             formatted_answer,
             sources,
             images: imagesFromRuns.length ? imagesFromRuns : normImages,
@@ -6689,15 +6834,19 @@ ${context}
             news: normNews,
             plan: { subqueries },
             last_fetched: new Date().toISOString(),
-          });
+          };
+          persistentSet(cacheKey, payload, 24 * 60 * 60).catch(() => {});
+          return res.json(payload);
         } catch (e) {
-          return res.json({
+          const payload = {
             formatted_answer,
             sources,
             images: imagesFromRuns,
             plan: { subqueries },
             last_fetched: new Date().toISOString(),
-          });
+          };
+          persistentSet(cacheKey, payload, 24 * 60 * 60).catch(() => {});
+          return res.json(payload);
         }
       }
     }
@@ -6724,12 +6873,14 @@ ${context}
       }
 
       if (mergedChunks.length === 0) {
-        return res.json({
+        const payload = {
           formatted_answer: "I couldn't fetch enough content for this query.",
           sources: [],
           images: [],
           last_fetched: new Date().toISOString(),
-        });
+        };
+        persistentSet(cacheKey, payload, 60 * 60).catch(() => {});
+        return res.json(payload);
       }
 
       const allTexts = [
@@ -6830,7 +6981,7 @@ ${contextInf}
             seen.add(url);
           }
         }
-  return sources.slice(0, 15);
+        return sources.slice(0, 15);
       }
       function extractImagesLocal(md = "") {
         const out = [];
@@ -6868,7 +7019,7 @@ ${contextInf}
     const todayISO = new Date().toISOString().slice(0, 10);
     const parts = splitMultiIntent(query);
     const plans = parts.flatMap((p) => makePlan(p, todayISO));
-    
+
     // Limit plans in fast mode for speed
     const plansToExecute = fast ? plans.slice(0, 2) : plans;
 
@@ -6999,24 +7150,6 @@ ${contextInf}
           };
 
     // Fetch verticals in parallel to include images/videos/news/shopping/short_videos
-    // Skip slow verticals in fast mode
-    if (fast) {
-      console.log("Fast mode: skipping slow verticals");
-      return res.json({
-        formatted_answer,
-        sources,
-        images: imagesFromRuns,
-        videos: [],
-        news: [],
-        shopping: [],
-        short_videos: [],
-        plan: plans,
-        contacts,
-        verification,
-        last_fetched: new Date().toISOString(),
-      });
-    }
-    
     try {
       const vert = await Promise.allSettled([
         (async () => {
@@ -7245,6 +7378,21 @@ app.get("/api/agentic-v2/stream", async (req, res) => {
         }
       } catch {}
     }
+
+    // Early token stream draft (perceived speed)
+    try {
+      if (process.env.OPENAI_API_KEY) {
+        const draftPrompt = `Write 1-2 sentence preview answer for: "${query}". Keep it neutral and helpful.`;
+        await streamOpenAIChat({
+          model: process.env.LLM_SIMPLE?.includes(":")
+            ? process.env.LLM_SIMPLE.split(":")[1]
+            : "gpt-4o-mini",
+          prompt: draftPrompt,
+          onDelta: (d) => send("delta", { text: d }),
+        });
+        send("delta_done", {});
+      }
+    } catch {}
 
     // Compute final answer via internal sync endpoint
     const base = process.env.SELF_BASE_URL || "http://localhost:10000";
