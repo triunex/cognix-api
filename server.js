@@ -453,7 +453,8 @@ async function rerankWithCohere(query, items = [], topN = 15) {
     const resp = await axios.post(
       "https://api.cohere.ai/v1/rerank",
       {
-        model: "rerank-2.5",
+        model:
+          process.env.COHERE_RERANK_MODEL || "rerank-english-v3.0",
         query,
         top_n: Math.min(topN, docs.length),
         documents: docs,
@@ -475,6 +476,52 @@ async function rerankWithCohere(query, items = [], topN = 15) {
   } catch (e) {
     console.warn("Cohere rerank failed:", e?.response?.data || e?.message || e);
     return null;
+  }
+}
+
+// Lightweight contact info extraction
+function extractContactsFromText(text = "") {
+  const emails = Array.from(
+    new Set((text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).map((e) => e.toLowerCase()))
+  ).slice(0, 10);
+  const phones = Array.from(
+    new Set(
+      (text.match(/\+?\d[\d\s().-]{6,}\d/g) || []).map((p) => p.replace(/\s+/g, " ").trim())
+    )
+  ).slice(0, 10);
+  const socials = [];
+  const li = text.match(/https?:\/\/([\w.-]*linkedin\.com\/[^\s)"']+)/gi) || [];
+  const tw = text.match(/https?:\/\/([\w.-]*twitter\.com|x\.com)\/[^\s)"']+/gi) || [];
+  const gh = text.match(/https?:\/\/github\.com\/[^\s)"']+/gi) || [];
+  socials.push(...li, ...tw, ...gh);
+  return { emails, phones, socials: Array.from(new Set(socials)).slice(0, 10) };
+}
+
+async function fetchLikelyContactPages(baseUrl) {
+  try {
+    const u = new URL(baseUrl);
+    const root = `${u.protocol}//${u.host}`;
+    const candidates = [
+      `${root}/contact`,
+      `${root}/contact-us`,
+      `${root}/about`,
+      `${root}/team`,
+    ];
+    const fetched = await Promise.all(
+      candidates.map((cu) =>
+        axios
+          .get(cu, {
+            headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+            timeout: 1000,
+            maxRedirects: 2,
+          })
+          .then((r) => ({ url: cu, html: r.data }))
+          .catch(() => null)
+      )
+    );
+    return fetched.filter(Boolean);
+  } catch {
+    return [];
   }
 }
 
@@ -1807,16 +1854,20 @@ async function searchInstagramPublic(query, maxResults = 4) {
 }
 
 // Faster page fetch for time-limited scraping
-async function fetchPageTextFast(url) {
+async function fetchPageTextFast(url, timeoutMs = null) {
   try {
     const rkey = `page:${url}`;
     const persisted = await persistentGet(rkey);
     if (persisted) return persisted;
     const c = pageCache.get(url);
     if (c) return c;
+    
+    const timeout = timeoutMs || Number(process.env.FAST_FETCH_TIMEOUT_MS || 2500);
     const resp = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
-      timeout: 3000,
+      timeout,
+      maxRedirects: 3,
+      validateStatus: (status) => status < 400,
     });
     const parsed = unfluff(resp.data || "");
     const out = {
@@ -5523,10 +5574,19 @@ app.post("/api/agentic-v2", async (req, res) => {
   try {
     // helpers: unified single-run that wraps existing logic (see runUnifiedOnce below)
     // NEW: Always-on planner to split into subqueries
+    const planStart = Date.now();
     const planLLM = await planSubqueriesLLM(query).catch(() => ({
       subqueries: [],
     }));
     const subqueries = (planLLM?.subqueries || []).filter((s) => s?.query);
+    console.log(`Planning took ${Date.now() - planStart}ms`);
+
+    // Parallel execution with limited concurrency in fast mode
+    const maxConcurrent = fast ? 2 : 4;
+    const subqueriesToRun = subqueries.slice(0, maxConcurrent);
+    
+    console.log(`Running ${subqueriesToRun.length} subqueries in parallel`);
+    const execStart = Date.now();
 
     async function runUnifiedOnce(
       userQuery,
@@ -5561,7 +5621,7 @@ app.post("/api/agentic-v2", async (req, res) => {
         );
         allSerpOrganic = allSerpOrganic.concat(organic);
 
-        if (organic.length < 5 || !strongEntityMatch(userQuery, organic)) {
+        if (!opts.fast && (organic.length < 5 || !strongEntityMatch(userQuery, organic))) {
           const extra = await runExtraSearches(userQuery, [
             "bing",
             "duckduckgo",
@@ -5574,19 +5634,20 @@ app.post("/api/agentic-v2", async (req, res) => {
         }
 
         const budget = opts.fast
-          ? Math.min(12, opts.maxWeb ?? 50)
+          ? Math.min(6, opts.maxWeb ?? 50)
           : complex
           ? opts.maxWeb ?? 50
           : Math.min(20, opts.maxWeb ?? 50);
         const topLinks = allSerpOrganic
           .slice(0, budget)
           .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
+        
+        // Parallel page fetching with aggressive timeout in fast mode
+        const fetchTimeout = opts.fast ? 1500 : 3000;
         const pageFetchPromises = topLinks.map((l) =>
-          fetchPageTextFast(l.link)
+          fetchPageTextFast(l.link, fetchTimeout)
         );
-        pages = (await Promise.all(pageFetchPromises)).filter(Boolean);
-
-        tweets = tw || [];
+        pages = (await Promise.all(pageFetchPromises)).filter(Boolean);        tweets = tw || [];
         reddit = rd || [];
         youtube = yt || [];
         wiki = wp || [];
@@ -5606,7 +5667,7 @@ app.post("/api/agentic-v2", async (req, res) => {
       let chunks = [];
       for (const p of pages) {
         if (p && p.text && p.text.length > 200) {
-          const cs = chunkText(p.text, 1200).map((c) => ({
+          const cs = chunkText(p.text, opts.fast ? 800 : 1200).map((c) => ({
             ...c,
             source: { type: "web", url: p.url, title: p.title },
           }));
@@ -5618,6 +5679,9 @@ app.post("/api/agentic-v2", async (req, res) => {
             source: { type: "web", url: p.url, title: p.title },
           });
         }
+      }
+      if (opts.fast && chunks.length > 100) {
+        chunks = chunks.slice(0, 100);
       }
       for (const t of tweets || [])
         chunks.push({
@@ -5657,7 +5721,7 @@ app.post("/api/agentic-v2", async (req, res) => {
         userQuery,
         ...chunks.map((c) => c.text.substring(0, 2000)),
       ];
-      const allEmbeddings = await getEmbeddingsGemini(allTexts);
+  const allEmbeddings = await getEmbeddingsGemini(allTexts);
       const qEmb = allEmbeddings[0];
       const chunkEmbeddings = allEmbeddings.slice(1);
 
@@ -5669,7 +5733,7 @@ app.post("/api/agentic-v2", async (req, res) => {
 
       // Candidate pool from embedding recall (take wider pool, e.g., 40)
       const pool = sims
-        .slice(0, Math.min(opts.fast ? 24 : 40, sims.length))
+        .slice(0, Math.min(opts.fast ? 8 : 40, sims.length))
         .map((s) => ({
           i: s.i,
           score: s.score,
@@ -5678,13 +5742,15 @@ app.post("/api/agentic-v2", async (req, res) => {
 
       // Optional cross-encoder rerank for precision
       let finalIdxs = null;
-      const co = await rerankWithCohere(
-        userQuery,
-        pool.map((p) => p.item),
-        opts.topChunks ?? 15
-      );
-      if (Array.isArray(co) && co.length) {
-        finalIdxs = co.map((r) => pool[r.index].i);
+      if (!opts.fast) {
+        const co = await rerankWithCohere(
+          userQuery,
+          pool.map((p) => p.item),
+          opts.topChunks ?? 15
+        );
+        if (Array.isArray(co) && co.length) {
+          finalIdxs = co.map((r) => pool[r.index].i);
+        }
       }
 
       const pickK = Math.min(opts.topChunks ?? 15, sims.length);
@@ -5714,7 +5780,7 @@ app.post("/api/agentic-v2", async (req, res) => {
       });
       // Build fused context with dedup + optional contradictions
       const fusion = await buildFusedContext(userQuery, top, {
-        maxBullets: opts.fast ? 25 : 40,
+        maxBullets: opts.fast ? 12 : 40,
       });
       const context = [fusion.fusedText, "", fusion.sourceMap].join("\n\n");
 
@@ -5800,7 +5866,7 @@ ${context}
           provider: modelChoice.provider,
           model: modelChoice.model,
           prompt: finalPrompt,
-          maxTokens: 1200,
+          maxTokens: opts.fast ? 400 : 1200,
         })) || "";
 
       function extractSourcesFromMarkdown(md = "", fallbackTop = []) {
@@ -5852,7 +5918,7 @@ ${context}
             }
           }
         }
-        return sources.slice(0, 12);
+  return sources.slice(0, 15);
       }
       function extractImages(md = "") {
         const out = [];
@@ -5867,6 +5933,46 @@ ${context}
           }
         }
         return out.slice(0, 8);
+      }
+
+      // If user asks for contacts, try extracting from fetched pages and likely contact endpoints
+      let contacts = { emails: [], phones: [], socials: [] };
+      if (/\b(contact|email|phone|reach|connect|investor relations|ir)\b/i.test(userQuery)) {
+        try {
+          // extract from fetched pages
+          for (const p of pages || []) {
+            if (p?.text) {
+              const c = extractContactsFromText(p.text);
+              contacts.emails.push(...c.emails);
+              contacts.phones.push(...c.phones);
+              contacts.socials.push(...c.socials);
+            }
+          }
+          // try common contact pages for top web sources
+          const topWeb = (top || [])
+            .map((t) => t?.chunk?.source?.url)
+            .filter((u) => /^https?:\/\//.test(u));
+          const roots = Array.from(new Set(topWeb.map((u) => {
+            try { return new URL(u).origin; } catch { return null; }
+          }).filter(Boolean))).slice(0, 3);
+          const quick = await Promise.allSettled(
+            roots.map((r) => fetchLikelyContactPages(r))
+          );
+          for (const result of quick) {
+            if (result.status === 'fulfilled') {
+              for (const group of result.value.flat()) {
+                const parsed = unfluff(group.html || "");
+                const c = extractContactsFromText((parsed.text || "") + "\n" + (parsed.title || ""));
+                contacts.emails.push(...c.emails);
+                contacts.phones.push(...c.phones);
+                contacts.socials.push(...c.socials);
+              }
+            }
+          }
+          contacts.emails = Array.from(new Set(contacts.emails)).slice(0, 15);
+          contacts.phones = Array.from(new Set(contacts.phones)).slice(0, 15);
+          contacts.socials = Array.from(new Set(contacts.socials)).slice(0, 15);
+        } catch {}
       }
 
       const sourcesArr = extractSourcesFromMarkdown(answer, top);
@@ -5890,6 +5996,28 @@ ${context}
           };
       let finalAnswer = answer;
       let finalSources = sourcesArr;
+      // If contacts were found and user asked for them, append a compact section
+      const wantsContacts = /\b(contact|email|phone|reach|connect|investor relations|\bIR\b)\b/i.test(
+        userQuery
+      );
+      if (
+        wantsContacts &&
+        contacts &&
+        (contacts.emails?.length || contacts.phones?.length || contacts.socials?.length)
+      ) {
+        const emails = (contacts.emails || []).map((e) => `- ${e}`).join("\n");
+        const phones = (contacts.phones || []).map((p) => `- ${p}`).join("\n");
+        const socials = (contacts.socials || []).map((s) => `- ${s}`).join("\n");
+        const contactSection = [
+          "\n\n### Contacts",
+          emails ? `**Emails:**\n${emails}` : "",
+          phones ? `\n**Phones:**\n${phones}` : "",
+          socials ? `\n**Profiles:**\n${socials}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n");
+        finalAnswer += contactSection;
+      }
       if (
         opts.verify &&
         verification.needs_retry &&
@@ -5935,6 +6063,7 @@ ${context}
         chunks,
         rawTop: top,
         verification,
+        contacts,
       };
     }
 
@@ -6472,7 +6601,7 @@ ${context}
           sources: r.sources || [],
         }));
         const formatted_answer = composeSections(blocks);
-        const sources = valid.flatMap((r) => r.sources || []).slice(0, 12);
+  const sources = valid.flatMap((r) => r.sources || []).slice(0, 15);
         const imagesFromRuns = valid.flatMap((r) => r.images || []).slice(0, 8);
 
         // Fetch verticals same as below
@@ -6701,7 +6830,7 @@ ${contextInf}
             seen.add(url);
           }
         }
-        return sources.slice(0, 12);
+  return sources.slice(0, 15);
       }
       function extractImagesLocal(md = "") {
         const out = [];
@@ -6739,10 +6868,14 @@ ${contextInf}
     const todayISO = new Date().toISOString().slice(0, 10);
     const parts = splitMultiIntent(query);
     const plans = parts.flatMap((p) => makePlan(p, todayISO));
+    
+    // Limit plans in fast mode for speed
+    const plansToExecute = fast ? plans.slice(0, 2) : plans;
 
     // 2) Execute each subtask (in parallel)
+    const execStart2 = Date.now();
     const execs = await Promise.all(
-      plans.map(async (t) => {
+      plansToExecute.map(async (t) => {
         if (t.kind === "news") {
           const q =
             t.scope === "country"
@@ -6784,12 +6917,15 @@ ${contextInf}
         }
         // generic
         const run = await runUnifiedOnce(t.query || t.id || query, {
-          maxWeb,
-          topChunks,
+          maxWeb: fast ? Math.min(maxWeb, 15) : maxWeb,
+          topChunks: fast ? Math.min(topChunks, 8) : topChunks,
+          fast,
+          verify,
         });
         return { task: t, run, verified: { ok: true } };
       })
     );
+    console.log(`Task execution took ${Date.now() - execStart2}ms`);
 
     // 3) Compose beautiful, sectioned answer
     const blocks = [];
@@ -6825,22 +6961,62 @@ ${contextInf}
     }
 
     const formatted_answer = composeSections(blocks);
-    const sources = execs.flatMap((ex) => ex.run.sources).slice(0, 12);
+    const sources = execs.flatMap((ex) => ex.run.sources).slice(0, 15);
     const imagesFromRuns = execs
       .flatMap((ex) => ex.run.images || [])
       .slice(0, 8);
-    
+    const contacts = (function collectContacts() {
+      const emails = new Set();
+      const phones = new Set();
+      const socials = new Set();
+      for (const ex of execs) {
+        const c = ex.run.contacts;
+        if (!c) continue;
+        (c.emails || []).forEach((e) => emails.add(e));
+        (c.phones || []).forEach((p) => phones.add(p));
+        (c.socials || []).forEach((s) => socials.add(s));
+      }
+      return {
+        emails: Array.from(emails).slice(0, 15),
+        phones: Array.from(phones).slice(0, 15),
+        socials: Array.from(socials).slice(0, 15),
+      };
+    })();
+
     // Collect verification data from executions
-    const verifications = execs.map((ex) => ex.run.verification).filter(Boolean);
-    const verification = verifications.length > 0 ? verifications[0] : {
-      contradictions: [],
-      missing_citations: [],
-      confidence: 0.7,
-      needs_retry: false,
-      refinements: []
-    };
+    const verifications = execs
+      .map((ex) => ex.run.verification)
+      .filter(Boolean);
+    const verification =
+      verifications.length > 0
+        ? verifications[0]
+        : {
+            contradictions: [],
+            missing_citations: [],
+            confidence: 0.7,
+            needs_retry: false,
+            refinements: [],
+          };
 
     // Fetch verticals in parallel to include images/videos/news/shopping/short_videos
+    // Skip slow verticals in fast mode
+    if (fast) {
+      console.log("Fast mode: skipping slow verticals");
+      return res.json({
+        formatted_answer,
+        sources,
+        images: imagesFromRuns,
+        videos: [],
+        news: [],
+        shopping: [],
+        short_videos: [],
+        plan: plans,
+        contacts,
+        verification,
+        last_fetched: new Date().toISOString(),
+      });
+    }
+    
     try {
       const vert = await Promise.allSettled([
         (async () => {
@@ -6968,6 +7144,7 @@ ${contextInf}
         shopping: normShopping,
         short_videos: normShort,
         plan: plans,
+        contacts,
         verification,
         last_fetched: new Date().toISOString(),
       });
@@ -6978,6 +7155,7 @@ ${contextInf}
         sources,
         images: imagesFromRuns,
         plan: plans,
+        contacts,
         verification,
         last_fetched: new Date().toISOString(),
       });
