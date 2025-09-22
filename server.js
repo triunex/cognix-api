@@ -23,6 +23,16 @@ dotenv.config();
 
 const app = express();
 
+// --- Core speed knobs (Week 1) ---
+// Aggressive network timeouts for retrieval to keep TTFB low
+const FAST_TIMEOUT_MS = Number(process.env.FAST_TIMEOUT_MS || 1500);
+const FAST_TIMEOUT_LONG_MS = Math.max(FAST_TIMEOUT_MS, 2000);
+// Helper to clamp axios timeout options consistently
+function fastTimeout(ms) {
+  const n = Number(ms || FAST_TIMEOUT_MS);
+  return Math.min(Math.max(200, n), 2000);
+}
+
 // --- Arsenal config store (simple in-memory map; replace with DB later) ---
 const arsenalStore = new Map(); // key: userId, value: ArsenalConfig
 // --- User instructions store (persisted to disk as a lightweight fallback) ---
@@ -282,6 +292,7 @@ class SimpleCache {
 const serpCache = new SimpleCache(400, 5 * 60 * 1000);
 const pageCache = new SimpleCache(400, 10 * 60 * 1000);
 const embedCache = new SimpleCache(3000, 60 * 60 * 1000);
+const verificationCache = new SimpleCache(1000, 10 * 60 * 1000);
 
 // Optional Redis persistent cache (fallback to in-memory if unavailable)
 let redis = null;
@@ -311,6 +322,37 @@ async function persistentGet(key) {
   } catch {
     return null;
   }
+}
+
+// --- Simple background job helpers ---
+function newJobId(prefix = "job") {
+  try {
+    return `${prefix}_${crypto.randomUUID()}`;
+  } catch {
+    return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  }
+}
+
+// --- SSE helpers (top-level, reusable) ---
+function sseStart(res) {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+  const ping = setInterval(() => {
+    try {
+      res.write(`event: ping\n`);
+      res.write(`data: {}\n\n`);
+    } catch {}
+  }, 15000);
+  const stop = () => clearInterval(ping);
+  return stop;
+}
+function sseSend(res, type, payload) {
+  try {
+    res.write(`event: ${type}\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  } catch {}
 }
 async function persistentSet(key, value, ttlSec) {
   if (!redis) return false;
@@ -349,7 +391,7 @@ async function searchSerpCached(engine, q, params = {}, timeoutMs = 6000) {
   try {
     const resp = await axios.get("https://serpapi.com/search", {
       params: { engine, q, api_key: apiKey, ...params },
-      timeout: timeoutMs,
+      timeout: fastTimeout(timeoutMs),
     });
     serpCache.set(key, resp.data);
     persistentSet(rkey, resp.data, 300).catch(() => {});
@@ -365,7 +407,7 @@ async function fetchPageText(url) {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
       },
-      timeout: 12000,
+      timeout: fastTimeout(FAST_TIMEOUT_MS),
     });
     const parsed = unfluff(resp.data || "");
     const text = (parsed.text || "").trim();
@@ -1184,7 +1226,10 @@ async function searchTwitterRecent(query, maxResults = 5) {
       `https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(
         query
       )}&tweet.fields=created_at,author_id,text&expansions=author_id&max_results=${maxResults}`,
-      { headers: { Authorization: `Bearer ${process.env.TWITTER_BEARER}` } }
+      {
+        headers: { Authorization: `Bearer ${process.env.TWITTER_BEARER}` },
+        timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
+      }
     );
     const tweets = (resp.data?.data || []).map((t) => ({
       id: t.id,
@@ -1218,9 +1263,9 @@ async function getRedditAccessToken() {
         headers: {
           Authorization: `Basic ${basic}`,
           "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": "NelieoAI/1.0 (userless)"
+          "User-Agent": "NelieoAI/1.0 (userless)",
         },
-        timeout: 8000,
+        timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
       }
     );
     const tok = resp.data?.access_token;
@@ -1255,10 +1300,13 @@ async function searchReddit(query, maxResults = 6) {
             Authorization: `Bearer ${token}`,
             "User-Agent": "NelieoAI/1.0 (userless)",
           },
-          timeout: 8000,
+          timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
         });
       } catch (e) {
-        console.warn("Reddit OAuth search failed, falling back:", e?.message || e);
+        console.warn(
+          "Reddit OAuth search failed, falling back:",
+          e?.message || e
+        );
       }
     }
     if (!resp) {
@@ -1266,7 +1314,7 @@ async function searchReddit(query, maxResults = 6) {
         `https://www.reddit.com/search.json?q=${encodeURIComponent(
           query
         )}&limit=${maxResults}&sort=relevance`,
-        { headers: { "User-Agent": "NelieoAI/1.0" }, timeout: 8000 }
+        { headers: { "User-Agent": "NelieoAI/1.0" }, timeout: fastTimeout(FAST_TIMEOUT_LONG_MS) }
       );
     }
 
@@ -1832,7 +1880,7 @@ async function runExtraSearches(
     axios
       .get("https://serpapi.com/search.json", {
         params: { engine, q: query, api_key: serpApiKey },
-        timeout: 8000,
+        timeout: fastTimeout(FAST_TIMEOUT_MS),
       })
       .then((r) => r.data)
       .catch((e) => null)
@@ -1847,7 +1895,7 @@ async function searchWikipedia(query) {
     const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
       query
     )}&format=json&origin=*`;
-    const resp = await axios.get(url, { timeout: 6000 });
+  const resp = await axios.get(url, { timeout: fastTimeout(FAST_TIMEOUT_LONG_MS) });
     return (resp.data?.query?.search || []).map((s) => ({
       title: s.title,
       snippet: s.snippet,
@@ -1867,7 +1915,7 @@ async function searchYouTube(query, maxResults = 4) {
     const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(
       query
     )}&type=video&maxResults=${maxResults}&key=${key}`;
-    const searchRes = await axios.get(searchUrl, { timeout: 8000 });
+  const searchRes = await axios.get(searchUrl, { timeout: fastTimeout(FAST_TIMEOUT_LONG_MS) });
     const items = searchRes.data.items || [];
     // For each video, fetch snippet details (title, description)
     return items.map((it) => ({
@@ -1901,7 +1949,7 @@ async function searchInstagramPublic(query, maxResults = 4) {
     for (const url of engines.slice(0, maxResults)) {
       try {
         const resp = await axios.get(url, {
-          timeout: 8000,
+          timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
           headers: { "User-Agent": "Mozilla/5.0" },
         });
         const html = resp.data || "";
@@ -1936,8 +1984,9 @@ async function fetchPageTextFast(url, timeoutMs = null) {
     const c = pageCache.get(url);
     if (c) return c;
 
-    const timeout =
-      timeoutMs || Number(process.env.FAST_FETCH_TIMEOUT_MS || 2500);
+    const timeout = fastTimeout(
+      timeoutMs || Number(process.env.FAST_FETCH_TIMEOUT_MS || FAST_TIMEOUT_MS)
+    );
     const resp = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
       timeout,
@@ -2135,12 +2184,10 @@ app.post("/api/search", async (req, res) => {
       .join("\n\n");
 
     const prompt = `
-You're an intelligent assistant. Use the search results below to answer the user's question *clearly and helpfully*, even if not all results are directly relevant. 
-If needed, combine your own knowledge with the web results.
-Give Great easy to understand and slightly big answers.
-If anyone want a paragraph , Summary, Research , do that all.
-Don't mention about any sources or links.
-Avoid using hashtags (#), asterisks (*), or markdown symbols.
+You're an intelligent assistant. Use the search results below to answer the user's question clearly and helpfully. If needed, combine concise synthesis with key bullets.
+Keep it readable and structured with short paragraphs and simple bullet points when helpful.
+Don't mention sources or links in the text.
+Avoid using hashtags (#) or decorative markdown symbols.
 
 
 Question: "${query}"
@@ -2148,10 +2195,7 @@ Question: "${query}"
 Search Results:
 ${context}
 
-Answer in a friendly, helpful tone:
-Answer clearly, concisely, and professionally.
-Talk in very Friendly way.
-Avoid using hashtags (#), asterisks (*), or markdown symbols.
+Answer in a friendly, concise tone. Prefer short paragraphs or brief bullet points for key facts. Avoid hashtags and decorative symbols.
 `;
 
     const geminiResponse = await axios.post(
@@ -5681,7 +5725,12 @@ app.post("/api/agentic-v2", async (req, res) => {
       while (attempts < 3 && confidence < 0.85) {
         const [serpResp, tw, rd, yt, wp] = await Promise.all([
           (async () => {
-            const data = await searchSerpCached("google", userQuery, {}, 6000);
+            const data = await searchSerpCached(
+              "google",
+              userQuery,
+              {},
+              FAST_TIMEOUT_MS
+            );
             return { data: data || { organic_results: [] } };
           })(),
           searchTwitterRecent(userQuery, 6),
@@ -5696,20 +5745,19 @@ app.post("/api/agentic-v2", async (req, res) => {
         );
         allSerpOrganic = allSerpOrganic.concat(organic);
 
-        if (
-          !opts.fast &&
-          (organic.length < 5 || !strongEntityMatch(userQuery, organic))
-        ) {
-          const extra = await runExtraSearches(userQuery, [
-            "bing",
-            "duckduckgo",
-          ]);
-          for (const e of extra)
-            if (e?.organic_results)
-              allSerpOrganic = allSerpOrganic.concat(
-                e.organic_results.slice(0, 5)
-              );
-        }
+        // Kick off extra engines in parallel but do not block the loop long
+        const extraPromise = runExtraSearches(userQuery, [
+          "bing",
+          "duckduckgo",
+        ])
+          .then((extra) => {
+            for (const e of extra || [])
+              if (e?.organic_results)
+                allSerpOrganic = allSerpOrganic.concat(
+                  e.organic_results.slice(0, 5)
+                );
+          })
+          .catch(() => {});
 
         const budget = opts.fast
           ? Math.min(6, opts.maxWeb ?? 50)
@@ -5721,11 +5769,12 @@ app.post("/api/agentic-v2", async (req, res) => {
           .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
 
         // Parallel page fetching with aggressive timeout in fast mode
-        const fetchTimeout = opts.fast ? 1500 : 3000;
+        const fetchTimeout = FAST_TIMEOUT_MS;
         const pageFetchPromises = topLinks.map((l) =>
           fetchPageTextFast(l.link, fetchTimeout)
         );
         pages = (await Promise.all(pageFetchPromises)).filter(Boolean);
+        await extraPromise; // fold in extras if they arrived
         tweets = tw || [];
         reddit = rd || [];
         youtube = yt || [];
@@ -5863,7 +5912,7 @@ app.post("/api/agentic-v2", async (req, res) => {
       });
       const context = [fusion.fusedText, "", fusion.sourceMap].join("\n\n");
 
-  const systemPrompt = `You are Nelieo AI — an agentic search assistant that adapts length, structure, and tone to the user's query.
+      const systemPrompt = `You are Nelieo AI — an agentic search assistant that adapts length, structure, and tone to the user's query.
 
 Adaptive formatting rules:
 - Always answer in polished Markdown.
@@ -5886,7 +5935,7 @@ Constraints:
 
 Goal: Be helpful and fast. Prefer brevity unless the question clearly needs depth.`;
 
-  const finalPrompt = `
+      const finalPrompt = `
 ${systemPrompt}
 
 Task: Answer the user's question with adaptive length and beautiful structure.
@@ -6230,7 +6279,7 @@ ${context}
                   q,
                   api_key: process.env.SERPAPI_API_KEY,
                 },
-                timeout: Math.min(10000, timeLeft()),
+                timeout: fastTimeout(Math.min(FAST_TIMEOUT_MS, timeLeft())),
               }),
               Math.min(11000, timeLeft())
             );
@@ -6251,7 +6300,7 @@ ${context}
               q
             )}&start=0&max_results=${n}`;
             const resp = await withTimeout(
-              axios.get(url, { timeout: Math.min(10000, timeLeft()) }),
+              axios.get(url, { timeout: fastTimeout(Math.min(FAST_TIMEOUT_MS, timeLeft())) }),
               Math.min(11000, timeLeft())
             );
             const xml = resp?.data || "";
@@ -6302,9 +6351,9 @@ ${context}
                       "google",
                       qNow,
                       {},
-                      Math.min(8000, timeLeft())
+                      fastTimeout(Math.min(FAST_TIMEOUT_MS, timeLeft()))
                     ),
-                    Math.min(9000, timeLeft())
+                    fastTimeout(Math.min(FAST_TIMEOUT_LONG_MS, timeLeft()))
                   );
                   const org = (data?.organic_results || []).slice(0, maxWeb);
                   pushUnique(serpOrganic, org, (r) => normalizeUrl(r.link));
@@ -7053,7 +7102,9 @@ ${contextInf}
     const verifications = execs
       .map((ex) => ex.run.verification)
       .filter(Boolean);
-    const verification =
+    // Queue background verification (first result) and return job id now
+    const verificationJobId = newJobId("verify");
+    const baseVerify =
       verifications.length > 0
         ? verifications[0]
         : {
@@ -7063,6 +7114,36 @@ ${contextInf}
             needs_retry: false,
             refinements: [],
           };
+    verificationCache.set(verificationJobId, {
+      status: "queued",
+      result: baseVerify,
+      created_at: Date.now(),
+    });
+    // Fire-and-forget: recompute with full context and update cache
+    (async () => {
+      try {
+        const mergedText = blocks.map((b) => b.body).join("\n\n");
+        const allSources = sources || [];
+        const v = await verifyAnswerLLM({
+          query,
+          answer: mergedText,
+          fusedText: "",
+          sourceMap: "",
+          sources: allSources,
+        });
+        verificationCache.set(verificationJobId, {
+          status: "done",
+          result: v,
+          updated_at: Date.now(),
+        });
+      } catch (e) {
+        verificationCache.set(verificationJobId, {
+          status: "error",
+          error: e?.message || String(e),
+          updated_at: Date.now(),
+        });
+      }
+    })();
 
     // Fetch verticals in parallel to include images/videos/news/shopping/short_videos
     // Skip slow verticals in fast mode
@@ -7078,7 +7159,7 @@ ${contextInf}
         short_videos: [],
         plan: plans,
         contacts,
-        verification,
+        verification_job_id: verificationJobId,
         last_fetched: new Date().toISOString(),
       });
     }
@@ -7211,7 +7292,7 @@ ${contextInf}
         short_videos: normShort,
         plan: plans,
         contacts,
-        verification,
+        verification_job_id: verificationJobId,
         last_fetched: new Date().toISOString(),
       });
     } catch (e) {
@@ -7236,6 +7317,92 @@ ${contextInf}
 });
 
 // (Removed) SSE streaming endpoint for agentic-v2
+// Background verification status
+app.get("/api/agentic-v2/verification/:id", (req, res) => {
+  const id = req.params.id;
+  const rec = verificationCache.get(id);
+  if (!rec) return res.status(404).json({ error: "not-found" });
+  return res.json(rec);
+});
+
+// SSE streaming: progressively send stages for agentic-v2
+app.post("/api/agentic-v2/stream", async (req, res) => {
+  const stop = sseStart(res);
+  try {
+    const { query, maxWeb = 30, topChunks = 12, fast = true } = req.body || {};
+    if (!query) {
+      sseSend(res, "error", { error: "Missing query" });
+      return res.end();
+    }
+    sseSend(res, "init", { query, fast });
+
+    // Plan (non-blocking if no key)
+    const plan = await planSubqueriesLLM(query).catch(() => ({ subqueries: [] }));
+    sseSend(res, "plan", { subqueries: plan.subqueries || [] });
+
+    // Kick retrieval
+    const start = Date.now();
+    const run = await (async () => {
+      const r = await (await Promise.resolve()).then(() =>
+        (async () =>
+          await (async function(userQuery){
+            return await (await Promise.resolve()).then(() =>
+              // reuse runUnifiedOnce via wrapper since it's scoped; re-call main endpoint quickly
+              axios
+                .post(`${process.env.SELF_BASE_URL || "http://localhost:10000"}/api/agentic-v2`,
+                  { query: userQuery, maxWeb, topChunks, fast, verify: false },
+                  { headers: { "Content-Type": "application/json" } }
+                )
+                .then((r) => r.data)
+            );
+          })(query)
+        )
+      );
+      return r;
+    })();
+    sseSend(res, "answer", {
+      formatted_answer: run.formatted_answer,
+      sources: run.sources || [],
+      images: run.images || [],
+      elapsed_ms: Date.now() - start,
+    });
+
+    // Queue verification in background and stream job id
+    const vId = newJobId("verify");
+    verificationCache.set(vId, { status: "queued", created_at: Date.now() });
+    sseSend(res, "verification", { job_id: vId });
+    (async () => {
+      try {
+        const v = await verifyAnswerLLM({
+          query,
+          answer: run.formatted_answer || "",
+          fusedText: "",
+          sourceMap: "",
+          sources: run.sources || [],
+        });
+        verificationCache.set(vId, {
+          status: "done",
+          result: v,
+          updated_at: Date.now(),
+        });
+        sseSend(res, "verification_result", { job_id: vId, result: v });
+      } catch (e) {
+        verificationCache.set(vId, {
+          status: "error",
+          error: e?.message || String(e),
+          updated_at: Date.now(),
+        });
+      } finally {
+        try { res.end(); } catch {}
+      }
+    })();
+  } catch (e) {
+    sseSend(res, "error", { error: e?.message || String(e) });
+    try { res.end(); } catch {}
+  } finally {
+    stop();
+  }
+});
 
 // Speculative prefetch to warm caches
 app.post("/api/agentic-v2/prefetch", async (req, res) => {
