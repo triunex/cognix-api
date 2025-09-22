@@ -324,14 +324,6 @@ async function persistentSet(key, value, ttlSec) {
   }
 }
 
-function hashKey(input = "") {
-  try {
-    return crypto.createHash("sha1").update(String(input)).digest("hex");
-  } catch {
-    return String(input).slice(0, 128);
-  }
-}
-
 function isComplexQuery(q = "") {
   const s = (q || "").toLowerCase();
   const long = s.split(/\s+/).length >= 10;
@@ -787,57 +779,6 @@ async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
   return "";
 }
 
-// OpenAI streaming (SSE) helper for token-by-token output
-async function streamOpenAIChat({ model = "gpt-4o-mini", prompt, onDelta }) {
-  if (!process.env.OPENAI_API_KEY) return null;
-  const axiosOpts = {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    responseType: "stream",
-    timeout: 30000,
-  };
-  const body = {
-    model,
-    stream: true,
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0.5,
-    top_p: 0.9,
-    max_tokens: 600,
-  };
-  const resp = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    body,
-    axiosOpts
-  );
-  return new Promise((resolve, reject) => {
-    let acc = "";
-    resp.data.on("data", (chunk) => {
-      const lines = chunk.toString().split(/\r?\n/);
-      for (const line of lines) {
-        const m = line.match(/^data:\s*(.*)$/);
-        if (!m) continue;
-        const data = m[1];
-        if (data === "[DONE]") {
-          resolve(acc);
-          return;
-        }
-        try {
-          const obj = JSON.parse(data);
-          const delta = obj.choices?.[0]?.delta?.content || "";
-          if (delta) {
-            acc += delta;
-            onDelta?.(delta, acc);
-          }
-        } catch {}
-      }
-    });
-    resp.data.on("end", () => resolve(acc));
-    resp.data.on("error", reject);
-  });
-}
-
 function pickModelForTask(query = "", { taskType } = {}) {
   const cfg = routerConfig();
   const type = taskType || (isCreativeQuery(query) ? "creative" : "simple");
@@ -1121,18 +1062,12 @@ function verifyTranscriptCoverage(
 
 // --- Safe-composer (pretty, professional, policy-safe) ---
 function composeSections(blocks) {
-  if (!Array.isArray(blocks) || blocks.length === 0) return "";
-  if (blocks.length === 1) {
-    return String(blocks[0].body || "").trim();
-  }
   const lines = [];
   for (const b of blocks) {
-    const body = String(b.body || "").trim();
-    const title = String(b.title || "").replace(/^Result\s*—\s*/i, "");
-    lines.push(`\n#### ${title}\n`);
-    lines.push(body);
-    const hasSourcesInBody = /(^|\n)#{1,6}\s*Sources\b/i.test(body);
-    if (!hasSourcesInBody && b.sources?.length) {
+    // Use slightly smaller headings for structured answers
+    lines.push(`\n#### ${b.title}\n`);
+    lines.push(b.body.trim());
+    if (b.sources?.length) {
       lines.push(
         `\n**Sources:** ` +
           b.sources
@@ -1195,21 +1130,10 @@ async function getEmbeddingsGemini(texts = []) {
       .map((v) => (Array.isArray(v) ? v : null));
     const need = [];
     const idxMap = [];
-    const persistedIdxMap = [];
-    const persistedVals = new Array(slice.length).fill(null);
     for (let j = 0; j < slice.length; j++) {
       if (cached[j]) continue;
-      // try persistent cache
-      const key = `embed:${hashKey(slice[j])}`;
-      // eslint-disable-next-line no-await-in-loop
-      const pv = await persistentGet(key);
-      if (pv && Array.isArray(pv) && pv.length) {
-        persistedVals[j] = pv;
-        continue;
-      }
       need.push(slice[j]);
       idxMap.push(j);
-      persistedIdxMap.push(key);
     }
     try {
       let embeddings = [];
@@ -1232,17 +1156,11 @@ async function getEmbeddingsGemini(texts = []) {
       for (let j = 0; j < slice.length; j++) {
         if (cached[j]) out[j] = cached[j];
       }
-      for (let j = 0; j < slice.length; j++) {
-        if (persistedVals[j]) out[j] = persistedVals[j];
-      }
       for (let k = 0; k < need.length; k++) {
         const pos = idxMap[k];
         const vec = embeddings[k] || Array(dim).fill(0);
         out[pos] = vec;
         embedCache.set(slice[pos], vec);
-        // 24h persistent cache
-        // eslint-disable-next-line no-await-in-loop
-        persistentSet(persistedIdxMap[k], vec, 24 * 60 * 60).catch(() => {});
       }
       all.push(...out);
     } catch (e) {
@@ -1968,7 +1886,7 @@ async function fetchPageTextFast(url, timeoutMs = null) {
       author: parsed.author || "",
     };
     pageCache.set(url, out);
-    persistentSet(rkey, out, 24 * 60 * 60).catch(() => {});
+    persistentSet(rkey, out, 600).catch(() => {});
     return out;
   } catch (e) {
     return null;
@@ -5663,30 +5581,13 @@ app.post("/api/agentic-v2", async (req, res) => {
   if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
-    // Query-level 24h cache: skip recomputation for identical inputs
-    const cacheKey = `agenticv2:${hashKey(
-      JSON.stringify({ q: query, maxWeb, topChunks, fast, verify })
-    )}`;
-    const cachedResp = await persistentGet(cacheKey);
-    if (cachedResp && cachedResp.formatted_answer) {
-      return res.json({ ...cachedResp, cached: true });
-    }
     // helpers: unified single-run that wraps existing logic (see runUnifiedOnce below)
     // NEW: Always-on planner to split into subqueries
     const planStart = Date.now();
     const planLLM = await planSubqueriesLLM(query).catch(() => ({
       subqueries: [],
     }));
-    const subqueriesRaw = (planLLM?.subqueries || []).filter((s) => s?.query);
-    const seenSQ = new Set();
-    const subqueries = [];
-    for (const sq of subqueriesRaw) {
-      const key = sq.query.trim().toLowerCase();
-      if (seenSQ.has(key)) continue;
-      seenSQ.add(key);
-      subqueries.push(sq);
-      if (subqueries.length >= 6) break;
-    }
+    const subqueries = (planLLM?.subqueries || []).filter((s) => s?.query);
     console.log(`Planning took ${Date.now() - planStart}ms`);
 
     // Parallel execution with limited concurrency in fast mode
@@ -5745,44 +5646,17 @@ app.post("/api/agentic-v2", async (req, res) => {
         }
 
         const budget = opts.fast
-          ? Math.min(12, opts.maxWeb ?? 50)
+          ? Math.min(6, opts.maxWeb ?? 50)
           : complex
-          ? Math.min(40, opts.maxWeb ?? 50)
+          ? opts.maxWeb ?? 50
           : Math.min(20, opts.maxWeb ?? 50);
-        const candidateLinks = allSerpOrganic
+        const topLinks = allSerpOrganic
           .slice(0, budget)
           .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
 
-        // Snippet-first rerank: use Cohere on snippets/titles before any scraping
-        let fetchSet = candidateLinks;
-        try {
-          const items = candidateLinks.map((c) => ({
-            text: `${c.title}\n${c.snippet || ""}`,
-          }));
-          const rr = await rerankWithCohere(
-            userQuery,
-            items,
-            Math.min(opts.fast ? 6 : 12, items.length)
-          );
-          if (Array.isArray(rr) && rr.length) {
-            const topIdx = rr.map((r) => r.index);
-            fetchSet = topIdx.map((i) => candidateLinks[i]);
-          } else {
-            fetchSet = candidateLinks.slice(
-              0,
-              Math.min(opts.fast ? 6 : 12, candidateLinks.length)
-            );
-          }
-        } catch {
-          fetchSet = candidateLinks.slice(
-            0,
-            Math.min(opts.fast ? 6 : 12, candidateLinks.length)
-          );
-        }
-
         // Parallel page fetching with aggressive timeout in fast mode
         const fetchTimeout = opts.fast ? 1500 : 3000;
-        const pageFetchPromises = fetchSet.map((l) =>
+        const pageFetchPromises = topLinks.map((l) =>
           fetchPageTextFast(l.link, fetchTimeout)
         );
         pages = (await Promise.all(pageFetchPromises)).filter(Boolean);
@@ -6756,7 +6630,7 @@ ${context}
 
         // Compose response: concatenate sections via composeSections
         const blocks = valid.map((r, i) => ({
-          title: `${subqueries[i]?.query || query}`,
+          title: `Result — ${subqueries[i]?.query || query}`,
           body: r.formatted_answer,
           sources: r.sources || [],
         }));
@@ -6841,7 +6715,7 @@ ${context}
             .slice(0, 24);
           const normNews = newsArr.slice(0, 24);
 
-          const payload = {
+          return res.json({
             formatted_answer,
             sources,
             images: imagesFromRuns.length ? imagesFromRuns : normImages,
@@ -6849,19 +6723,15 @@ ${context}
             news: normNews,
             plan: { subqueries },
             last_fetched: new Date().toISOString(),
-          };
-          persistentSet(cacheKey, payload, 24 * 60 * 60).catch(() => {});
-          return res.json(payload);
+          });
         } catch (e) {
-          const payload = {
+          return res.json({
             formatted_answer,
             sources,
             images: imagesFromRuns,
             plan: { subqueries },
             last_fetched: new Date().toISOString(),
-          };
-          persistentSet(cacheKey, payload, 24 * 60 * 60).catch(() => {});
-          return res.json(payload);
+          });
         }
       }
     }
@@ -6888,14 +6758,12 @@ ${context}
       }
 
       if (mergedChunks.length === 0) {
-        const payload = {
+        return res.json({
           formatted_answer: "I couldn't fetch enough content for this query.",
           sources: [],
           images: [],
           last_fetched: new Date().toISOString(),
-        };
-        persistentSet(cacheKey, payload, 60 * 60).catch(() => {});
-        return res.json(payload);
+        });
       }
 
       const allTexts = [
@@ -7106,7 +6974,7 @@ ${contextInf}
           ? ex.run.formatted_answer
           : ex.run.formatted_answer +
             `\n\n*Note:* I filtered by place/date; not enough verified local items were fast to fetch. Use Arsenal → Deep Research to dig deeper.`;
-  blocks.push({ title, body, sources: ex.run.sources });
+        blocks.push({ title, body, sources: ex.run.sources });
       } else if (t.kind === "transcript") {
         const title = `${t.title} — Transcript (${t.year || ""})`;
         const addNote = !ex.verified.ok
@@ -7119,34 +6987,14 @@ ${contextInf}
         });
       } else {
         blocks.push({
-          title: `${t.query}`,
+          title: `Result — ${t.query}`,
           body: ex.run.formatted_answer,
           sources: ex.run.sources,
         });
       }
     }
 
-    let formatted_answer = composeSections(blocks);
-    if (!formatted_answer || formatted_answer.trim().length === 0) {
-      // Fallback: synthesize minimal answer from fused facts
-      const lines = [];
-      for (const ex of execs) {
-        const srcs = (ex.run.sources || []).slice(0, 5);
-        const heading = ex.task?.query || ex.task?.title || "Result";
-        lines.push(`\n#### ${heading}\n`);
-        const snippet = (ex.run.rawTop?.[0]?.chunk?.text || "").slice(0, 500);
-        lines.push(snippet || "No answer generated; see sources below.");
-        if (srcs.length) {
-          lines.push(
-            `\n**Sources:** ` +
-              srcs
-                .map((s) => `[${s.title || new URL(s.url).hostname}](${s.url})`)
-                .join(" · ")
-          );
-        }
-      }
-      formatted_answer = lines.join("\n");
-    }
+    const formatted_answer = composeSections(blocks);
     const sources = execs.flatMap((ex) => ex.run.sources).slice(0, 15);
     const imagesFromRuns = execs
       .flatMap((ex) => ex.run.images || [])
@@ -7185,6 +7033,24 @@ ${contextInf}
           };
 
     // Fetch verticals in parallel to include images/videos/news/shopping/short_videos
+    // Skip slow verticals in fast mode
+    if (fast) {
+      console.log("Fast mode: skipping slow verticals");
+      return res.json({
+        formatted_answer,
+        sources,
+        images: imagesFromRuns,
+        videos: [],
+        news: [],
+        shopping: [],
+        short_videos: [],
+        plan: plans,
+        contacts,
+        verification,
+        last_fetched: new Date().toISOString(),
+      });
+    }
+
     try {
       const vert = await Promise.allSettled([
         (async () => {
@@ -7337,117 +7203,7 @@ ${contextInf}
   }
 });
 
-// --- SSE streaming for agentic-v2 ---
-app.get("/api/agentic-v2/stream", async (req, res) => {
-  const query = String(req.query.query || "").trim();
-  const fast = String(req.query.fast || "false").toLowerCase() === "true";
-  const verify = String(req.query.verify || "true").toLowerCase() !== "false";
-  const maxWeb = Number(req.query.maxWeb || 50) || 50;
-  const topChunks = Number(req.query.topChunks || 15) || 15;
-  if (!query) return res.status(400).end();
-
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
-  const ping = setInterval(() => {
-    try {
-      res.write(`event: ping\n`);
-      res.write(`data: {}\n\n`);
-    } catch {}
-  }, 15000);
-  const close = () => clearInterval(ping);
-  req.on("close", close);
-
-  const send = (type, payload) => {
-    try {
-      res.write(`event: ${type}\n`);
-      res.write(`data: ${JSON.stringify(payload)}\n\n`);
-    } catch {}
-  };
-
-  try {
-    const planLLM = await planSubqueriesLLM(query).catch(() => ({
-      subqueries: [],
-    }));
-    const subqueries = (planLLM?.subqueries || []).filter((s) => s?.query);
-    send("plan", { subqueries });
-
-    // Early retrieval + fused preview per subquery (lightweight, cached)
-    const subs = subqueries.length ? subqueries : [{ query }];
-    for (const sq of subs) {
-      try {
-        const data = await searchSerpCached("google", sq.query, {}, 6000);
-        const org = (data?.organic_results || []).slice(0, fast ? 4 : 8);
-        send("retrieval", {
-          query: sq.query,
-          results: org.map((r) => ({
-            title: r.title,
-            url: r.link,
-            snippet: r.snippet,
-          })),
-        });
-        const toGrab = org.slice(0, Math.min(3, org.length));
-        const fetched = await Promise.allSettled(
-          toGrab.map((r) => fetchPageTextFast(r.link))
-        );
-        const top = fetched
-          .filter((x) => x.status === "fulfilled" && x.value && x.value.text)
-          .map((x) => x.value)
-          .map((p) => ({
-            chunk: {
-              id: crypto.randomUUID(),
-              text: String(p.text || "").slice(0, 1600),
-              source: { type: "web", url: p.url, title: p.title },
-            },
-            score: 0,
-          }));
-        if (top.length) {
-          const fusion = await buildFusedContext(sq.query, top, {
-            maxBullets: fast ? 16 : 24,
-          });
-          send("fused", {
-            fusedText: fusion.fusedText.slice(0, 1800),
-            sourceMap: fusion.sourceMap,
-          });
-        }
-      } catch {}
-    }
-
-    // Early token stream draft (perceived speed)
-    try {
-      if (process.env.OPENAI_API_KEY) {
-        const draftPrompt = `Write 1-2 sentence preview answer for: "${query}". Keep it neutral and helpful.`;
-        await streamOpenAIChat({
-          model: process.env.LLM_SIMPLE?.includes(":")
-            ? process.env.LLM_SIMPLE.split(":")[1]
-            : "gpt-4o-mini",
-          prompt: draftPrompt,
-          onDelta: (d) => send("delta", { text: d }),
-        });
-        send("delta_done", {});
-      }
-    } catch {}
-
-    // Compute final answer via internal sync endpoint
-    const base = process.env.SELF_BASE_URL || "http://localhost:10000";
-    const finalResp = await axios
-      .post(
-        `${base}/api/agentic-v2`,
-        { query, fast, verify, maxWeb, topChunks },
-        { headers: { "Content-Type": "application/json" } }
-      )
-      .catch((e) => ({
-        data: { formatted_answer: "", sources: [], plan: { subqueries } },
-      }));
-    const payload = finalResp?.data || { formatted_answer: "" };
-    send("final", payload);
-    res.end();
-  } catch (e) {
-    send("error", { error: e?.message || String(e) });
-    res.end();
-  }
-});
+// (Removed) SSE streaming endpoint for agentic-v2
 
 // Speculative prefetch to warm caches
 app.post("/api/agentic-v2/prefetch", async (req, res) => {
