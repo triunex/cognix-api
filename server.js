@@ -292,7 +292,6 @@ class SimpleCache {
 const serpCache = new SimpleCache(400, 5 * 60 * 1000);
 const pageCache = new SimpleCache(400, 10 * 60 * 1000);
 const embedCache = new SimpleCache(3000, 60 * 60 * 1000);
-const verificationCache = new SimpleCache(1000, 10 * 60 * 1000);
 
 // Optional Redis persistent cache (fallback to in-memory if unavailable)
 let redis = null;
@@ -322,37 +321,6 @@ async function persistentGet(key) {
   } catch {
     return null;
   }
-}
-
-// --- Simple background job helpers ---
-function newJobId(prefix = "job") {
-  try {
-    return `${prefix}_${crypto.randomUUID()}`;
-  } catch {
-    return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  }
-}
-
-// --- SSE helpers (top-level, reusable) ---
-function sseStart(res) {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
-  const ping = setInterval(() => {
-    try {
-      res.write(`event: ping\n`);
-      res.write(`data: {}\n\n`);
-    } catch {}
-  }, 15000);
-  const stop = () => clearInterval(ping);
-  return stop;
-}
-function sseSend(res, type, payload) {
-  try {
-    res.write(`event: ${type}\n`);
-    res.write(`data: ${JSON.stringify(payload)}\n\n`);
-  } catch {}
 }
 async function persistentSet(key, value, ttlSec) {
   if (!redis) return false;
@@ -7102,9 +7070,7 @@ ${contextInf}
     const verifications = execs
       .map((ex) => ex.run.verification)
       .filter(Boolean);
-    // Queue background verification (first result) and return job id now
-    const verificationJobId = newJobId("verify");
-    const baseVerify =
+    const verification =
       verifications.length > 0
         ? verifications[0]
         : {
@@ -7114,36 +7080,6 @@ ${contextInf}
             needs_retry: false,
             refinements: [],
           };
-    verificationCache.set(verificationJobId, {
-      status: "queued",
-      result: baseVerify,
-      created_at: Date.now(),
-    });
-    // Fire-and-forget: recompute with full context and update cache
-    (async () => {
-      try {
-        const mergedText = blocks.map((b) => b.body).join("\n\n");
-        const allSources = sources || [];
-        const v = await verifyAnswerLLM({
-          query,
-          answer: mergedText,
-          fusedText: "",
-          sourceMap: "",
-          sources: allSources,
-        });
-        verificationCache.set(verificationJobId, {
-          status: "done",
-          result: v,
-          updated_at: Date.now(),
-        });
-      } catch (e) {
-        verificationCache.set(verificationJobId, {
-          status: "error",
-          error: e?.message || String(e),
-          updated_at: Date.now(),
-        });
-      }
-    })();
 
     // Fetch verticals in parallel to include images/videos/news/shopping/short_videos
     // Skip slow verticals in fast mode
@@ -7159,7 +7095,7 @@ ${contextInf}
         short_videos: [],
         plan: plans,
         contacts,
-        verification_job_id: verificationJobId,
+        verification,
         last_fetched: new Date().toISOString(),
       });
     }
@@ -7292,7 +7228,7 @@ ${contextInf}
         short_videos: normShort,
         plan: plans,
         contacts,
-        verification_job_id: verificationJobId,
+        verification,
         last_fetched: new Date().toISOString(),
       });
     } catch (e) {
@@ -7317,92 +7253,6 @@ ${contextInf}
 });
 
 // (Removed) SSE streaming endpoint for agentic-v2
-// Background verification status
-app.get("/api/agentic-v2/verification/:id", (req, res) => {
-  const id = req.params.id;
-  const rec = verificationCache.get(id);
-  if (!rec) return res.status(404).json({ error: "not-found" });
-  return res.json(rec);
-});
-
-// SSE streaming: progressively send stages for agentic-v2
-app.post("/api/agentic-v2/stream", async (req, res) => {
-  const stop = sseStart(res);
-  try {
-    const { query, maxWeb = 30, topChunks = 12, fast = true } = req.body || {};
-    if (!query) {
-      sseSend(res, "error", { error: "Missing query" });
-      return res.end();
-    }
-    sseSend(res, "init", { query, fast });
-
-    // Plan (non-blocking if no key)
-    const plan = await planSubqueriesLLM(query).catch(() => ({ subqueries: [] }));
-    sseSend(res, "plan", { subqueries: plan.subqueries || [] });
-
-    // Kick retrieval
-    const start = Date.now();
-    const run = await (async () => {
-      const r = await (await Promise.resolve()).then(() =>
-        (async () =>
-          await (async function(userQuery){
-            return await (await Promise.resolve()).then(() =>
-              // reuse runUnifiedOnce via wrapper since it's scoped; re-call main endpoint quickly
-              axios
-                .post(`${process.env.SELF_BASE_URL || "http://localhost:10000"}/api/agentic-v2`,
-                  { query: userQuery, maxWeb, topChunks, fast, verify: false },
-                  { headers: { "Content-Type": "application/json" } }
-                )
-                .then((r) => r.data)
-            );
-          })(query)
-        )
-      );
-      return r;
-    })();
-    sseSend(res, "answer", {
-      formatted_answer: run.formatted_answer,
-      sources: run.sources || [],
-      images: run.images || [],
-      elapsed_ms: Date.now() - start,
-    });
-
-    // Queue verification in background and stream job id
-    const vId = newJobId("verify");
-    verificationCache.set(vId, { status: "queued", created_at: Date.now() });
-    sseSend(res, "verification", { job_id: vId });
-    (async () => {
-      try {
-        const v = await verifyAnswerLLM({
-          query,
-          answer: run.formatted_answer || "",
-          fusedText: "",
-          sourceMap: "",
-          sources: run.sources || [],
-        });
-        verificationCache.set(vId, {
-          status: "done",
-          result: v,
-          updated_at: Date.now(),
-        });
-        sseSend(res, "verification_result", { job_id: vId, result: v });
-      } catch (e) {
-        verificationCache.set(vId, {
-          status: "error",
-          error: e?.message || String(e),
-          updated_at: Date.now(),
-        });
-      } finally {
-        try { res.end(); } catch {}
-      }
-    })();
-  } catch (e) {
-    sseSend(res, "error", { error: e?.message || String(e) });
-    try { res.end(); } catch {}
-  } finally {
-    stop();
-  }
-});
 
 // Speculative prefetch to warm caches
 app.post("/api/agentic-v2/prefetch", async (req, res) => {
