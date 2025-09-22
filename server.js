@@ -1198,13 +1198,77 @@ async function searchTwitterRecent(query, maxResults = 5) {
   }
 }
 
+// Reddit OAuth (userless) helper with simple in-memory cache
+let __redditToken = null;
+let __redditTokenExpiry = 0;
+async function getRedditAccessToken() {
+  const id = process.env.REDDIT_CLIENT_ID;
+  const secret = process.env.REDDIT_CLIENT_SECRET;
+  if (!id || !secret) return null;
+  const now = Date.now();
+  if (__redditToken && now < __redditTokenExpiry - 5000) {
+    return __redditToken;
+  }
+  try {
+    const basic = Buffer.from(`${id}:${secret}`).toString("base64");
+    const resp = await axios.post(
+      "https://www.reddit.com/api/v1/access_token",
+      new URLSearchParams({ grant_type: "client_credentials" }).toString(),
+      {
+        headers: {
+          Authorization: `Basic ${basic}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": "NelieoAI/1.0 (userless)"
+        },
+        timeout: 8000,
+      }
+    );
+    const tok = resp.data?.access_token;
+    const ttl = (resp.data?.expires_in || 3600) * 1000;
+    if (tok) {
+      __redditToken = tok;
+      __redditTokenExpiry = Date.now() + Math.max(60000, ttl);
+      return __redditToken;
+    }
+  } catch (e) {
+    console.warn("Reddit OAuth token fetch failed:", e?.message || e);
+  }
+  return null;
+}
+
 async function searchReddit(query, maxResults = 6) {
   try {
-    const resp = await axios.get(
-      `https://www.reddit.com/search.json?q=${encodeURIComponent(
-        query
-      )}&limit=${maxResults}&sort=relevance`
-    );
+    let resp = null;
+    // Prefer OAuth API if credentials are provided
+    const token = await getRedditAccessToken();
+    if (token) {
+      try {
+        resp = await axios.get("https://oauth.reddit.com/search", {
+          params: {
+            q: query,
+            limit: maxResults,
+            sort: "relevance",
+            type: "link",
+            raw_json: 1,
+          },
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "User-Agent": "NelieoAI/1.0 (userless)",
+          },
+          timeout: 8000,
+        });
+      } catch (e) {
+        console.warn("Reddit OAuth search failed, falling back:", e?.message || e);
+      }
+    }
+    if (!resp) {
+      resp = await axios.get(
+        `https://www.reddit.com/search.json?q=${encodeURIComponent(
+          query
+        )}&limit=${maxResults}&sort=relevance`,
+        { headers: { "User-Agent": "NelieoAI/1.0" }, timeout: 8000 }
+      );
+    }
 
     // ---------------- Deep Research SSE (Server-Sent Events) ----------------
     function sseInit(res) {
