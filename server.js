@@ -23,16 +23,6 @@ dotenv.config();
 
 const app = express();
 
-// --- Core speed knobs (Week 1) ---
-// Aggressive network timeouts for retrieval to keep TTFB low
-const FAST_TIMEOUT_MS = Number(process.env.FAST_TIMEOUT_MS || 1500);
-const FAST_TIMEOUT_LONG_MS = Math.max(FAST_TIMEOUT_MS, 2000);
-// Helper to clamp axios timeout options consistently
-function fastTimeout(ms) {
-  const n = Number(ms || FAST_TIMEOUT_MS);
-  return Math.min(Math.max(200, n), 2000);
-}
-
 // --- Arsenal config store (simple in-memory map; replace with DB later) ---
 const arsenalStore = new Map(); // key: userId, value: ArsenalConfig
 // --- User instructions store (persisted to disk as a lightweight fallback) ---
@@ -359,7 +349,7 @@ async function searchSerpCached(engine, q, params = {}, timeoutMs = 6000) {
   try {
     const resp = await axios.get("https://serpapi.com/search", {
       params: { engine, q, api_key: apiKey, ...params },
-      timeout: fastTimeout(timeoutMs),
+      timeout: timeoutMs,
     });
     serpCache.set(key, resp.data);
     persistentSet(rkey, resp.data, 300).catch(() => {});
@@ -375,7 +365,7 @@ async function fetchPageText(url) {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
       },
-      timeout: fastTimeout(FAST_TIMEOUT_MS),
+      timeout: 12000,
     });
     const parsed = unfluff(resp.data || "");
     const text = (parsed.text || "").trim();
@@ -1194,10 +1184,7 @@ async function searchTwitterRecent(query, maxResults = 5) {
       `https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(
         query
       )}&tweet.fields=created_at,author_id,text&expansions=author_id&max_results=${maxResults}`,
-      {
-        headers: { Authorization: `Bearer ${process.env.TWITTER_BEARER}` },
-        timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
-      }
+      { headers: { Authorization: `Bearer ${process.env.TWITTER_BEARER}` } }
     );
     const tweets = (resp.data?.data || []).map((t) => ({
       id: t.id,
@@ -1231,9 +1218,9 @@ async function getRedditAccessToken() {
         headers: {
           Authorization: `Basic ${basic}`,
           "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": "NelieoAI/1.0 (userless)",
+          "User-Agent": "NelieoAI/1.0 (userless)"
         },
-        timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
+        timeout: 8000,
       }
     );
     const tok = resp.data?.access_token;
@@ -1268,13 +1255,10 @@ async function searchReddit(query, maxResults = 6) {
             Authorization: `Bearer ${token}`,
             "User-Agent": "NelieoAI/1.0 (userless)",
           },
-          timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
+          timeout: 8000,
         });
       } catch (e) {
-        console.warn(
-          "Reddit OAuth search failed, falling back:",
-          e?.message || e
-        );
+        console.warn("Reddit OAuth search failed, falling back:", e?.message || e);
       }
     }
     if (!resp) {
@@ -1282,7 +1266,7 @@ async function searchReddit(query, maxResults = 6) {
         `https://www.reddit.com/search.json?q=${encodeURIComponent(
           query
         )}&limit=${maxResults}&sort=relevance`,
-        { headers: { "User-Agent": "NelieoAI/1.0" }, timeout: fastTimeout(FAST_TIMEOUT_LONG_MS) }
+        { headers: { "User-Agent": "NelieoAI/1.0" }, timeout: 8000 }
       );
     }
 
@@ -1848,7 +1832,7 @@ async function runExtraSearches(
     axios
       .get("https://serpapi.com/search.json", {
         params: { engine, q: query, api_key: serpApiKey },
-        timeout: fastTimeout(FAST_TIMEOUT_MS),
+        timeout: 8000,
       })
       .then((r) => r.data)
       .catch((e) => null)
@@ -1863,7 +1847,7 @@ async function searchWikipedia(query) {
     const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
       query
     )}&format=json&origin=*`;
-  const resp = await axios.get(url, { timeout: fastTimeout(FAST_TIMEOUT_LONG_MS) });
+    const resp = await axios.get(url, { timeout: 6000 });
     return (resp.data?.query?.search || []).map((s) => ({
       title: s.title,
       snippet: s.snippet,
@@ -1883,7 +1867,7 @@ async function searchYouTube(query, maxResults = 4) {
     const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(
       query
     )}&type=video&maxResults=${maxResults}&key=${key}`;
-  const searchRes = await axios.get(searchUrl, { timeout: fastTimeout(FAST_TIMEOUT_LONG_MS) });
+    const searchRes = await axios.get(searchUrl, { timeout: 8000 });
     const items = searchRes.data.items || [];
     // For each video, fetch snippet details (title, description)
     return items.map((it) => ({
@@ -1917,7 +1901,7 @@ async function searchInstagramPublic(query, maxResults = 4) {
     for (const url of engines.slice(0, maxResults)) {
       try {
         const resp = await axios.get(url, {
-          timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
+          timeout: 8000,
           headers: { "User-Agent": "Mozilla/5.0" },
         });
         const html = resp.data || "";
@@ -1952,9 +1936,8 @@ async function fetchPageTextFast(url, timeoutMs = null) {
     const c = pageCache.get(url);
     if (c) return c;
 
-    const timeout = fastTimeout(
-      timeoutMs || Number(process.env.FAST_FETCH_TIMEOUT_MS || FAST_TIMEOUT_MS)
-    );
+    const timeout =
+      timeoutMs || Number(process.env.FAST_FETCH_TIMEOUT_MS || 2500);
     const resp = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
       timeout,
@@ -2152,10 +2135,12 @@ app.post("/api/search", async (req, res) => {
       .join("\n\n");
 
     const prompt = `
-You're an intelligent assistant. Use the search results below to answer the user's question clearly and helpfully. If needed, combine concise synthesis with key bullets.
-Keep it readable and structured with short paragraphs and simple bullet points when helpful.
-Don't mention sources or links in the text.
-Avoid using hashtags (#) or decorative markdown symbols.
+You're an intelligent assistant. Use the search results below to answer the user's question *clearly and helpfully*, even if not all results are directly relevant. 
+If needed, combine your own knowledge with the web results.
+Give Great easy to understand and slightly big answers.
+If anyone want a paragraph , Summary, Research , do that all.
+Don't mention about any sources or links.
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
 
 
 Question: "${query}"
@@ -2163,7 +2148,10 @@ Question: "${query}"
 Search Results:
 ${context}
 
-Answer in a friendly, concise tone. Prefer short paragraphs or brief bullet points for key facts. Avoid hashtags and decorative symbols.
+Answer in a friendly, helpful tone:
+Answer clearly, concisely, and professionally.
+Talk in very Friendly way.
+Avoid using hashtags (#), asterisks (*), or markdown symbols.
 `;
 
     const geminiResponse = await axios.post(
@@ -5693,12 +5681,7 @@ app.post("/api/agentic-v2", async (req, res) => {
       while (attempts < 3 && confidence < 0.85) {
         const [serpResp, tw, rd, yt, wp] = await Promise.all([
           (async () => {
-            const data = await searchSerpCached(
-              "google",
-              userQuery,
-              {},
-              FAST_TIMEOUT_MS
-            );
+            const data = await searchSerpCached("google", userQuery, {}, 6000);
             return { data: data || { organic_results: [] } };
           })(),
           searchTwitterRecent(userQuery, 6),
@@ -5713,19 +5696,20 @@ app.post("/api/agentic-v2", async (req, res) => {
         );
         allSerpOrganic = allSerpOrganic.concat(organic);
 
-        // Kick off extra engines in parallel but do not block the loop long
-        const extraPromise = runExtraSearches(userQuery, [
-          "bing",
-          "duckduckgo",
-        ])
-          .then((extra) => {
-            for (const e of extra || [])
-              if (e?.organic_results)
-                allSerpOrganic = allSerpOrganic.concat(
-                  e.organic_results.slice(0, 5)
-                );
-          })
-          .catch(() => {});
+        if (
+          !opts.fast &&
+          (organic.length < 5 || !strongEntityMatch(userQuery, organic))
+        ) {
+          const extra = await runExtraSearches(userQuery, [
+            "bing",
+            "duckduckgo",
+          ]);
+          for (const e of extra)
+            if (e?.organic_results)
+              allSerpOrganic = allSerpOrganic.concat(
+                e.organic_results.slice(0, 5)
+              );
+        }
 
         const budget = opts.fast
           ? Math.min(6, opts.maxWeb ?? 50)
@@ -5737,12 +5721,11 @@ app.post("/api/agentic-v2", async (req, res) => {
           .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
 
         // Parallel page fetching with aggressive timeout in fast mode
-        const fetchTimeout = FAST_TIMEOUT_MS;
+        const fetchTimeout = opts.fast ? 1500 : 3000;
         const pageFetchPromises = topLinks.map((l) =>
           fetchPageTextFast(l.link, fetchTimeout)
         );
         pages = (await Promise.all(pageFetchPromises)).filter(Boolean);
-        await extraPromise; // fold in extras if they arrived
         tweets = tw || [];
         reddit = rd || [];
         youtube = yt || [];
@@ -5880,7 +5863,7 @@ app.post("/api/agentic-v2", async (req, res) => {
       });
       const context = [fusion.fusedText, "", fusion.sourceMap].join("\n\n");
 
-      const systemPrompt = `You are Nelieo AI — an agentic search assistant that adapts length, structure, and tone to the user's query.
+  const systemPrompt = `You are Nelieo AI — an agentic search assistant that adapts length, structure, and tone to the user's query.
 
 Adaptive formatting rules:
 - Always answer in polished Markdown.
@@ -5903,7 +5886,7 @@ Constraints:
 
 Goal: Be helpful and fast. Prefer brevity unless the question clearly needs depth.`;
 
-      const finalPrompt = `
+  const finalPrompt = `
 ${systemPrompt}
 
 Task: Answer the user's question with adaptive length and beautiful structure.
@@ -6247,7 +6230,7 @@ ${context}
                   q,
                   api_key: process.env.SERPAPI_API_KEY,
                 },
-                timeout: fastTimeout(Math.min(FAST_TIMEOUT_MS, timeLeft())),
+                timeout: Math.min(10000, timeLeft()),
               }),
               Math.min(11000, timeLeft())
             );
@@ -6268,7 +6251,7 @@ ${context}
               q
             )}&start=0&max_results=${n}`;
             const resp = await withTimeout(
-              axios.get(url, { timeout: fastTimeout(Math.min(FAST_TIMEOUT_MS, timeLeft())) }),
+              axios.get(url, { timeout: Math.min(10000, timeLeft()) }),
               Math.min(11000, timeLeft())
             );
             const xml = resp?.data || "";
@@ -6319,9 +6302,9 @@ ${context}
                       "google",
                       qNow,
                       {},
-                      fastTimeout(Math.min(FAST_TIMEOUT_MS, timeLeft()))
+                      Math.min(8000, timeLeft())
                     ),
-                    fastTimeout(Math.min(FAST_TIMEOUT_LONG_MS, timeLeft()))
+                    Math.min(9000, timeLeft())
                   );
                   const org = (data?.organic_results || []).slice(0, maxWeb);
                   pushUnique(serpOrganic, org, (r) => normalizeUrl(r.link));
