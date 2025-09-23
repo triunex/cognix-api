@@ -23,6 +23,16 @@ dotenv.config();
 
 const app = express();
 
+// --- Core speed knobs (Week 1) ---
+// Aggressive network timeouts for retrieval to keep TTFB low
+const FAST_TIMEOUT_MS = Number(process.env.FAST_TIMEOUT_MS || 1500);
+const FAST_TIMEOUT_LONG_MS = Math.max(FAST_TIMEOUT_MS, 2000);
+// Helper to clamp axios timeout options consistently
+function fastTimeout(ms) {
+  const n = Number(ms || FAST_TIMEOUT_MS);
+  return Math.min(Math.max(200, n), 2000);
+}
+
 // --- Arsenal config store (simple in-memory map; replace with DB later) ---
 const arsenalStore = new Map(); // key: userId, value: ArsenalConfig
 // --- User instructions store (persisted to disk as a lightweight fallback) ---
@@ -349,7 +359,7 @@ async function searchSerpCached(engine, q, params = {}, timeoutMs = 6000) {
   try {
     const resp = await axios.get("https://serpapi.com/search", {
       params: { engine, q, api_key: apiKey, ...params },
-      timeout: timeoutMs,
+      timeout: fastTimeout(timeoutMs),
     });
     serpCache.set(key, resp.data);
     persistentSet(rkey, resp.data, 300).catch(() => {});
@@ -365,7 +375,7 @@ async function fetchPageText(url) {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
       },
-      timeout: 12000,
+      timeout: fastTimeout(FAST_TIMEOUT_MS),
     });
     const parsed = unfluff(resp.data || "");
     const text = (parsed.text || "").trim();
@@ -396,7 +406,7 @@ async function planSubqueriesLLM(userQuery = "") {
     return out;
   }
 
-  const prompt = `You are a precise query planner. Split the user's query into 1–6 focused subqueries that together fully cover the intent. Return JSON ONLY with this schema:
+  const prompt = `You are a precise query planner. Split the user's query into 1–6 focused subqueries that together fully cover the user's explicit intent ONLY. Return JSON ONLY with this schema:
 {
   "subqueries": [
     { "query": "<searchable subquery>", "rationale": "<why include>", "priority": <1..5> }
@@ -405,7 +415,10 @@ async function planSubqueriesLLM(userQuery = "") {
 
 Rules:
 - Keep each subquery specific and disjoint where possible.
-- Include at least 1 subquery even if the query is simple.
+- STRICT: Do NOT introduce new scopes beyond the user's words (no pricing, tutorials, code, SQL, database, API, jobs, roadmap, alternatives, news, timeline, vs/compare) unless such terms appear in the query.
+- If the query is a single name or has ≤ 3 tokens and doesn't request comparison/timeline/news/how/why/versus, return EXACTLY ONE subquery identical to the query.
+- Do not infer modalities or implementations; never produce code or SQL tasks.
+- Keep minimal coverage; fewer is better if complete.
 - Do not include extra text outside JSON.
 User query: """${q}"""`;
 
@@ -422,7 +435,7 @@ User query: """${q}"""`;
       try {
         const parsed = JSON.parse(raw.slice(s, e + 1));
         if (Array.isArray(parsed?.subqueries) && parsed.subqueries.length) {
-          out.subqueries = parsed.subqueries
+          const prelim = parsed.subqueries
             .slice(0, 6)
             .map((sq, i) => ({
               query: String(sq?.query || "").trim() || q,
@@ -432,6 +445,97 @@ User query: """${q}"""`;
                 : Math.min(5, i + 1),
             }))
             .filter((sq) => sq.query);
+
+          // Sanitize to keep subqueries strictly within user intent
+          const sanitize = (query, subs) => {
+            const base = String(query || "").toLowerCase();
+            const baseWords = new Set(
+              base
+                .replace(/[^a-z0-9\s]/g, " ")
+                .split(/\s+/)
+                .filter(Boolean)
+            );
+            const tokenCount = Array.from(baseWords).length;
+            const has = (w) => base.includes(w);
+            const bannedIfMissing = [
+              "sql",
+              "select",
+              "update",
+              "insert",
+              "delete",
+              "database",
+              "code",
+              "implementation",
+              "tutorial",
+              "guide",
+              "api",
+              "pricing",
+              "jobs",
+              "salary",
+              "download",
+              "install",
+              "github",
+              "roadmap",
+              "features",
+              "alternative",
+              "alternatives",
+              "timeline",
+              "news",
+            ];
+            const allowCompare = has(" vs ") || has(" versus ") || has("compare");
+            const allowNews = has("news") || /\b20\d{2}\b/.test(base);
+            const allowTimeline = has("timeline");
+            const allowHowWhy = has("how ") || has("why ");
+
+            // If trivially short and not asking for expansion, force single identical subquery
+            if (tokenCount <= 3 && !(allowCompare || allowNews || allowTimeline || allowHowWhy)) {
+              return [{ query, rationale: "Single short query", priority: 1 }];
+            }
+
+            const cleaned = [];
+            for (const s of subs) {
+              const sq = String(s.query || "").trim();
+              if (!sq) continue;
+              const lower = sq.toLowerCase();
+              // Drop if introduces banned terms not in base
+              let bad = false;
+              for (const bw of bannedIfMissing) {
+                if (lower.includes(bw) && !base.includes(bw)) {
+                  if (bw === "news" && allowNews) continue;
+                  bad = true;
+                  break;
+                }
+              }
+              if (bad) continue;
+              // Drop compare/vs unless present in base
+              if (!allowCompare && /(\bvs\b|\bversus\b|\bcompare\b)/.test(lower)) continue;
+              // Drop timeline unless present
+              if (!allowTimeline && /\btimeline\b/.test(lower)) continue;
+              // Strongly prefer subqueries that are close to the original terms
+              const lowerWords = new Set(
+                lower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean)
+              );
+              const extras = Array.from(lowerWords).filter((w) => !baseWords.has(w));
+              if (extras.length > 2) continue; // too much scope creep
+              // Keep it reasonably short
+              if (sq.length > Math.max(140, q.length * 2)) continue;
+              cleaned.push({ ...s, query: sq });
+            }
+            // Ensure at least original query present and first
+            const uniq = new Map();
+            const ordered = [
+              { query, rationale: "Original query", priority: 1 },
+              ...cleaned,
+            ].filter((s) => {
+              const key = s.query.toLowerCase();
+              if (uniq.has(key)) return false;
+              uniq.set(key, true);
+              return true;
+            });
+            return ordered.slice(0, 3); // keep minimal
+          };
+
+          out.subqueries = sanitize(q, prelim);
         }
       } catch {}
     }
@@ -1184,7 +1288,10 @@ async function searchTwitterRecent(query, maxResults = 5) {
       `https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(
         query
       )}&tweet.fields=created_at,author_id,text&expansions=author_id&max_results=${maxResults}`,
-      { headers: { Authorization: `Bearer ${process.env.TWITTER_BEARER}` } }
+      {
+        headers: { Authorization: `Bearer ${process.env.TWITTER_BEARER}` },
+        timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
+      }
     );
     const tweets = (resp.data?.data || []).map((t) => ({
       id: t.id,
@@ -1218,9 +1325,9 @@ async function getRedditAccessToken() {
         headers: {
           Authorization: `Basic ${basic}`,
           "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": "NelieoAI/1.0 (userless)"
+          "User-Agent": "NelieoAI/1.0 (userless)",
         },
-        timeout: 8000,
+        timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
       }
     );
     const tok = resp.data?.access_token;
@@ -1255,10 +1362,13 @@ async function searchReddit(query, maxResults = 6) {
             Authorization: `Bearer ${token}`,
             "User-Agent": "NelieoAI/1.0 (userless)",
           },
-          timeout: 8000,
+          timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
         });
       } catch (e) {
-        console.warn("Reddit OAuth search failed, falling back:", e?.message || e);
+        console.warn(
+          "Reddit OAuth search failed, falling back:",
+          e?.message || e
+        );
       }
     }
     if (!resp) {
@@ -1266,7 +1376,10 @@ async function searchReddit(query, maxResults = 6) {
         `https://www.reddit.com/search.json?q=${encodeURIComponent(
           query
         )}&limit=${maxResults}&sort=relevance`,
-        { headers: { "User-Agent": "NelieoAI/1.0" }, timeout: 8000 }
+        {
+          headers: { "User-Agent": "NelieoAI/1.0" },
+          timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
+        }
       );
     }
 
@@ -1832,7 +1945,7 @@ async function runExtraSearches(
     axios
       .get("https://serpapi.com/search.json", {
         params: { engine, q: query, api_key: serpApiKey },
-        timeout: 8000,
+        timeout: fastTimeout(FAST_TIMEOUT_MS),
       })
       .then((r) => r.data)
       .catch((e) => null)
@@ -1847,7 +1960,9 @@ async function searchWikipedia(query) {
     const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
       query
     )}&format=json&origin=*`;
-    const resp = await axios.get(url, { timeout: 6000 });
+    const resp = await axios.get(url, {
+      timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
+    });
     return (resp.data?.query?.search || []).map((s) => ({
       title: s.title,
       snippet: s.snippet,
@@ -1867,7 +1982,9 @@ async function searchYouTube(query, maxResults = 4) {
     const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(
       query
     )}&type=video&maxResults=${maxResults}&key=${key}`;
-    const searchRes = await axios.get(searchUrl, { timeout: 8000 });
+    const searchRes = await axios.get(searchUrl, {
+      timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
+    });
     const items = searchRes.data.items || [];
     // For each video, fetch snippet details (title, description)
     return items.map((it) => ({
@@ -1901,7 +2018,7 @@ async function searchInstagramPublic(query, maxResults = 4) {
     for (const url of engines.slice(0, maxResults)) {
       try {
         const resp = await axios.get(url, {
-          timeout: 8000,
+          timeout: fastTimeout(FAST_TIMEOUT_LONG_MS),
           headers: { "User-Agent": "Mozilla/5.0" },
         });
         const html = resp.data || "";
@@ -1936,8 +2053,9 @@ async function fetchPageTextFast(url, timeoutMs = null) {
     const c = pageCache.get(url);
     if (c) return c;
 
-    const timeout =
-      timeoutMs || Number(process.env.FAST_FETCH_TIMEOUT_MS || 2500);
+    const timeout = fastTimeout(
+      timeoutMs || Number(process.env.FAST_FETCH_TIMEOUT_MS || FAST_TIMEOUT_MS)
+    );
     const resp = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
       timeout,
@@ -2135,12 +2253,10 @@ app.post("/api/search", async (req, res) => {
       .join("\n\n");
 
     const prompt = `
-You're an intelligent assistant. Use the search results below to answer the user's question *clearly and helpfully*, even if not all results are directly relevant. 
-If needed, combine your own knowledge with the web results.
-Give Great easy to understand and slightly big answers.
-If anyone want a paragraph , Summary, Research , do that all.
-Don't mention about any sources or links.
-Avoid using hashtags (#), asterisks (*), or markdown symbols.
+You're an intelligent assistant. Use the search results below to answer the user's question clearly and helpfully. If needed, combine concise synthesis with key bullets.
+Keep it readable and structured with short paragraphs and simple bullet points when helpful.
+Don't mention sources or links in the text.
+Avoid using hashtags (#) or decorative markdown symbols.
 
 
 Question: "${query}"
@@ -2148,10 +2264,7 @@ Question: "${query}"
 Search Results:
 ${context}
 
-Answer in a friendly, helpful tone:
-Answer clearly, concisely, and professionally.
-Talk in very Friendly way.
-Avoid using hashtags (#), asterisks (*), or markdown symbols.
+Answer in a friendly, concise tone. Prefer short paragraphs or brief bullet points for key facts. Avoid hashtags and decorative symbols.
 `;
 
     const geminiResponse = await axios.post(
@@ -4684,8 +4797,8 @@ export async function sendEmailWithPdf(email, buffer, filename) {
   const mailOptions = {
     from: "CogniX <triunex.shorya@gmail.com>",
     to: email,
-    subject: "Your Market Research Report",
-    text: "Hi! Here's your AI-generated market research report from CogniX.",
+    subject: "Here is Your Market Research Report",
+    text: "Hi! Here's your AI-generated market research report from Nelieo.",
     attachments: [
       {
         filename,
@@ -5681,7 +5794,12 @@ app.post("/api/agentic-v2", async (req, res) => {
       while (attempts < 3 && confidence < 0.85) {
         const [serpResp, tw, rd, yt, wp] = await Promise.all([
           (async () => {
-            const data = await searchSerpCached("google", userQuery, {}, 6000);
+            const data = await searchSerpCached(
+              "google",
+              userQuery,
+              {},
+              FAST_TIMEOUT_MS
+            );
             return { data: data || { organic_results: [] } };
           })(),
           searchTwitterRecent(userQuery, 6),
@@ -5696,20 +5814,16 @@ app.post("/api/agentic-v2", async (req, res) => {
         );
         allSerpOrganic = allSerpOrganic.concat(organic);
 
-        if (
-          !opts.fast &&
-          (organic.length < 5 || !strongEntityMatch(userQuery, organic))
-        ) {
-          const extra = await runExtraSearches(userQuery, [
-            "bing",
-            "duckduckgo",
-          ]);
-          for (const e of extra)
-            if (e?.organic_results)
-              allSerpOrganic = allSerpOrganic.concat(
-                e.organic_results.slice(0, 5)
-              );
-        }
+        // Kick off extra engines in parallel but do not block the loop long
+        const extraPromise = runExtraSearches(userQuery, ["bing", "duckduckgo"])
+          .then((extra) => {
+            for (const e of extra || [])
+              if (e?.organic_results)
+                allSerpOrganic = allSerpOrganic.concat(
+                  e.organic_results.slice(0, 5)
+                );
+          })
+          .catch(() => {});
 
         const budget = opts.fast
           ? Math.min(6, opts.maxWeb ?? 50)
@@ -5721,11 +5835,12 @@ app.post("/api/agentic-v2", async (req, res) => {
           .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
 
         // Parallel page fetching with aggressive timeout in fast mode
-        const fetchTimeout = opts.fast ? 1500 : 3000;
+        const fetchTimeout = FAST_TIMEOUT_MS;
         const pageFetchPromises = topLinks.map((l) =>
           fetchPageTextFast(l.link, fetchTimeout)
         );
         pages = (await Promise.all(pageFetchPromises)).filter(Boolean);
+        await extraPromise; // fold in extras if they arrived
         tweets = tw || [];
         reddit = rd || [];
         youtube = yt || [];
@@ -5863,7 +5978,26 @@ app.post("/api/agentic-v2", async (req, res) => {
       });
       const context = [fusion.fusedText, "", fusion.sourceMap].join("\n\n");
 
-  const systemPrompt = `You are Nelieo AI — an agentic search assistant that adapts length, structure, and tone to the user's query.
+      // Detect simple entity/name queries (e.g., "Elon Musk") to avoid misinterpreting as coding/SQL tasks
+      const qTrim = String(userQuery || "").trim();
+      const nameLike = /^(?!.*\b(news|what|how|why|vs|compare|list|price|sql|select|update|insert|delete)\b)[A-Za-z][A-Za-z.'-]+(?:\s+[A-Za-z][A-Za-z.'-]+){1,3}$/.test(
+        qTrim
+      );
+      const uqLower = qTrim.toLowerCase();
+      const hasBioCue = (top || []).some((t) => {
+        const txt = String(t?.chunk?.text || "").toLowerCase();
+        return (
+          txt.includes(`${uqLower} is a`) ||
+          txt.includes(`${uqLower} is an`) ||
+          txt.includes("born ") ||
+          txt.includes("founder") ||
+          txt.includes("ceo") ||
+          txt.includes("entrepreneur")
+        );
+      });
+      const entityMode = nameLike && hasBioCue;
+
+      const systemPrompt = `You are Nelieo AI — an agentic search assistant that adapts length, structure, and tone to the user's query.
 
 Adaptive formatting rules:
 - Always answer in polished Markdown.
@@ -5878,6 +6012,9 @@ Intent-specific hints (apply if relevant):
 - People/Bio: one-paragraph overview; key facts as bullets if needed.
 - Local queries: surface local/regional sources first.
 - Coding: runnable code + 1–2 line explanation.
+
+Entity guard (when name-only entity is detected):
+${entityMode ? `- The user query is a name-only entity. Do NOT include any code, SQL, database, or implementation guidance. Produce a compact profile: 1 short paragraph + 3–6 bullets (roles, companies, notable achievements, birth details if present). Unless the user asked for news, avoid speculative updates. Keep it factual and concise.` : `- If the query appears to be solely a proper name and sources read like a bio, prefer a concise profile. Avoid unrelated coding/SQL explanations.`}
 
 Constraints:
 - Use ONLY the provided CONTEXT for facts; if something is missing, say "Not found in provided sources".
@@ -6230,7 +6367,7 @@ ${context}
                   q,
                   api_key: process.env.SERPAPI_API_KEY,
                 },
-                timeout: Math.min(10000, timeLeft()),
+                timeout: fastTimeout(Math.min(FAST_TIMEOUT_MS, timeLeft())),
               }),
               Math.min(11000, timeLeft())
             );
@@ -6251,7 +6388,9 @@ ${context}
               q
             )}&start=0&max_results=${n}`;
             const resp = await withTimeout(
-              axios.get(url, { timeout: Math.min(10000, timeLeft()) }),
+              axios.get(url, {
+                timeout: fastTimeout(Math.min(FAST_TIMEOUT_MS, timeLeft())),
+              }),
               Math.min(11000, timeLeft())
             );
             const xml = resp?.data || "";
@@ -6302,9 +6441,9 @@ ${context}
                       "google",
                       qNow,
                       {},
-                      Math.min(8000, timeLeft())
+                      fastTimeout(Math.min(FAST_TIMEOUT_MS, timeLeft()))
                     ),
-                    Math.min(9000, timeLeft())
+                    fastTimeout(Math.min(FAST_TIMEOUT_LONG_MS, timeLeft()))
                   );
                   const org = (data?.organic_results || []).slice(0, maxWeb);
                   pushUnique(serpOrganic, org, (r) => normalizeUrl(r.link));
