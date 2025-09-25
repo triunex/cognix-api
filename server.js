@@ -482,13 +482,17 @@ User query: """${q}"""`;
               "timeline",
               "news",
             ];
-            const allowCompare = has(" vs ") || has(" versus ") || has("compare");
+            const allowCompare =
+              has(" vs ") || has(" versus ") || has("compare");
             const allowNews = has("news") || /\b20\d{2}\b/.test(base);
             const allowTimeline = has("timeline");
             const allowHowWhy = has("how ") || has("why ");
 
             // If trivially short and not asking for expansion, force single identical subquery
-            if (tokenCount <= 3 && !(allowCompare || allowNews || allowTimeline || allowHowWhy)) {
+            if (
+              tokenCount <= 3 &&
+              !(allowCompare || allowNews || allowTimeline || allowHowWhy)
+            ) {
               return [{ query, rationale: "Single short query", priority: 1 }];
             }
 
@@ -508,14 +512,23 @@ User query: """${q}"""`;
               }
               if (bad) continue;
               // Drop compare/vs unless present in base
-              if (!allowCompare && /(\bvs\b|\bversus\b|\bcompare\b)/.test(lower)) continue;
+              if (
+                !allowCompare &&
+                /(\bvs\b|\bversus\b|\bcompare\b)/.test(lower)
+              )
+                continue;
               // Drop timeline unless present
               if (!allowTimeline && /\btimeline\b/.test(lower)) continue;
               // Strongly prefer subqueries that are close to the original terms
               const lowerWords = new Set(
-                lower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean)
+                lower
+                  .replace(/[^a-z0-9\s]/g, " ")
+                  .split(/\s+/)
+                  .filter(Boolean)
               );
-              const extras = Array.from(lowerWords).filter((w) => !baseWords.has(w));
+              const extras = Array.from(lowerWords).filter(
+                (w) => !baseWords.has(w)
+              );
               if (extras.length > 2) continue; // too much scope creep
               // Keep it reasonably short
               if (sq.length > Math.max(140, q.length * 2)) continue;
@@ -5980,9 +5993,10 @@ app.post("/api/agentic-v2", async (req, res) => {
 
       // Detect simple entity/name queries (e.g., "Elon Musk") to avoid misinterpreting as coding/SQL tasks
       const qTrim = String(userQuery || "").trim();
-      const nameLike = /^(?!.*\b(news|what|how|why|vs|compare|list|price|sql|select|update|insert|delete)\b)[A-Za-z][A-Za-z.'-]+(?:\s+[A-Za-z][A-Za-z.'-]+){1,3}$/.test(
-        qTrim
-      );
+      const nameLike =
+        /^(?!.*\b(news|what|how|why|vs|compare|list|price|sql|select|update|insert|delete)\b)[A-Za-z][A-Za-z.'-]+(?:\s+[A-Za-z][A-Za-z.'-]+){1,3}$/.test(
+          qTrim
+        );
       const uqLower = qTrim.toLowerCase();
       const hasBioCue = (top || []).some((t) => {
         const txt = String(t?.chunk?.text || "").toLowerCase();
@@ -6014,7 +6028,11 @@ Intent-specific hints (apply if relevant):
 - Coding: runnable code + 1–2 line explanation.
 
 Entity guard (when name-only entity is detected):
-${entityMode ? `- The user query is a name-only entity. Do NOT include any code, SQL, database, or implementation guidance. Produce a compact profile: 1 short paragraph + 3–6 bullets (roles, companies, notable achievements, birth details if present). Unless the user asked for news, avoid speculative updates. Keep it factual and concise.` : `- If the query appears to be solely a proper name and sources read like a bio, prefer a concise profile. Avoid unrelated coding/SQL explanations.`}
+${
+  entityMode
+    ? `- The user query is a name-only entity. Do NOT include any code, SQL, database, or implementation guidance. Produce a compact profile: 1 short paragraph + 3–6 bullets (roles, companies, notable achievements, birth details if present). Unless the user asked for news, avoid speculative updates. Keep it factual and concise.`
+    : `- If the query appears to be solely a proper name and sources read like a bio, prefer a concise profile. Avoid unrelated coding/SQL explanations.`
+}
 
 Constraints:
 - Use ONLY the provided CONTEXT for facts; if something is missing, say "Not found in provided sources".
@@ -6023,10 +6041,14 @@ Constraints:
 
 Goal: Be helpful and fast. Prefer brevity unless the question clearly needs depth.`;
 
-  const finalPrompt = `
+      const finalPrompt = `
 ${systemPrompt}
 
 Task: Answer the user's question with adaptive length and beautiful structure.
+Rules:
+1st - Answer like you are in a conversation and be Proactive.
+2nd- Be Human , and answer like a real human dont be robotic.
+3rd - You have Emotional Intelligence and you can adapt tone according to user's Mood and query.
 
 User question:
 "${userQuery}"
