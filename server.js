@@ -19,9 +19,117 @@ import { PuppeteerScreenRecorder } from "puppeteer-screen-recorder";
 puppeteer.use(StealthPlugin());
 import Redis from "ioredis";
 
+// --- Lightweight in-process caches (Week 1 stop-gap) ---
+class TTLCache {
+  constructor(ttlMs = 60000, maxEntries = 500) {
+    this.ttlMs = ttlMs;
+    this.maxEntries = maxEntries;
+    this.store = new Map();
+  }
+  get(key) {
+    const entry = this.store.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt < Date.now()) {
+      this.store.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  }
+  set(key, value, ttlOverride) {
+    const ttl = typeof ttlOverride === "number" ? ttlOverride : this.ttlMs;
+    if (this.store.size >= this.maxEntries) {
+      const oldestKey = this.store.keys().next().value;
+      if (oldestKey !== undefined) this.store.delete(oldestKey);
+    }
+    this.store.set(key, { value, expiresAt: Date.now() + ttl });
+  }
+  has(key) {
+    return this.get(key) !== undefined;
+  }
+}
+
+const PLAN_CACHE_TTL_MS = Number(
+  process.env.PLAN_CACHE_TTL_MS || 10 * 60 * 1000
+);
+const PLAN_CACHE_MAX = Number(process.env.PLAN_CACHE_MAX || 1000);
+const planCache = new TTLCache(PLAN_CACHE_TTL_MS, PLAN_CACHE_MAX);
+
 dotenv.config();
 
 const app = express();
+
+function logEvent(level = "info", event = "log", fields = {}, req) {
+  const base = {
+    level,
+    event,
+    time: new Date().toISOString(),
+    ...fields,
+  };
+  if (req?.requestId) base.requestId = req.requestId;
+  const userId = req?.headers?.["x-user-id"];
+  if (userId) base.userId = userId;
+  const line = JSON.stringify(base);
+  if (level === "error") console.error(line);
+  else if (level === "warn") console.warn(line);
+  else console.log(line);
+}
+
+const logger = {
+  info: (req, event, fields = {}) => logEvent("info", event, fields, req),
+  warn: (req, event, fields = {}) => logEvent("warn", event, fields, req),
+  error: (req, event, fields = {}) => logEvent("error", event, fields, req),
+};
+
+app.use((req, res, next) => {
+  const requestId = req.headers["x-request-id"] || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader("x-request-id", requestId);
+  const startHighRes =
+    typeof process?.hrtime?.bigint === "function"
+      ? process.hrtime.bigint()
+      : null;
+  const startTimeMs = startHighRes ? null : Date.now();
+
+  res.on("finish", () => {
+    let durationMs;
+    if (startHighRes) {
+      const diff = process.hrtime.bigint() - startHighRes;
+      durationMs = Number(diff) / 1_000_000;
+    } else {
+      durationMs = Date.now() - startTimeMs;
+    }
+    logger.info(req, "http_request", {
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      duration_ms: Math.round(durationMs * 1000) / 1000,
+    });
+  });
+
+  next();
+});
+
+// Request correlation + latency logging
+app.use((req, res, next) => {
+  const reqId = crypto.randomUUID();
+  const start = process.hrtime.bigint();
+  req.id = reqId;
+  res.setHeader("x-request-id", reqId);
+  res.on("finish", () => {
+    const durationMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+    const payload = {
+      event: "request_complete",
+      req_id: reqId,
+      method: req.method,
+      path: req.originalUrl || req.url,
+      status: res.statusCode,
+      duration_ms: Number(durationMs.toFixed(2)),
+      user: req.headers["x-user-id"] || null,
+    };
+    console.log(JSON.stringify(payload));
+  });
+  next();
+});
 
 // --- Core speed knobs (Week 1) ---
 // Aggressive network timeouts for retrieval to keep TTFB low
@@ -292,6 +400,130 @@ class SimpleCache {
 const serpCache = new SimpleCache(400, 5 * 60 * 1000);
 const pageCache = new SimpleCache(400, 10 * 60 * 1000);
 const embedCache = new SimpleCache(3000, 60 * 60 * 1000);
+const agentPlanCache = new SimpleCache(500, 10 * 60 * 1000);
+const answerCache = new SimpleCache(300, 3 * 60 * 1000);
+function hashKey(input = "") {
+  try {
+    return crypto
+      .createHash("sha1")
+      .update(String(input))
+      .digest("hex")
+      .slice(0, 20);
+  } catch (e) {
+    return String(input).slice(0, 20);
+  }
+}
+
+class Semaphore {
+  constructor(limit = 40) {
+    this.limit = Math.max(1, limit);
+    this.active = 0;
+    this.queue = [];
+  }
+  acquire(timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+      const tryAcquire = () => {
+        if (this.active < this.limit) {
+          this.active += 1;
+          resolve();
+          return true;
+        }
+        return false;
+      };
+      if (tryAcquire()) return;
+      const ticket = { resolve: null, timer: null };
+      ticket.resolve = () => {
+        if (ticket.timer) clearTimeout(ticket.timer);
+        this.active += 1;
+        resolve();
+      };
+      this.queue.push(ticket);
+      if (timeoutMs > 0) {
+        ticket.timer = setTimeout(() => {
+          const idx = this.queue.indexOf(ticket);
+          if (idx >= 0) this.queue.splice(idx, 1);
+          reject(new Error("Semaphore acquire timeout"));
+        }, timeoutMs);
+      }
+    });
+  }
+  release() {
+    if (this.active > 0) this.active -= 1;
+    while (this.queue.length && this.active < this.limit) {
+      const next = this.queue.shift();
+      if (next) {
+        next.resolve();
+        break;
+      }
+    }
+  }
+}
+
+const outboundLimiter = new Semaphore(
+  Number(process.env.OUTBOUND_CONCURRENCY || 40)
+);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withOutboundLimit(
+  label,
+  fn,
+  { timeoutMs = 5000, retries = 1, backoffMs = 150 } = {}
+) {
+  let attempt = 0;
+  let lastError = null;
+  while (attempt <= retries) {
+    await outboundLimiter.acquire(timeoutMs).catch((err) => {
+      lastError = err;
+      throw err;
+    });
+    const start = Date.now();
+    try {
+      const result = await fn();
+      const duration = Date.now() - start;
+      if (duration > 2000) {
+        console.warn(
+          JSON.stringify({
+            event: "slow_outbound",
+            label,
+            duration_ms: duration,
+            attempt,
+          })
+        );
+      }
+      return result;
+    } catch (err) {
+      lastError = err;
+      if (attempt >= retries) throw err;
+      const wait = backoffMs * Math.pow(2, attempt);
+      await sleep(wait);
+    } finally {
+      outboundLimiter.release();
+    }
+    attempt += 1;
+  }
+  throw lastError || new Error(`Failed outbound call ${label}`);
+}
+
+async function externalGet(label, url, config = {}, opts = {}) {
+  const timeoutFromConfig = config?.timeout || FAST_TIMEOUT_LONG_MS;
+  return withOutboundLimit(label, () => axios.get(url, config), {
+    timeoutMs: opts.timeoutMs || timeoutFromConfig,
+    retries: opts.retries ?? 1,
+    backoffMs: opts.backoffMs ?? 200,
+  });
+}
+
+async function externalPost(label, url, data = {}, config = {}, opts = {}) {
+  const timeoutFromConfig = config?.timeout || FAST_TIMEOUT_LONG_MS;
+  return withOutboundLimit(label, () => axios.post(url, data, config), {
+    timeoutMs: opts.timeoutMs || timeoutFromConfig,
+    retries: opts.retries ?? 1,
+    backoffMs: opts.backoffMs ?? 200,
+  });
+}
 
 // Optional Redis persistent cache (fallback to in-memory if unavailable)
 let redis = null;
@@ -357,10 +589,15 @@ async function searchSerpCached(engine, q, params = {}, timeoutMs = 6000) {
   const cached = serpCache.get(key);
   if (cached) return cached;
   try {
-    const resp = await axios.get("https://serpapi.com/search", {
-      params: { engine, q, api_key: apiKey, ...params },
-      timeout: fastTimeout(timeoutMs),
-    });
+    const resp = await externalGet(
+      "serpapi.search",
+      "https://serpapi.com/search",
+      {
+        params: { engine, q, api_key: apiKey, ...params },
+        timeout: fastTimeout(timeoutMs),
+      },
+      { timeoutMs }
+    );
     serpCache.set(key, resp.data);
     persistentSet(rkey, resp.data, 300).catch(() => {});
     return resp.data;
@@ -423,10 +660,12 @@ Rules:
 User query: """${q}"""`;
 
   try {
-    const resp = await axios.post(
+    const resp = await externalPost(
+      "gemini.plan",
       `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       { contents: [{ role: "user", parts: [{ text: prompt }] }] },
-      { headers: { "Content-Type": "application/json" }, timeout: 12000 }
+      { headers: { "Content-Type": "application/json" }, timeout: 12000 },
+      { timeoutMs: 12000 }
     );
     const raw = resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
     const s = raw.indexOf("{");
@@ -790,7 +1029,8 @@ async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
         model
       )}:generateContent?key=${process.env.GEMINI_API_KEY}`;
       try {
-        const resp = await axios.post(
+        const resp = await externalPost(
+          "gemini.call",
           url,
           {
             contents: [{ role: "user", parts: [{ text: prompt }] }],
@@ -800,7 +1040,8 @@ async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
               maxOutputTokens: maxTokens,
             },
           },
-          { headers: { "Content-Type": "application/json" }, timeout: 28000 }
+          { headers: { "Content-Type": "application/json" }, timeout: 28000 },
+          { timeoutMs: 28000, retries: 1 }
         );
         return (
           resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ""
@@ -809,10 +1050,13 @@ async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
         // Retry with fallback model names if 404 or model issue
         const msg = e?.response?.data || e?.message || "";
         if (e?.response?.status === 404 || /model/i.test(msg)) {
-          const fallback = model.includes("flash") ? "gemini-1.5-flash" : "gemini-1.5-pro";
+          const fallback = model.includes("flash")
+            ? "gemini-1.5-flash"
+            : "gemini-1.5-pro";
           if (fallback !== model) {
             try {
-              const resp2 = await axios.post(
+              const resp2 = await externalPost(
+                "gemini.fallback",
                 `https://generativelanguage.googleapis.com/v1/models/${fallback}:generateContent?key=${process.env.GEMINI_API_KEY}`,
                 {
                   contents: [{ role: "user", parts: [{ text: prompt }] }],
@@ -822,10 +1066,15 @@ async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
                     maxOutputTokens: maxTokens,
                   },
                 },
-                { headers: { "Content-Type": "application/json" }, timeout: 28000 }
+                {
+                  headers: { "Content-Type": "application/json" },
+                  timeout: 28000,
+                },
+                { timeoutMs: 28000, retries: 0 }
               );
               return (
-                resp2?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ""
+                resp2?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
+                ""
               );
             } catch {}
           }
@@ -834,7 +1083,8 @@ async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
       }
     }
     if (provider === "openai" && process.env.OPENAI_API_KEY) {
-      const resp = await axios.post(
+      const resp = await externalPost(
+        "openai.call",
         "https://api.openai.com/v1/chat/completions",
         {
           model: model || "gpt-4o-mini",
@@ -849,12 +1099,14 @@ async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
             "Content-Type": "application/json",
           },
           timeout: 30000,
-        }
+        },
+        { timeoutMs: 30000, retries: 1 }
       );
       return resp?.data?.choices?.[0]?.message?.content?.trim() || "";
     }
     if (provider === "anthropic" && process.env.ANTHROPIC_API_KEY) {
-      const resp = await axios.post(
+      const resp = await externalPost(
+        "anthropic.call",
         "https://api.anthropic.com/v1/messages",
         {
           model: model || "claude-3-5-sonnet-20240620",
@@ -868,7 +1120,8 @@ async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
             "Content-Type": "application/json",
           },
           timeout: 30000,
-        }
+        },
+        { timeoutMs: 30000, retries: 1 }
       );
       const parts = resp?.data?.content || [];
       const txt = parts
@@ -1126,13 +1379,27 @@ function splitMultiIntent(original = "") {
 // --- New LLM-based multi-intent planner ---
 async function planMultiIntentLLM(query = "") {
   // Returns array of { subquery, intent_type, rationale, priority }
-  const fallback = () => splitMultiIntent(query).map((p, i) => ({
-    subquery: p,
-    intent_type: inferIntentTypeHeuristic(p),
-    rationale: "heuristic",
-    priority: i + 1,
-  }));
-  if (!process.env.GEMINI_API_KEY) return fallback();
+  const normalized = norm(query || "");
+  const cacheKey = normalized.toLowerCase();
+  const computeFallback = () => {
+    const items = splitMultiIntent(query).map((p, i) => ({
+      subquery: p,
+      intent_type: inferIntentTypeHeuristic(p),
+      rationale: "heuristic",
+      priority: i + 1,
+    }));
+    if (cacheKey) agentPlanCache.set(cacheKey, items);
+    return items;
+  };
+
+  if (!cacheKey) return computeFallback();
+
+  const cached = agentPlanCache.get(cacheKey);
+  if (cached) {
+    return cached.map((item) => ({ ...item }));
+  }
+
+  if (!process.env.GEMINI_API_KEY) return computeFallback();
   const prompt = `Decompose the USER QUERY into focused sub-questions.
 Return STRICT JSON array.
 Each item: {"subquery":"...","intent_type":"compare|definition|explain|timeline|list|steps|recommend|other","rationale":"...","priority":1-10}
@@ -1142,23 +1409,32 @@ Rules:
 - 2-6 items max.
 USER QUERY: ${query}`;
   try {
-    const raw = await callLLM({ provider: "gemini", model: "gemini-1.5-flash", prompt, maxTokens: 500 });
+    const raw = await callLLM({
+      provider: "gemini",
+      model: "gemini-1.5-flash",
+      prompt,
+      maxTokens: 500,
+    });
     const jsonStart = raw.indexOf("[");
     const jsonEnd = raw.lastIndexOf("]");
-    if (jsonStart === -1 || jsonEnd === -1) return fallback();
+    if (jsonStart === -1 || jsonEnd === -1) return computeFallback();
     const parsed = JSON.parse(raw.slice(jsonStart, jsonEnd + 1));
-    if (!Array.isArray(parsed) || parsed.length === 0) return fallback();
-    return parsed
+    if (!Array.isArray(parsed) || parsed.length === 0) return computeFallback();
+    const cleaned = parsed
       .filter((o) => o?.subquery)
       .slice(0, 6)
       .map((o, i) => ({
         subquery: norm(o.subquery),
-        intent_type: String(o.intent_type || inferIntentTypeHeuristic(o.subquery)).toLowerCase(),
+        intent_type: String(
+          o.intent_type || inferIntentTypeHeuristic(o.subquery)
+        ).toLowerCase(),
         rationale: o.rationale || "LLM",
         priority: typeof o.priority === "number" ? o.priority : i + 1,
       }));
+    agentPlanCache.set(cacheKey, cleaned);
+    return cleaned;
   } catch {
-    return fallback();
+    return computeFallback();
   }
 }
 
@@ -1267,7 +1543,10 @@ function composeSections(blocks) {
   for (const b of blocks.slice(0, 6)) {
     const body = (b.body || "").replace(/\s+/g, " ").trim();
     if (!body) continue;
-    const firstSent = body.split(/(?<=[.!?])\s+/).slice(0, 2).join(" ");
+    const firstSent = body
+      .split(/(?<=[.!?])\s+/)
+      .slice(0, 2)
+      .join(" ");
     if (firstSent) summaryParts.push(firstSent);
   }
   const globalSummary = summaryParts.slice(0, 5).join(" ");
@@ -2159,12 +2438,17 @@ async function fetchPageTextFast(url, timeoutMs = null) {
     const timeout = fastTimeout(
       timeoutMs || Number(process.env.FAST_FETCH_TIMEOUT_MS || FAST_TIMEOUT_MS)
     );
-    const resp = await axios.get(url, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
-      timeout,
-      maxRedirects: 3,
-      validateStatus: (status) => status < 400,
-    });
+    const resp = await externalGet(
+      "page.fetch",
+      url,
+      {
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+        timeout,
+        maxRedirects: 3,
+        validateStatus: (status) => status < 400,
+      },
+      { timeoutMs: timeout }
+    );
     const parsed = unfluff(resp.data || "");
     const out = {
       url,
@@ -5861,6 +6145,9 @@ app.post("/api/agentic-v2", async (req, res) => {
     verify = true,
   } = req.body || {};
   if (!query) return res.status(400).json({ error: "Missing query" });
+  
+  // Ensure minimum source count for better quality answers
+  const effectiveMaxWeb = Math.max(15, Math.min(maxWeb, 50));  // Min 15, Max 50 sources
 
   try {
     // helpers: unified single-run that wraps existing logic (see runUnifiedOnce below)
@@ -5881,7 +6168,7 @@ app.post("/api/agentic-v2", async (req, res) => {
 
     async function runUnifiedOnce(
       userQuery,
-      opts = { maxWeb, topChunks, fast, verify }
+      opts = { maxWeb: effectiveMaxWeb, topChunks, fast, verify }
     ) {
       // === begin: your existing core (lightly parameterized) ===
       let attempts = 0;
@@ -5905,9 +6192,9 @@ app.post("/api/agentic-v2", async (req, res) => {
             );
             return { data: data || { organic_results: [] } };
           })(),
-          searchTwitterRecent(userQuery, 6),
-          searchReddit(userQuery, 6),
-          searchYouTube(userQuery, 4),
+          searchTwitterRecent(userQuery, 8),  // Increased from 6 to 8 for more Twitter sources
+          searchReddit(userQuery, 8),       // Increased from 6 to 8 for more Reddit sources
+          searchYouTube(userQuery, 6),      // Increased from 4 to 6 for more YouTube sources
           searchWikipedia(userQuery),
         ]).catch(() => [{ data: { organic_results: [] } }, [], [], [], []]);
 
@@ -5923,16 +6210,16 @@ app.post("/api/agentic-v2", async (req, res) => {
             for (const e of extra || [])
               if (e?.organic_results)
                 allSerpOrganic = allSerpOrganic.concat(
-                  e.organic_results.slice(0, 5)
+                  e.organic_results.slice(0, 12)  // Increased from 5 to 12 for more diverse sources
                 );
           })
           .catch(() => {});
 
         const budget = opts.fast
-          ? Math.min(6, opts.maxWeb ?? 50)
+          ? Math.min(15, opts.maxWeb ?? 50)  // Minimum 15 sources even in fast mode
           : complex
-          ? opts.maxWeb ?? 50
-          : Math.min(20, opts.maxWeb ?? 50);
+          ? Math.min(50, opts.maxWeb ?? 50)  // Maximum 50 sources for complex queries
+          : Math.min(Math.max(15, opts.maxWeb ?? 50), 50);  // Min 15, Max 50 for regular queries
         const topLinks = allSerpOrganic
           .slice(0, budget)
           .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
@@ -6139,6 +6426,7 @@ Rules:
 1st - Answer like you are in a conversation and be Proactive.
 2nd- Be Human , and answer like a real human dont be robotic.
 3rd - You have Emotional Intelligence and you can adapt tone according to user's Mood and query.
+4th- Use Markdown tables when it required to compare , and for other things.
 
 User question:
 "${userQuery}"
@@ -7185,12 +7473,14 @@ ${contextInf}
     const todayISO = new Date().toISOString().slice(0, 10);
     const plannedSubs = await planMultiIntentLLM(query);
     // Convert planner outputs into existing makePlan tasks (so news/transcript heuristics still apply)
-    const expanded = plannedSubs.flatMap((p) => makePlan(p.subquery, todayISO).map((t) => ({
-      ...t,
-      intent_type: p.intent_type,
-      subquery: p.subquery,
-      priority: p.priority,
-    })));
+    const expanded = plannedSubs.flatMap((p) =>
+      makePlan(p.subquery, todayISO).map((t) => ({
+        ...t,
+        intent_type: p.intent_type,
+        subquery: p.subquery,
+        priority: p.priority,
+      }))
+    );
     // Deduplicate generic tasks with identical normalized queries
     const seenGeneric = new Set();
     const plans = expanded.filter((t) => {
