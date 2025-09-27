@@ -6145,11 +6145,9 @@ app.post("/api/agentic-v2", async (req, res) => {
     verify = true,
   } = req.body || {};
   if (!query) return res.status(400).json({ error: "Missing query" });
-  
+
   // Ensure minimum source count for better quality answers
-  const effectiveMaxWeb = fast 
-    ? Math.max(20, Math.min(maxWeb, 50))  // Min 20 sources in fast mode, Max 50
-    : Math.max(15, Math.min(maxWeb, 50)); // Min 15 sources in normal mode, Max 50
+  const effectiveMaxWeb = Math.max(15, Math.min(maxWeb, 50)); // Min 15, Max 50 sources
 
   try {
     // helpers: unified single-run that wraps existing logic (see runUnifiedOnce below)
@@ -6194,9 +6192,9 @@ app.post("/api/agentic-v2", async (req, res) => {
             );
             return { data: data || { organic_results: [] } };
           })(),
-          searchTwitterRecent(userQuery, 8),  // Increased from 6 to 8 for more Twitter sources
-          searchReddit(userQuery, 8),       // Increased from 6 to 8 for more Reddit sources
-          searchYouTube(userQuery, 6),      // Increased from 4 to 6 for more YouTube sources
+          searchTwitterRecent(userQuery, 8), // Increased from 6 to 8 for more Twitter sources
+          searchReddit(userQuery, 8), // Increased from 6 to 8 for more Reddit sources
+          searchYouTube(userQuery, 6), // Increased from 4 to 6 for more YouTube sources
           searchWikipedia(userQuery),
         ]).catch(() => [{ data: { organic_results: [] } }, [], [], [], []]);
 
@@ -6212,16 +6210,16 @@ app.post("/api/agentic-v2", async (req, res) => {
             for (const e of extra || [])
               if (e?.organic_results)
                 allSerpOrganic = allSerpOrganic.concat(
-                  e.organic_results.slice(0, 12)  // Increased from 5 to 12 for more diverse sources
+                  e.organic_results.slice(0, 12) // Increased from 5 to 12 for more diverse sources
                 );
           })
           .catch(() => {});
 
         const budget = opts.fast
-          ? Math.min(Math.max(20, opts.maxWeb ?? 50), 50)  // Minimum 20 sources even in fast mode, max 50
+          ? Math.min(15, opts.maxWeb ?? 50) // Minimum 15 sources even in fast mode
           : complex
-          ? Math.min(50, opts.maxWeb ?? 50)  // Maximum 50 sources for complex queries
-          : Math.min(Math.max(15, opts.maxWeb ?? 50), 50);  // Min 15, Max 50 for regular queries
+          ? Math.min(50, opts.maxWeb ?? 50) // Maximum 50 sources for complex queries
+          : Math.min(Math.max(15, opts.maxWeb ?? 50), 50); // Min 15, Max 50 for regular queries
         const topLinks = allSerpOrganic
           .slice(0, budget)
           .map((r) => ({ title: r.title, link: r.link, snippet: r.snippet }));
@@ -6266,8 +6264,8 @@ app.post("/api/agentic-v2", async (req, res) => {
           });
         }
       }
-      if (opts.fast && chunks.length > 150) {
-        chunks = chunks.slice(0, 150);  // Increased from 100 to 150 to handle more sources in fast mode
+      if (opts.fast && chunks.length > 100) {
+        chunks = chunks.slice(0, 100);
       }
       for (const t of tweets || [])
         chunks.push({
@@ -6319,7 +6317,7 @@ app.post("/api/agentic-v2", async (req, res) => {
 
       // Candidate pool from embedding recall (take wider pool, e.g., 40)
       const pool = sims
-        .slice(0, Math.min(opts.fast ? 25 : 40, sims.length))  // Increased fast mode pool from 8 to 25
+        .slice(0, Math.min(opts.fast ? 8 : 40, sims.length))
         .map((s) => ({
           i: s.i,
           score: s.score,
