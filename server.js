@@ -6147,7 +6147,9 @@ app.post("/api/agentic-v2", async (req, res) => {
   if (!query) return res.status(400).json({ error: "Missing query" });
   
   // Ensure minimum source count for better quality answers
-  const effectiveMaxWeb = Math.max(15, Math.min(maxWeb, 50));  // Min 15, Max 50 sources
+  const effectiveMaxWeb = fast 
+    ? Math.max(20, Math.min(maxWeb, 50))  // Min 20 sources in fast mode, Max 50
+    : Math.max(15, Math.min(maxWeb, 50)); // Min 15 sources in normal mode, Max 50
 
   try {
     // helpers: unified single-run that wraps existing logic (see runUnifiedOnce below)
@@ -6216,7 +6218,7 @@ app.post("/api/agentic-v2", async (req, res) => {
           .catch(() => {});
 
         const budget = opts.fast
-          ? Math.min(15, opts.maxWeb ?? 50)  // Minimum 15 sources even in fast mode
+          ? Math.min(Math.max(20, opts.maxWeb ?? 50), 50)  // Minimum 20 sources even in fast mode, max 50
           : complex
           ? Math.min(50, opts.maxWeb ?? 50)  // Maximum 50 sources for complex queries
           : Math.min(Math.max(15, opts.maxWeb ?? 50), 50);  // Min 15, Max 50 for regular queries
@@ -6264,8 +6266,8 @@ app.post("/api/agentic-v2", async (req, res) => {
           });
         }
       }
-      if (opts.fast && chunks.length > 100) {
-        chunks = chunks.slice(0, 100);
+      if (opts.fast && chunks.length > 150) {
+        chunks = chunks.slice(0, 150);  // Increased from 100 to 150 to handle more sources in fast mode
       }
       for (const t of tweets || [])
         chunks.push({
@@ -6317,7 +6319,7 @@ app.post("/api/agentic-v2", async (req, res) => {
 
       // Candidate pool from embedding recall (take wider pool, e.g., 40)
       const pool = sims
-        .slice(0, Math.min(opts.fast ? 8 : 40, sims.length))
+        .slice(0, Math.min(opts.fast ? 25 : 40, sims.length))  // Increased fast mode pool from 8 to 25
         .map((s) => ({
           i: s.i,
           score: s.score,
