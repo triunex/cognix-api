@@ -789,21 +789,49 @@ async function callLLM({ provider, model, prompt, maxTokens = 1200 }) {
       const url = `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(
         model
       )}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-      const resp = await axios.post(
-        url,
-        {
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.5,
-            topP: 0.9,
-            maxOutputTokens: maxTokens,
+      try {
+        const resp = await axios.post(
+          url,
+          {
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.4,
+              topP: 0.9,
+              maxOutputTokens: maxTokens,
+            },
           },
-        },
-        { headers: { "Content-Type": "application/json" }, timeout: 28000 }
-      );
-      return (
-        resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ""
-      );
+          { headers: { "Content-Type": "application/json" }, timeout: 28000 }
+        );
+        return (
+          resp?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ""
+        );
+      } catch (e) {
+        // Retry with fallback model names if 404 or model issue
+        const msg = e?.response?.data || e?.message || "";
+        if (e?.response?.status === 404 || /model/i.test(msg)) {
+          const fallback = model.includes("flash") ? "gemini-1.5-flash" : "gemini-1.5-pro";
+          if (fallback !== model) {
+            try {
+              const resp2 = await axios.post(
+                `https://generativelanguage.googleapis.com/v1/models/${fallback}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+                {
+                  contents: [{ role: "user", parts: [{ text: prompt }] }],
+                  generationConfig: {
+                    temperature: 0.4,
+                    topP: 0.9,
+                    maxOutputTokens: maxTokens,
+                  },
+                },
+                { headers: { "Content-Type": "application/json" }, timeout: 28000 }
+              );
+              return (
+                resp2?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ""
+              );
+            } catch {}
+          }
+        }
+        throw e;
+      }
     }
     if (provider === "openai" && process.env.OPENAI_API_KEY) {
       const resp = await axios.post(
@@ -1095,6 +1123,57 @@ function splitMultiIntent(original = "") {
   return parts;
 }
 
+// --- New LLM-based multi-intent planner ---
+async function planMultiIntentLLM(query = "") {
+  // Returns array of { subquery, intent_type, rationale, priority }
+  const fallback = () => splitMultiIntent(query).map((p, i) => ({
+    subquery: p,
+    intent_type: inferIntentTypeHeuristic(p),
+    rationale: "heuristic",
+    priority: i + 1,
+  }));
+  if (!process.env.GEMINI_API_KEY) return fallback();
+  const prompt = `Decompose the USER QUERY into focused sub-questions.
+Return STRICT JSON array.
+Each item: {"subquery":"...","intent_type":"compare|definition|explain|timeline|list|steps|recommend|other","rationale":"...","priority":1-10}
+Rules:
+- Merge trivial overlaps.
+- Keep ordering logical: comparisons after definitions, recommendations after explanations.
+- 2-6 items max.
+USER QUERY: ${query}`;
+  try {
+    const raw = await callLLM({ provider: "gemini", model: "gemini-1.5-flash", prompt, maxTokens: 500 });
+    const jsonStart = raw.indexOf("[");
+    const jsonEnd = raw.lastIndexOf("]");
+    if (jsonStart === -1 || jsonEnd === -1) return fallback();
+    const parsed = JSON.parse(raw.slice(jsonStart, jsonEnd + 1));
+    if (!Array.isArray(parsed) || parsed.length === 0) return fallback();
+    return parsed
+      .filter((o) => o?.subquery)
+      .slice(0, 6)
+      .map((o, i) => ({
+        subquery: norm(o.subquery),
+        intent_type: String(o.intent_type || inferIntentTypeHeuristic(o.subquery)).toLowerCase(),
+        rationale: o.rationale || "LLM",
+        priority: typeof o.priority === "number" ? o.priority : i + 1,
+      }));
+  } catch {
+    return fallback();
+  }
+}
+
+function inferIntentTypeHeuristic(q = "") {
+  const s = q.toLowerCase();
+  if (/compare| vs |versus|difference|differ/i.test(s)) return "compare";
+  if (/timeline|history|evolution|chronolog/i.test(s)) return "timeline";
+  if (/how to|steps|procedure|guide|tutorial/i.test(s)) return "steps";
+  if (/list|top\s+\d+|best /i.test(s)) return "list";
+  if (/recommend|suggest/i.test(s)) return "recommend";
+  if (/what is|define|definition/i.test(s)) return "definition";
+  if (/why |explain|explanation|cause|reason/i.test(s)) return "explain";
+  return "other";
+}
+
 function makePlan(q = "", todayISO = new Date().toISOString().slice(0, 10)) {
   /** @type {SubTask[]} */
   const tasks = [];
@@ -1180,17 +1259,28 @@ function verifyTranscriptCoverage(
 // --- Safe-composer (pretty, professional, policy-safe) ---
 function composeSections(blocks) {
   if (!Array.isArray(blocks) || blocks.length === 0) return "";
-  // If there's only one block, return its body as-is (no extra heading or sources line)
-  if (blocks.length === 1) {
-    return (blocks[0].body || "").trim();
+  if (blocks.length === 1) return (blocks[0].body || "").trim();
+
+  // Build a lightweight global summary if not already added.
+  // We heuristically take first sentences of each block body (up to 2) and join.
+  const summaryParts = [];
+  for (const b of blocks.slice(0, 6)) {
+    const body = (b.body || "").replace(/\s+/g, " ").trim();
+    if (!body) continue;
+    const firstSent = body.split(/(?<=[.!?])\s+/).slice(0, 2).join(" ");
+    if (firstSent) summaryParts.push(firstSent);
+  }
+  const globalSummary = summaryParts.slice(0, 5).join(" ");
+
+  const lines = [];
+  if (globalSummary) {
+    lines.push(`### Quick Summary\n${globalSummary}`);
   }
 
-  // For multiple blocks, show concise section headers and the provided bodies.
-  const lines = [];
   for (const b of blocks) {
     const rawTitle = (b.title || "").trim();
     const isGeneric = /^Result\s+—/i.test(rawTitle);
-    if (!isGeneric && rawTitle) {
+    if (rawTitle && !isGeneric) {
       const cleanTitle = rawTitle.replace(/^Result\s+—\s+/i, "");
       lines.push(`\n#### ${cleanTitle}\n`);
     }
@@ -7091,13 +7181,35 @@ ${contextInf}
       });
     }
 
-    // 1) Split multi-intent
+    // 1) Multi-intent planning (LLM + heuristic fallback)
     const todayISO = new Date().toISOString().slice(0, 10);
-    const parts = splitMultiIntent(query);
-    const plans = parts.flatMap((p) => makePlan(p, todayISO));
-
-    // Limit plans in fast mode for speed
-    const plansToExecute = fast ? plans.slice(0, 2) : plans;
+    const plannedSubs = await planMultiIntentLLM(query);
+    // Convert planner outputs into existing makePlan tasks (so news/transcript heuristics still apply)
+    const expanded = plannedSubs.flatMap((p) => makePlan(p.subquery, todayISO).map((t) => ({
+      ...t,
+      intent_type: p.intent_type,
+      subquery: p.subquery,
+      priority: p.priority,
+    })));
+    // Deduplicate generic tasks with identical normalized queries
+    const seenGeneric = new Set();
+    const plans = expanded.filter((t) => {
+      if (t.kind !== "generic") return true;
+      const key = t.query.toLowerCase();
+      if (seenGeneric.has(key)) return false;
+      seenGeneric.add(key);
+      return true;
+    });
+    // In fast mode keep at least one of each intent_type up to 2 total
+    let plansToExecute = plans;
+    if (fast) {
+      const byIntent = new Map();
+      for (const p of plans) {
+        if (!byIntent.has(p.intent_type)) byIntent.set(p.intent_type, p);
+      }
+      const essential = Array.from(byIntent.values()).slice(0, 2);
+      plansToExecute = essential.length ? essential : plans.slice(0, 2);
+    }
 
     // 2) Execute each subtask (in parallel)
     const execStart2 = Date.now();
@@ -7179,8 +7291,11 @@ ${contextInf}
           sources: ex.run.sources,
         });
       } else {
+        const intentLabel = t.intent_type
+          ? t.intent_type.charAt(0).toUpperCase() + t.intent_type.slice(1)
+          : "Result";
         blocks.push({
-          title: `Result — ${t.query}`,
+          title: `${intentLabel} — ${t.query}`,
           body: ex.run.formatted_answer,
           sources: ex.run.sources,
         });
